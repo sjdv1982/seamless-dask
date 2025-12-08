@@ -1,89 +1,26 @@
+Seamless is essentially a caching machine: transformation results are stored remotely as a result checksum plus the underlying buffer. The checksum goes to the database client and the buffer goes to the buffer/hashserver; repeat submissions reuse cached work.
 
-In a normal Seamless transformation, the lifecycle goes construct() => compute() => run() . 
-A constructed transformation has a transformation checksum, and a computed transformation has a result checksum.
-Construction happens in the Seamless client process ("the client"), 
-and computation may be delegated to a remote jobserver.
-Transformation.run() is nothing more than transformation_checksum.resolve(), i.e. it happens also on the client.
+Normal Seamless lifecycle: construct() → compute() → run(). Construction happens on the client (producing a transformation checksum). Computation can be remote, and run() simply resolves the checksum on the client.
 
-Unlike a jobserver, Dask supports that transformations can already be submitted *before* they are constructed. 
-Each transformation becomes a Dask future, and each input of a transformation can be (but doesn't have to be) 
-also a Dask future. 
+Dask difference: tasks can be submitted before construction finishes. Inputs and transformations themselves can be Dask futures. The goal is to reuse work via deterministic keys when possible, while keeping result buffers hot on workers for nearby dependents.
 
-The lifecycle of a Dask-submitted Seamless transformation is then different, and goes as follows:
+Case 1: transformation without dependencies (inputs are checksums or values that become checksums). Steps:
+- Construct on the client to get the transformation checksum. Check the remote database/cache; on hit, do not submit to Dask.
+- On miss, build “fat checksum” futures per input checksum. These run on workers, pull `(checksum, buffer, exc)` from hashserver/buffer cache, and use predictable keys `fat-checksum-{checksum.hex()}`. Creating the future does not force execution. A weak/strong cache keeps these futures alive; strong entries expire ~10s after last access (refreshed on access). Default-task-duration: “fast”.
+- Build three futures keyed deterministically with the transformation checksum (e.g., `base-{tf_checksum}`, `fat-{tf_checksum}`, `thin-{tf_checksum}`); if already running, Dask will reuse them.
+  - Base future (worker): awaits fat inputs, re-checks cache, and either returns `(tf_checksum, result_checksum, None, None)` on hit or runs the transformation, writes checksum+buffer to db/hashserver, and returns `(tf_checksum, result_checksum, result_buffer, None)`; on error `(tf_checksum, None, None, exc)`. The result buffer intentionally stays in worker memory for near-term dependents. Default-task-duration: “fast” (but moves/holds buffer).
+  - Fat future (worker): depends on base. If base already returned a buffer it forwards `(result_checksum, result_buffer, exc)`; if base hit cache, it awaits the result’s fat-checksum future and forwards that result. Two timing paths: instantaneous when piggybacking on base, slower when fetching from hashstore/NFS. Use a small nonzero default duration to cover the slower path.
+  - Thin future (worker): depends on base, returns `(tf_checksum, result_checksum, exc)` without the buffer. Default-task-duration: “fast”.
+- A transformation_checksum→(base, fat, thin) cache mirrors the fat-checksum cache; entries are reconstructed as needed and refreshed at the end of computation. .compute() runs the thin future; on exc it sets a RemoteException, otherwise it records result_checksum and registers a dummy task under the fat-checksum key that returns the fat future.
 
-Case 1. A transformation with no dependencies.
-"No dependencies" means that none of the inputs are Transformations, and all of them are Checksums 
-(or values that will be replaced by checksums when the transformation dict is prepared). 
-The transformation is constructed normally on the client, and gets a transformation checksum. Then, on the client side, the remote database/transformation cache 
-is quickly checked for cache hits. In that case, no Dask submission at all takes place. So, assuming a cache miss: 
-First, for every input checksum, a "fat checksum" Dask future is constructed. Such a future is a function that runs on a Dask worker,
-taking as input a checksum, and returning a (checksum, buffer, None) tuple by retrieving the buffer from cache (buffer cache or hashserver).
-In case of a CacheMissError or another exception, it returns instead (checksum, None, exc), where exc is the exception traceback rendered as string.
-"Fat checksum" futures have a predictable task key, namely "fat-checksum-X", where X is the checksum.hex(). Using "default-task-durations", it
-is indicated that fat checksum tasks are rather fast.
-The client keeps a checksum-to-fat-checksum-Future cache, inspired by buffer cache: one weak value dict, and one strong entry dict where
-every entry is removed 10 secs after the last access. Unlike the buffer cache, the strong entry dict is only purged 
-upon a new registry or access, not in the background.
-The transformation dict containing fat checksum Futures and the transformation checksum is then converted into three Dask futures:
+Case 2: transformation with dependencies (some inputs are Transformation instances).
+- construct() semantics unchanged, but compute() no longer auto-calls construct().
+- When compute() runs: if any dependency already has an exception, set “Dependency has an exception.” Prefer dependencies that already have their (base, fat, thin) triple alive in Dask; otherwise, if a dependency has completed, replace it with its result checksum. If all deps become concrete, fall back to Case 1. If a dep is unknown to Dask and not completed, rebuild its triple.
+- Build a transformation dict with fat checksum futures for concrete inputs and fat Transformation futures (from their triples) for dependent transforms. Submit three futures analogous to Case 1:
+  - Base future (worker): performs construction once dep checksums are known, checks cache, and on hit returns `(tf_checksum, result_checksum, None, None)`. If it misses, it learns the deterministic key for the Case 1 base task. A worker cannot truly alias scheduler keys, but it may submit `K2` from within the task using `get_client()` and `client.submit(lambda x: x, current_future, key=K2)` to let later tasks keyed `K2` reuse the running work; this is not a scheduler-level alias and only affects tasks submitted after `K2` is registered (co-location not guaranteed unless you pin the worker). It then runs the transformation, writes checksum+buffer, and returns `(tf_checksum, result_checksum, result_buffer, None)` or an exc tuple.
+  - Fat/thin futures behave as in Case 1. Because the transformation checksum is initially unknown, the (base, fat, thin) triple cannot be cached by checksum.
 
-- The "base" future evaluates all fat input futures on the Dask worker, resolving the checksums into buffers. 
-It checks the remote database (again) for a cache hit (unlikely, but possible). 
-In cache of a cache hit, it returns a tuple (transformation_checksum, result_checksum, None, None). Otherwise, it runs the transformation on the worker,
-converted to a result buffer, and then returns (transformation_checksum, result_checksum, result_buffer, None). 
-In case of an exception, it returns instead (transformation_checksum, None, None, exc), where exc is the exception traceback rendered as string.
-- The "fat" future depends on the "base" future, taking its output as input. 
-If the "base" future did not return (transformation_checksum, result_checksum, None, None), then the "fat" future will return 
-the last three elements of this result.
-If it did return (transformation_checksum, result_checksum, None, None), then the "fat" future will construct the result checksum's "fat checksum" future,
-await it, and return its result. 
-Using "default-task-durations", it is indicated that fat tasks are instantaneous (since a cache hit is unlikely, and even then it's quite fast).
-- The "thin" future depends on the "base" future, returning its first, second and last element, i.e. (transformation_checksum, result_checksum, exc).
-Using "default-task-durations", it is indicated that fat tasks are instantaneous
-
-The task key of the three futures is generated deterministically by prefixing the transformation checksum. It is possible that they are already
-running (and not finished; we would get a cache hit otherwise), but Dask but handle that gracefully.
-
-All three futures are constructed and kept as length-3 tuples in a transformation_checksum-to-triple-Future cache, 
-which works the same as the checksum-to-fat-checksum-Future cache. The cache can be interrogated by compute(), either its own computation
-or that of a dependent Transformation.
-If they have disappeared from cache, the length-3 tuples are reconstructed, and kept alive as long as the Transformation is computing. 
-At the end of computation, the strong cache has its expiry refreshed once more.
-
-For a case 1 Dask-submitted Seamless transformation, .compute() runs the thin future. 
-If exc is not None, it will set the transformation exception as a RemoteException (a subclass of RuntimeError) with exc as its value. 
-Otherwise, it will set result_checksum as the result checksum. In addition, it will create a dummy task with the same task key as the result
-checksum's "fat checksum" task, that returns the fat future.
-
-The semantics of .construct() and .run() are unchanged.
-
-Case 2. A transformation with dependencies. 
-In this case, the semantics of .construct() are unchanged, but .compute() will no longer automatically call .construct() .
-Instead, when .compute() is called:
-First, it checks if its dependencies have been run. If any of them has run with an exception, it will set as exception
-"Dependency has an exception", just like a non-Dask-submitted transformation does (although in that other case, dependency
-evaluation will have been forced, and here we do no such thing). 
-Then, we verify that each dependency Transformation is known to Dask, i.e. it has an active length-3 tuple-of-Dask-Futures attribute.
-Otherwise, we can only use it if it has been run, i.e. if we can replace the dependency by its result checksum.
-If we are forced to do such replacement, check afterwards if there are any non-replaced dependencies left. If not, proceed as in case 1.
-If the dependency Transformation is not known to Dask nor has it been run, we have to rebuild the dependency's length-3 tuple.
-
-Now, a transformation dict is constructed containing fat checksum Futures for "normal" inputs (where the checksum is known) 
-and fat Transformation futures (taken from their length-3 tuple) for Transformation inputs.
-This is then converted into three Dask future.s:
-
-- The "base" future does construction on the Dask worker. At evaluation time, all input checksums will be available because
-the checksum of all fat input futures is available (the second element of their result tuple).
-Therefore, the transformation checksum can be built. It checks the remote database for a cache hit.
-In cache of a cache hit, it returns a tuple (transformation_checksum, result_checksum, None, None).
-
-Even if not, it now knows the deterministic task key for a case 1 base future with the same transformation checksum. 
-It checks the scheduler if it knows about a such a task key X. If so, it latches on to it using a naked Future and returns its result.
-
-Otherwise, it retrieves its own task key Y and registers under X a dummy task that simply returns the result of Y. 
-Then, it runs the transformation on the worker,
-converted to a result buffer, and then returns (transformation_checksum, result_checksum, result_buffer, None). 
-In case of an exception, it returns instead (transformation_checksum, None, None, exc), where exc is the exception traceback rendered as string.
-
-- The "fat" and "thin" futures work the same as for case 1.
-All three futures are constructed and kept as length-3 tuples upon compute(). However, since their transformation checksum is unknown, this 
-length-3 tuple cannot be cached.
+Keying and caches:
+- Deterministic keys should incorporate anything that changes semantics (e.g., scratch/meta/resources) to avoid unintended cross-client reuse/cancellation.
+- Keep strong references to long-running futures; the 10s strong-cache TTL is refreshed on access, but if the client drops references, Dask may cancel in-flight work.
+- Nested client submissions from workers should avoid blocking; if awaiting nested futures, use `worker_client(secede=True)` to free the worker thread.
