@@ -14,30 +14,3 @@ complete (or constructed manually), Transformation.transformation_checksum is se
 and they are entered under transformation_checksum into the Dask future cache 
 for Case 1 transformations (if not existing).
 The fat future is also entered under result_checksum into the fat checksum cache (if not existing).
-
-D. In the long run, look into mechanism to make Seamless even more memory/IO efficient:
-- Support file "upload" with hardlinks
-
-- Construct numpy array from Buffer with memory reuse (np.frombuffer). Challenge: Buffer content contains numpy header.
-
-import io
-import numpy as np
-import numpy.lib.format as fmt
-
-def parse_npy_header(b):
-    """Return (shape, fortran_order, dtype, data_offset) from .npy bytes/BytesIO."""
-    if isinstance(b, (bytes, bytearray, memoryview)):
-        f = io.BytesIO(b)
-    else:
-        # assume file-like (e.g. BytesIO already)
-        f = b
-
-    version = fmt.read_magic(f)
-    if version == (1, 0):
-        shape, fortran_order, dtype = fmt.read_array_header_1_0(f)
-    else:
-        # covers 2.0 and 3.0 formats
-        shape, fortran_order, dtype = fmt.read_array_header_2_0(f)
-
-    data_offset = f.tell()
-    return shape, fortran_order, dtype, data_offset
