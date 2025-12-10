@@ -21,7 +21,7 @@ async def create_dummy_scheduler(
     host: str = "127.0.0.1",
     port: int = 0,
     workers: int = 1,
-    worker_threads: int = 1,
+    worker_threads: int = 3,
 ) -> Tuple[Scheduler, list[Worker]]:
     """Start a Dask scheduler with a handful of local workers."""
     if workers < 0:
