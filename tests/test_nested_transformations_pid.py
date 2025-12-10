@@ -2,7 +2,8 @@ import os
 
 import seamless
 
-from seamless_transformer import delayed, worker
+from seamless.transformer import delayed
+from seamless_transformer import worker
 from seamless_dask.default import default_client
 from seamless_dask.transformer_client import set_dask_client
 

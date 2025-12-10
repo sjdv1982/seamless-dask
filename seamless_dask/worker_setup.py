@@ -19,15 +19,15 @@ class SeamlessWorkerPlugin(WorkerPlugin):
 
     def setup(self, worker) -> None:  # type: ignore[override]
         try:
-            from seamless_transformer import worker as seamless_worker
+            from seamless.transformer import has_spawned, spawn
 
             if getattr(worker.state, "nthreads", None) not in (None, self.num_workers):
                 raise RuntimeError(
                     f"Dask worker threads ({getattr(worker.state, 'nthreads', None)}) "
                     f"must equal Seamless worker count ({self.num_workers})"
                 )
-            if not seamless_worker.has_spawned():
-                seamless_worker.spawn(self.num_workers)
+            if not has_spawned():
+                spawn(self.num_workers)
                 LOGGER.info(
                     "Spawned Seamless workers inside Dask worker %s (count=%d)",
                     worker.name,

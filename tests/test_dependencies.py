@@ -3,7 +3,8 @@ import time
 
 import seamless
 
-from seamless_transformer import delayed, worker
+from seamless.transformer import delayed
+from seamless_transformer import worker
 from seamless_dask.default import default_client
 from seamless_dask.transformer_client import set_dask_client
 
@@ -27,10 +28,11 @@ def test_dependencies():
     with default_client(workers=1, worker_threads=3) as sd_client:
         set_dask_client(sd_client)
         try:
+
             @delayed
             def slow_add(a, b, c=None, d=None, e=None):
                 import time
-                from seamless_transformer import global_lock
+                from seamless.transformer import global_lock
 
                 with global_lock:
                     time.sleep(0.2)

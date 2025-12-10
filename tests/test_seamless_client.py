@@ -1,7 +1,7 @@
 import seamless
 from seamless import Buffer
 
-from seamless_transformer.transformer_class import delayed
+from seamless.transformer import delayed
 from seamless_dask.transformer_client import set_dask_client
 
 from seamless_dask.default import default_client
@@ -14,7 +14,7 @@ def _get_nthreads():
 
 
 def test_seamless_client_executes_transformation() -> None:
-    from seamless_transformer import Transformation
+    from seamless.transformer import Transformation
 
     with default_client(workers=1, worker_threads=3) as sd_client:
         set_dask_client(sd_client)
