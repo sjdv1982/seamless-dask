@@ -21,17 +21,19 @@ class SeamlessWorkerPlugin(WorkerPlugin):
         try:
             from seamless.transformer import has_spawned, spawn
 
-            if getattr(worker.state, "nthreads", None) not in (None, self.num_workers):
+            threads = getattr(worker.state, "nthreads", None)
+            if threads is not None and threads < self.num_workers:
                 raise RuntimeError(
-                    f"Dask worker threads ({getattr(worker.state, 'nthreads', None)}) "
-                    f"must equal Seamless worker count ({self.num_workers})"
+                    f"Dask worker threads ({threads}) "
+                    f"must be at least Seamless worker count ({self.num_workers})"
                 )
             if not has_spawned():
                 spawn(self.num_workers)
                 LOGGER.info(
-                    "Spawned Seamless workers inside Dask worker %s (count=%d)",
+                    "Spawned Seamless workers inside Dask worker %s (count=%d, threads=%s)",
                     worker.name,
                     self.num_workers,
+                    threads,
                 )
         except Exception as exc:  # pragma: no cover - best-effort safety
             LOGGER.error(

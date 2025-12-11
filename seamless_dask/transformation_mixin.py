@@ -10,7 +10,11 @@ from seamless import Checksum
 from seamless_transformer.transformation_utils import tf_get_buffer
 
 from .transformer_client import get_dask_client
-from .types import TransformationFutures, TransformationInputSpec, TransformationSubmission
+from .types import (
+    TransformationFutures,
+    TransformationInputSpec,
+    TransformationSubmission,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - type checking only
     from .client import SeamlessDaskClient
@@ -35,7 +39,7 @@ class TransformationDaskMixin:
             )
             tf_checksum_hex, result_checksum_hex, exc = futures.thin.result()
         except Exception:
-            self._exception = traceback.format_exc(limit=0).strip("\n") + "\n"
+            self._exception = traceback.format_exc().strip("\n") + "\n"
             self._constructed = True
             self._evaluated = True
             return None
@@ -54,9 +58,7 @@ class TransformationDaskMixin:
 
     async def _compute_with_dask_async(self, require_value: bool) -> Checksum | None:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            None, self._compute_with_dask, require_value
-        )
+        return await loop.run_in_executor(None, self._compute_with_dask, require_value)
 
     # ---- internals --------------------------------------------------------
     def _get_resource(self) -> str:
@@ -73,8 +75,8 @@ class TransformationDaskMixin:
             raise RuntimeError("No pre-transformation available for Dask")
 
         upstream_dependencies = getattr(self, "_upstream_dependencies", {}) or {}
-        transformation_dict, dependencies = pretransformation.build_partial_transformation(
-            upstream_dependencies
+        transformation_dict, dependencies = (
+            pretransformation.build_partial_transformation(upstream_dependencies)
         )
         tf_checksum_hex: str | None = None
         if not dependencies:
@@ -153,9 +155,7 @@ class TransformationDaskMixin:
             submission = self._build_dask_submission(
                 client, require_value=require_value, need_fat=need_fat
             )
-            futures = client.submit_transformation(
-                submission, need_fat=need_fat
-            )
+            futures = client.submit_transformation(submission, need_fat=need_fat)
             self._dask_futures = futures
         if need_fat and futures.fat is None:
             futures.fat = client.ensure_fat_future(
@@ -165,4 +165,3 @@ class TransformationDaskMixin:
 
 
 __all__ = ["TransformationDaskMixin"]
-
