@@ -16,25 +16,43 @@ import time
 from typing import Callable, Optional
 
 DefaultLoadProvider = Callable[[], float]
+ResourceUpdater = Callable[[int], None]
 
 
 class PermissionManager:
     """Synchronous permission gate with epoch-based batching."""
 
-    def __init__(self, *, workers: int, throttle: int, load_provider: DefaultLoadProvider) -> None:
+    def __init__(
+        self,
+        *,
+        workers: int,
+        throttle: int,
+        load_provider: DefaultLoadProvider,
+        resource_updater: ResourceUpdater | None = None,
+    ) -> None:
         self.workers = max(1, int(workers))
         self.throttle = max(1, int(throttle))
         # S starts at the number of Seamless workers on this Dask worker.
         self._s_counter = float(self.workers)
         self._load_provider = load_provider
+        self._resource_updater = resource_updater
         self._lock = threading.Lock()
         self._pending: list[dict] = []
         self._epoch_thread: Optional[threading.Thread] = None
         self._epoch_deadline: float | None = None
+        self._sync_resources()
 
     @property
     def capacity(self) -> int:
         return self.throttle * self.workers
+
+    def _sync_resources(self) -> None:
+        if self._resource_updater is None:
+            return
+        try:
+            self._resource_updater(int(math.ceil(self._s_counter)))
+        except Exception:
+            pass
 
     def _schedule_epoch_if_needed(self, deadline: float) -> None:
         if self._epoch_thread is not None and self._epoch_thread.is_alive():
@@ -70,6 +88,7 @@ class PermissionManager:
                     self._s_counter += 1.0
                     grant_count -= 1
                     granted = True
+                    self._sync_resources()
                 entry["result"] = granted
                 entry["condition"].notify()
 
@@ -88,6 +107,7 @@ class PermissionManager:
         with self._lock:
             if self._s_counter < self.capacity:
                 self._s_counter += 1.0
+                self._sync_resources()
                 return True
 
             free_ratio = self._safe_load_ratio()
@@ -110,6 +130,7 @@ class PermissionManager:
         with self._lock:
             baseline = float(self.workers)
             self._s_counter = max(baseline, self._s_counter - 1.0)
+            self._sync_resources()
 
     def shutdown(self) -> None:
         """Best-effort shutdown to prevent lingering epoch threads."""
@@ -148,18 +169,30 @@ def _default_load_provider() -> float:
         return 1.0
 
 
-def configure(workers: int, throttle: int, load_provider: DefaultLoadProvider | None = None) -> None:
+def configure(
+    workers: int,
+    throttle: int,
+    load_provider: DefaultLoadProvider | None = None,
+    resource_updater: ResourceUpdater | None = None,
+) -> None:
     """Configure the global permission manager."""
     global _manager, _load_provider
     _load_provider = load_provider or _default_load_provider
-    _manager = PermissionManager(workers=workers, throttle=throttle, load_provider=_load_provider)
+    _manager = PermissionManager(
+        workers=workers,
+        throttle=throttle,
+        load_provider=_load_provider,
+        resource_updater=resource_updater,
+    )
 
 
-def ensure_configured(workers: int, throttle: int) -> None:
+def ensure_configured(
+    workers: int, throttle: int, *, resource_updater: ResourceUpdater | None = None
+) -> None:
     """Ensure a manager exists; if not, configure with the provided defaults."""
     global _manager
     if _manager is None:
-        configure(workers, throttle)
+        configure(workers, throttle, resource_updater=resource_updater)
 
 
 def request_permission() -> bool:

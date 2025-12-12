@@ -173,7 +173,11 @@ class SeamlessDaskClient:
             return cached[0]
 
         future = self._client.submit(
-            _fat_checksum_task, checksum_hex, pure=False, key=key
+            _fat_checksum_task,
+            checksum_hex,
+            pure=False,
+            key=key,
+            resources={"S": 1},
         )
         self._fat_checksum_cache[key] = (future, self._expiry())
         return future
@@ -208,17 +212,26 @@ class SeamlessDaskClient:
         thin_key = self._build_key("thin", resource, tf_checksum_hex)
 
         base_future = self._client.submit(
-            _run_base, payload, input_futures, pure=False, key=base_key
+            _run_base,
+            payload,
+            input_futures,
+            pure=False,
+            key=base_key,
+            resources={"S": 1},
         )
         thin_future = self._client.submit(
-            _run_thin, base_future, pure=False, key=thin_key
+            _run_thin, base_future, pure=False, key=thin_key, resources={"S": 1}
         )
 
         fat_future = None
         if need_fat:
             fat_key = self._build_key("fat", resource, tf_checksum_hex)
             fat_future = self._client.submit(
-                _run_fat, base_future, pure=False, key=fat_key
+                _run_fat,
+                base_future,
+                pure=False,
+                key=fat_key,
+                resources={"S": 1},
             )
 
         futures = TransformationFutures(
@@ -248,7 +261,7 @@ class SeamlessDaskClient:
         tf_hex = futures.tf_checksum
         fat_key = self._build_key("fat", resource, tf_hex)
         futures.fat = self._client.submit(
-            _run_fat, futures.base, pure=False, key=fat_key
+            _run_fat, futures.base, pure=False, key=fat_key, resources={"S": 1}
         )
         if futures.result_checksum:
             fat_cache_key = self._fat_checksum_key(futures.result_checksum, resource)

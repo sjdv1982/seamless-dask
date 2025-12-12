@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -28,8 +29,23 @@ class SeamlessWorkerPlugin(WorkerPlugin):
                     f"Dask worker threads ({threads}) "
                     f"must be at least Seamless worker count ({self.num_workers})"
                 )
+
+            def _update_resources(value: int) -> None:
+                """Push the current permission counter to the scheduler."""
+
+                try:
+                    loop = getattr(worker.loop, "asyncio_loop", None) or worker.loop
+                    coro = worker.set_resources(S=float(value))
+                    asyncio.run_coroutine_threadsafe(coro, loop)
+                except Exception:
+                    LOGGER.debug("Failed to update worker resources", exc_info=True)
+
             try:
-                configure_permissions(workers=self.num_workers, throttle=3)
+                configure_permissions(
+                    workers=self.num_workers,
+                    throttle=3,
+                    resource_updater=_update_resources,
+                )
             except Exception:
                 LOGGER.debug("Failed to configure permission manager", exc_info=True)
             if not has_spawned():
