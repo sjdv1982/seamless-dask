@@ -9,10 +9,6 @@ from seamless_dask.default import default_client
 from seamless_dask.transformer_client import set_dask_client
 
 
-def _sum_non_none(*values: int) -> int:
-    return sum(v for v in values if v is not None)
-
-
 def _measure_run(tf, expected: int) -> float:
     start = time.perf_counter()
     result = tf.run()
@@ -36,11 +32,11 @@ def test_dependencies():
 
                 with global_lock:
                     time.sleep(0.2)
-                return _sum_non_none(a, b, c, d, e)
+                return sum(v for v in (a, b, c, d, e) if v is not None)
 
             @delayed
             def fast_add(a, b, c=None, d=None, e=None):
-                return _sum_non_none(a, b, c, d, e)
+                return sum(v for v in (a, b, c, d, e) if v is not None)
 
             # Two independent slow adds should run in parallel on the Dask worker pool.
             duration = _measure_run(
@@ -77,5 +73,4 @@ def test_dependencies():
             assert 0.2 < duration < 1.5
         finally:
             set_dask_client(None)
-            worker.shutdown_workers()
             seamless.close()

@@ -35,7 +35,7 @@ def _test_nested_transformations(local, OFFSET):
         try:
 
             @delayed
-            def outer(label):
+            def outer(label, local):
                 import os
                 from seamless.transformer import delayed
 
@@ -61,7 +61,7 @@ def _test_nested_transformations(local, OFFSET):
 
                 return {"outer_pid": os.getpid(), "results": (first, second)}
 
-            combined = outer("beta" + str(OFFSET))
+            combined = outer("beta" + str(OFFSET), local)
 
             first_run = combined.run()
             first_result, second_result = first_run["results"]
@@ -79,7 +79,7 @@ def _test_nested_transformations(local, OFFSET):
             assert second_result[0] == "beta" + str(OFFSET) + "-2", second_result
             assert first_result[1] != main_pid
 
-            repeat_tf = outer("beta" + str(OFFSET))
+            repeat_tf = outer("beta" + str(OFFSET), local)
             repeat_run = repeat_tf.run()
             all_results = {
                 _canonical_result(first_result),

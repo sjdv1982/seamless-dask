@@ -20,6 +20,7 @@ class SeamlessWorkerPlugin(WorkerPlugin):
     def setup(self, worker) -> None:  # type: ignore[override]
         try:
             from seamless.transformer import has_spawned, spawn
+            from .permissions import configure as configure_permissions
 
             threads = getattr(worker.state, "nthreads", None)
             if threads is not None and threads < self.num_workers:
@@ -27,6 +28,10 @@ class SeamlessWorkerPlugin(WorkerPlugin):
                     f"Dask worker threads ({threads}) "
                     f"must be at least Seamless worker count ({self.num_workers})"
                 )
+            try:
+                configure_permissions(workers=self.num_workers, throttle=3)
+            except Exception:
+                LOGGER.debug("Failed to configure permission manager", exc_info=True)
             if not has_spawned():
                 spawn(self.num_workers)
                 LOGGER.info(
@@ -46,9 +51,15 @@ class SeamlessWorkerPlugin(WorkerPlugin):
         try:
             from seamless_transformer import worker as seamless_worker
 
-            seamless_worker.shutdown_workers()
+            seamless_worker.shutdown_workers(wait=False)
         except Exception:  # pragma: no cover - best-effort safety
             LOGGER.debug("Failed to shut down Seamless workers cleanly", exc_info=True)
+        try:
+            from .permissions import shutdown_permission_manager
+
+            shutdown_permission_manager()
+        except Exception:  # pragma: no cover - best-effort safety
+            LOGGER.debug("Failed to shut down permission manager cleanly", exc_info=True)
 
 
 __all__ = ["SeamlessWorkerPlugin"]

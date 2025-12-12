@@ -14,6 +14,7 @@ from seamless import Buffer, Checksum
 from seamless_transformer.transformation_cache import run_sync
 from seamless_transformer.transformation_utils import tf_get_buffer
 
+from .permissions import ensure_configured
 from .types import (
     TransformationFutures,
     TransformationInputSpec,
@@ -148,6 +149,7 @@ class SeamlessDaskClient:
         self._ttl = strong_cache_ttl
         self._fat_checksum_cache: dict[str, tuple[Future, float]] = {}
         self._transformation_cache: dict[str, tuple[TransformationFutures, float]] = {}
+        ensure_configured(workers=worker_plugin_workers, throttle=3)
         self._register_worker_plugin(worker_plugin_workers)
 
     # --- public API -----------------------------------------------------

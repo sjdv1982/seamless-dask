@@ -1,23 +1,38 @@
 import os
+
+import pytest
+from seamless.transformer import delayed
+from seamless_dask.default import default_client
+from seamless_dask.transformer_client import set_dask_client
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _close_seamless_session():
+    """Ensure Seamless shuts down once after the full test session."""
+    import seamless
+
+    yield
+    seamless.close()
+
+
+import os
 import time
 
 import seamless
-from seamless.transformer import delayed
-from seamless_transformer import worker
-from seamless_dask.default import default_client
-from seamless_dask.transformer_client import set_dask_client
+from seamless.transformer import delayed, spawn
 from tqdm import tqdm
 
-tqdm = lambda x: x  ### debug
 
-
-def test_nested_transformations_stress():
+def test_nested_transformations_multi():
     """Stress nested + nested-nested execution with many small jobs."""
 
     main_pid = os.getpid()
-    job_count = 1
+    job_count = 200
+    spawn_workers = 5
 
-    with default_client(workers=1, spawn_workers=5, worker_threads=10) as sd_client:
+    with default_client(
+        workers=1, spawn_workers=spawn_workers, worker_threads=3 * spawn_workers
+    ) as sd_client:
         set_dask_client(sd_client)
         try:
 
@@ -25,15 +40,16 @@ def test_nested_transformations_stress():
             def outer(label: str):
                 from seamless.transformer import delayed, direct
 
-                ###@direct
+                @direct
                 def middle(label: str):
                     from seamless.transformer import delayed, direct
 
                     def leaf(label: str):
                         import time
                         import os
+                        from seamless.transformer import global_lock
 
-                        time.sleep(0.1)
+                        time.sleep(0.5)
                         return label, os.getpid()
 
                     leaf = delayed(leaf)
@@ -45,8 +61,7 @@ def test_nested_transformations_stress():
 
                 first = middle(f"{label}-1")
                 second = middle(f"{label}-2")
-                # return first, second
-                return first, first
+                return first, second
 
             start = time.perf_counter()
             tasks = [outer(f"job-{idx}").start() for idx in range(job_count)]
@@ -71,8 +86,18 @@ def test_nested_transformations_stress():
 
             assert expected_labels == seen_labels
             assert len(seen_pids) >= 2  # should run on spawned workers
-            assert duration < 30.0  # should complete with reasonable concurrency
+            import math
+
+            assert duration * 0.9 - 2 < 0.5 * job_count * max(
+                math.log(job_count / 5), 1
+            ) / (
+                spawn_workers * 0.5
+            )  # should complete with reasonable (half of spawn workers) concurrency, and 2 + 10 % overhead
+            # Add another log(job_count/5) factor for contention
+
         finally:
             set_dask_client(None)
-            worker.shutdown_workers()
-            seamless.close()
+            try:
+                seamless.close()
+            except Exception:
+                pass

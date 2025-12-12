@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import random
+import time
 import traceback
 from typing import Any, Dict, Optional, TYPE_CHECKING
 
 from seamless import Checksum
 from seamless_transformer.transformation_utils import tf_get_buffer
 
+from .permissions import release_permission, request_permission
 from .transformer_client import get_dask_client
 from .types import (
     TransformationFutures,
@@ -33,9 +36,16 @@ class TransformationDaskMixin:
         client = self._dask_client()
         if client is None:
             return None
+
+        use_dask = self._wait_for_permission(env_requires_remote=False)
+        if not use_dask:
+            return self._run_local_fallback_sync(require_value=require_value)
         try:
             futures = self._ensure_dask_futures(
-                client, require_value=require_value, need_fat=False
+                client,
+                require_value=require_value,
+                need_fat=False,
+                permission_granted=True,
             )
             tf_checksum_hex, result_checksum_hex, exc = futures.thin.result()
         except Exception:
@@ -57,8 +67,42 @@ class TransformationDaskMixin:
         return self._result_checksum
 
     async def _compute_with_dask_async(self, require_value: bool) -> Checksum | None:
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._compute_with_dask, require_value)
+        client = self._dask_client()
+        if client is None:
+            return None
+        use_dask = await self._wait_for_permission_async(env_requires_remote=False)
+        if not use_dask:
+            return await self._run_local_fallback_async(require_value=require_value)
+
+        try:
+            futures = self._ensure_dask_futures(
+                client,
+                require_value=require_value,
+                need_fat=False,
+                permission_granted=True,
+            )
+            tf_checksum_hex, result_checksum_hex, exc = await asyncio.wrap_future(
+                asyncio.get_running_loop().run_in_executor(
+                    None, futures.thin.result
+                )
+            )
+        except Exception:
+            self._exception = traceback.format_exc().strip("\n") + "\n"
+            self._constructed = True
+            self._evaluated = True
+            return None
+        if exc:
+            self._exception = exc if exc.endswith("\n") else exc + "\n"
+            self._constructed = True
+            self._evaluated = True
+            return None
+        if tf_checksum_hex:
+            self._transformation_checksum = Checksum(tf_checksum_hex)
+            self._constructed = True
+        if result_checksum_hex:
+            self._result_checksum = Checksum(result_checksum_hex)
+            self._evaluated = True
+        return self._result_checksum
 
     # ---- internals --------------------------------------------------------
     def _get_resource(self) -> str:
@@ -66,6 +110,65 @@ class TransformationDaskMixin:
         if isinstance(meta, dict):
             return meta.get("resource", "default")
         return "default"
+
+    def _env_allows_local(self) -> bool:
+        """Stub for environment analysis; currently always returns True."""
+
+        return True
+
+    def _wait_for_permission(self, *, env_requires_remote: bool) -> bool:
+        """Blocking permission acquisition with 10% local fallback on denial."""
+
+        while True:
+            granted = request_permission()
+            if granted:
+                return True
+            if env_requires_remote:
+                time.sleep(0.05)
+                continue
+            if random.random() < 0.1:
+                return False
+            time.sleep(0.05)
+
+    async def _wait_for_permission_async(self, *, env_requires_remote: bool) -> bool:
+        while True:
+            granted = await asyncio.get_running_loop().run_in_executor(
+                None, request_permission
+            )
+            if granted:
+                return True
+            if env_requires_remote:
+                await asyncio.sleep(0.05)
+                continue
+            if random.random() < 0.1:
+                return False
+            await asyncio.sleep(0.05)
+
+    def _run_local_fallback_sync(self, require_value: bool) -> Checksum | None:
+        """Execute the transformation locally (no Dask) when permission is denied."""
+
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+
+            async def _run():
+                await self._run_dependencies_async(require_value=require_value)
+                await self._evaluation(require_value=require_value)
+                return self._result_checksum
+
+            return loop.run_until_complete(_run())
+        finally:
+            try:
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            except Exception:
+                pass
+            asyncio.set_event_loop(None)
+            loop.close()
+
+    async def _run_local_fallback_async(self, require_value: bool) -> Checksum | None:
+        await self._run_dependencies_async(require_value=require_value)
+        await self._evaluation(require_value=require_value)
+        return self._result_checksum
 
     def _build_dask_submission(
         self, client: "SeamlessDaskClient", *, require_value: bool, need_fat: bool
@@ -148,15 +251,37 @@ class TransformationDaskMixin:
         *,
         require_value: bool,
         need_fat: bool = False,
+        permission_granted: bool = False,
     ) -> TransformationFutures:
+        permission_released = False
         if self._dask_futures is not None:
             futures = self._dask_futures
         else:
             submission = self._build_dask_submission(
                 client, require_value=require_value, need_fat=need_fat
             )
-            futures = client.submit_transformation(submission, need_fat=need_fat)
-            self._dask_futures = futures
+            if submission.tf_checksum:
+                cached = client._transformation_cache.get(submission.tf_checksum)  # type: ignore[attr-defined]
+                if cached is not None and not cached[0].base.cancelled():
+                    if permission_granted:
+                        release_permission()
+                        permission_released = True
+                    futures = cached[0]
+                    self._dask_futures = futures
+                    if need_fat and futures.fat is None:
+                        futures.fat = client.ensure_fat_future(
+                            futures, resource=self._get_resource()
+                        )
+                    return futures
+            try:
+                futures = client.submit_transformation(submission, need_fat=need_fat)
+                self._dask_futures = futures
+                if permission_granted and futures.base is not None:
+                    futures.base.add_done_callback(lambda _f: release_permission())
+                    permission_released = True
+            finally:
+                if permission_granted and not permission_released:
+                    release_permission()
         if need_fat and futures.fat is None:
             futures.fat = client.ensure_fat_future(
                 futures, resource=self._get_resource()

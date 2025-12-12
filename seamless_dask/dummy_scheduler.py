@@ -230,8 +230,8 @@ class DummySchedulerHandle:
                 fut.result(timeout=timeout)
             self._loop.call_soon_threadsafe(self._loop.stop)
         if self._thread is not None:
-            self._thread.join(timeout=timeout)
-        self._stop_event.wait(timeout=timeout)
+            self._thread.join(timeout=min(timeout, 2.0))
+        self._stop_event.wait(timeout=min(timeout, 2.0))
 
     def __enter__(self) -> DummySchedulerHandle:
         self.start()

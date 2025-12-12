@@ -12,7 +12,7 @@ from .dummy_scheduler import DummySchedulerHandle, start_dummy_scheduler
 
 
 def create_default_client(
-    *, workers: int = 1, worker_threads: int = 3, spawn_workers: int = 3
+    *, workers: int = 1, worker_threads: int = 9, spawn_workers: int = 3
 ) -> Tuple[SeamlessDaskClient, DummySchedulerHandle, Client]:
     """Start a dummy scheduler and return a connected Seamless client."""
     scheduler = start_dummy_scheduler(
@@ -28,7 +28,7 @@ def create_default_client(
 
 @contextlib.contextmanager
 def default_client(
-    *, workers: int = 1, worker_threads: int = 3, spawn_workers: int = 3
+    *, workers: int = 1, worker_threads: int = 9, spawn_workers: int = 3
 ) -> Iterator[SeamlessDaskClient]:
     """Context manager that yields a configured Seamless Dask client."""
     client: SeamlessDaskClient | None = None
@@ -40,14 +40,20 @@ def default_client(
         )
         yield client
     finally:
+        try:
+            from .permissions import shutdown_permission_manager
+
+            shutdown_permission_manager()
+        except Exception:
+            pass
         if dask_client is not None:
             try:
-                dask_client.close()
+                dask_client.close(timeout="2s")
             except Exception:
                 pass
         if scheduler is not None:
             try:
-                scheduler.stop()
+                scheduler.stop(timeout=2.0)
             except Exception:
                 pass
 
