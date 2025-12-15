@@ -1,0 +1,20 @@
+name: seamless-dask
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.13
+  - aiofiles
+  - dask
+  - distributed
+  - aiohttp
+  - pyyaml
+  - numpy
+  - pip
+  - pip:
+      - orjson
+      - frozendict
+      - -e .
+      - -e ./seamless-base
+      - -e ./seamless-transformer
+      - -e ./seamless-config
+      - -e ./seamless-remote
