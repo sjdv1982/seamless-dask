@@ -42,9 +42,7 @@ class SeamlessWorkerPlugin(WorkerPlugin):
 
             try:
                 configure_permissions(
-                    workers=self.num_workers,
-                    throttle=3,
-                    resource_updater=_update_resources,
+                    workers=self.num_workers, resource_updater=_update_resources
                 )
             except Exception:
                 LOGGER.debug("Failed to configure permission manager", exc_info=True)
@@ -75,7 +73,9 @@ class SeamlessWorkerPlugin(WorkerPlugin):
 
             shutdown_permission_manager()
         except Exception:  # pragma: no cover - best-effort safety
-            LOGGER.debug("Failed to shut down permission manager cleanly", exc_info=True)
+            LOGGER.debug(
+                "Failed to shut down permission manager cleanly", exc_info=True
+            )
 
 
 __all__ = ["SeamlessWorkerPlugin"]

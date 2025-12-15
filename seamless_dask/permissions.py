@@ -5,6 +5,8 @@ process-local (driver or worker) and keeps track of a resource counter ``S``
 and the throttle capacity ``T * N``. Requests that would exceed the capacity
 are batched per 10s epoch and granted/denied according to the load and
 random chance; denied requests can trigger a caller-side local fallback.
+
+Throttle capacity is determined by seamless_transformation.worker.TRANSFORMATION_THROTTLE
 """
 
 from __future__ import annotations
@@ -26,12 +28,10 @@ class PermissionManager:
         self,
         *,
         workers: int,
-        throttle: int,
         load_provider: DefaultLoadProvider,
         resource_updater: ResourceUpdater | None = None,
     ) -> None:
         self.workers = max(1, int(workers))
-        self.throttle = max(1, int(throttle))
         # S starts at the number of Seamless workers on this Dask worker.
         self._s_counter = float(self.workers)
         self._load_provider = load_provider
@@ -44,7 +44,9 @@ class PermissionManager:
 
     @property
     def capacity(self) -> int:
-        return self.throttle * self.workers
+        from seamless_transformer.worker import TRANSFORMATION_THROTTLE
+
+        return TRANSFORMATION_THROTTLE * self.workers
 
     def _sync_resources(self) -> None:
         if self._resource_updater is None:
@@ -171,7 +173,6 @@ def _default_load_provider() -> float:
 
 def configure(
     workers: int,
-    throttle: int,
     load_provider: DefaultLoadProvider | None = None,
     resource_updater: ResourceUpdater | None = None,
 ) -> None:
@@ -180,25 +181,24 @@ def configure(
     _load_provider = load_provider or _default_load_provider
     _manager = PermissionManager(
         workers=workers,
-        throttle=throttle,
         load_provider=_load_provider,
         resource_updater=resource_updater,
     )
 
 
 def ensure_configured(
-    workers: int, throttle: int, *, resource_updater: ResourceUpdater | None = None
+    workers: int, *, resource_updater: ResourceUpdater | None = None
 ) -> None:
     """Ensure a manager exists; if not, configure with the provided defaults."""
     global _manager
     if _manager is None:
-        configure(workers, throttle, resource_updater=resource_updater)
+        configure(workers, resource_updater=resource_updater)
 
 
 def request_permission() -> bool:
     """Blocking permission request."""
     if _manager is None:
-        configure(workers=1, throttle=3)
+        configure(workers=1)
     return _manager.request()  # type: ignore[union-attr]
 
 
