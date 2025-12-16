@@ -49,7 +49,7 @@ class StatusFileTracker:
     def _write(self, payload: dict):
         tmp_path = f"{self.path}.tmp"
         with open(tmp_path, "w", encoding="utf-8") as status_stream:
-            json.dump(payload, status_stream)
+            json.dump(payload, status_stream, indent=4)
             status_stream.write("\n")
         os.replace(tmp_path, self.path)
 
@@ -107,7 +107,9 @@ def wait_for_status_file(path: str, timeout: float = STATUS_FILE_WAIT_TIMEOUT):
     return contents
 
 
-def pick_random_free_port(host: str, start: int, end: int, *, exclude: Iterable[int] = ()):
+def pick_random_free_port(
+    host: str, start: int, end: int, *, exclude: Iterable[int] = ()
+):
     if start < 0 or end > 65535:
         raise RuntimeError("--port-range values must be between 0 and 65535")
     if start > end:
@@ -255,6 +257,8 @@ def merge_flat_config(flat_config: Mapping[str, Any]) -> Dict[str, Any]:
 
 @dataclass
 class WrapperConfig:
+    common: Dict[str, Dict[str, Any]]
+    worker_threads: int
     jobqueue_config: Dict[str, Dict[str, Any]]
     dask_config: Dict[str, Any]
     env_exports: List[str]
@@ -295,10 +299,14 @@ def build_wrapper_configuration(
 
     tmpdir = parameters.get("tmpdir", DEFAULT_TMPDIR)
     partition = parameters.get("partition")
-    job_extra_directives = ensure_list(parameters.get("job_extra_directives"), "job_extra_directives")
+    job_extra_directives = ensure_list(
+        parameters.get("job_extra_directives"), "job_extra_directives"
+    )
     project = parameters.get("project")
     memory_per_core_property_name = parameters.get("memory_per_core_property_name")
-    user_job_script_prologue = ensure_list(parameters.get("job_script_prologue"), "job_script_prologue")
+    user_job_script_prologue = ensure_list(
+        parameters.get("job_script_prologue"), "job_script_prologue"
+    )
 
     transformation_throttle = parameters.get(
         "transformation_throttle", DEFAULT_TRANSFORMATION_THROTTLE
@@ -312,7 +320,9 @@ def build_wrapper_configuration(
 
     worker_threads = cores * transformation_throttle
     env_exports: List[str] = [
-        format_bash_export("SEAMLESS_WORKER_TRANSFORMATION_THROTTLE", transformation_throttle)
+        format_bash_export(
+            "SEAMLESS_WORKER_TRANSFORMATION_THROTTLE", transformation_throttle
+        )
     ]
 
     unknown_task_duration = parameters.get(
@@ -333,7 +343,9 @@ def build_wrapper_configuration(
             walltime_td = parse_timedelta_value(walltime)
             stagger_td = parse_timedelta_value(lifetime_stagger)
             grace_td = parse_timedelta_value(DEFAULT_LIFETIME_GRACE)
-            lifetime_value = f"{int((walltime_td - stagger_td - grace_td).total_seconds())}s"
+            lifetime_value = (
+                f"{int((walltime_td - stagger_td - grace_td).total_seconds())}s"
+            )
         except Exception as exc:
             raise RuntimeError(f"Failed to compute default lifetime: {exc}")
     try:
@@ -395,8 +407,8 @@ def build_wrapper_configuration(
         "distributed.scheduler.target-duration": target_duration,
         "distributed.worker.port": internal_port_range_str,
         "distributed.nanny.port": internal_port_range_str,
-        "distributed.worker.lifetime-stagger": lifetime_stagger,
-        "distributed.worker.lifetime": lifetime_value,
+        "distributed.worker.lifetime.stagger": lifetime_stagger,
+        "distributed.worker.lifetime.duration": lifetime_value,
     }
     if dask_resources is not None:
         dask_config_flat["distributed.worker.resources"] = dict(dask_resources)
@@ -433,6 +445,8 @@ def build_wrapper_configuration(
             raise RuntimeError("Parameter 'maximum_jobs' must be positive")
 
     return WrapperConfig(
+        common=jobqueue_common,
+        worker_threads=worker_threads,
         jobqueue_config=jobqueue_config,
         dask_config=merge_flat_config(dask_config_flat),
         env_exports=env_exports,
@@ -445,21 +459,37 @@ def build_wrapper_configuration(
 
 
 def load_cluster_from_string(cluster_string: str, cluster_base: Any):
+    from distributed import LocalCluster
+
     if "::" not in cluster_string:
         raise RuntimeError("Cluster string must be of the form 'MODULE::SYMBOL'")
     module_name, symbol_name = cluster_string.split("::", 1)
     module = import_module(module_name)
     target = getattr(module, symbol_name)
     if isinstance(target, cluster_base):
+        if isinstance(target, LocalCluster):
+            raise RuntimeError(
+                "Cannot return LocalCluster instance: LocalCluster doesn't read ports from config. Return a LocalCluster class or subclass instead."
+            )
         return target
+
     if isinstance(target, FunctionType):
         target = target()
     elif isinstance(target, type):
         if not issubclass(target, cluster_base):
             raise RuntimeError("Cluster class must subclass dask.distributed.Cluster")
+        if issubclass(target, LocalCluster):
+            return target
         target = target()
     else:
-        raise RuntimeError("Cluster symbol must be a Cluster instance, class or function")
+        raise RuntimeError(
+            "Cluster symbol must be a Cluster instance, class or function"
+        )
+
+    if isinstance(target, LocalCluster):
+        raise RuntimeError(
+            "Cannot return LocalCluster instance: LocalCluster doesn't read ports from config. Return a LocalCluster class or subclass instead."
+        )
     if not isinstance(target, cluster_base):
         raise RuntimeError("Cluster string did not yield a Dask Cluster instance")
     return target
@@ -478,7 +508,9 @@ def _scheduler_activity(dask_scheduler, monitor_id: str):
 def keep_cluster_alive(cluster, timeout: Optional[float]):
     from distributed import Client
 
-    monitor_client = Client(cluster, set_as_default=False, name="seamless-dask-wrapper-monitor")
+    monitor_client = Client(
+        cluster, set_as_default=False, name="seamless-dask-wrapper-monitor"
+    )
     last_activity: Optional[float] = None
     try:
         while True:
@@ -487,7 +519,9 @@ def keep_cluster_alive(cluster, timeout: Optional[float]):
                     _scheduler_activity, monitor_id=monitor_client.id
                 )
                 has_activity = bool(
-                    activity.get("client_count", 0) > 0 or activity.get("task_count", 0) > 0
+                    activity.get("client_count", 0)
+                    > 1  # a monitor client is a client too!
+                    or activity.get("task_count", 0) > 0
                 )
             except Exception:
                 has_activity = False
@@ -496,7 +530,9 @@ def keep_cluster_alive(cluster, timeout: Optional[float]):
             else:
                 if last_activity is None:
                     last_activity = time.monotonic()
-                elif timeout is not None and time.monotonic() - last_activity >= timeout:
+                elif (
+                    timeout is not None and time.monotonic() - last_activity >= timeout
+                ):
                     break
             time.sleep(INACTIVITY_CHECK_INTERVAL)
     finally:
@@ -508,7 +544,9 @@ def keep_cluster_alive(cluster, timeout: Optional[float]):
 
 def main():
     parser = argparse.ArgumentParser(description="Launch Seamless Dask wrapper")
-    parser.add_argument("cluster", type=str, help="Cluster string in the form MODULE::SYMBOL")
+    parser.add_argument(
+        "cluster", type=str, help="Cluster string in the form MODULE::SYMBOL"
+    )
     parser.add_argument(
         "--port-range",
         type=int,
@@ -554,27 +592,50 @@ def main():
         raise_startup_error(exc)
 
     try:
-        dask.config.set({"jobqueue": wrapper_config.jobqueue_config})
-        dask.config.set(wrapper_config.dask_config)
-
+        # Merge into the existing config to avoid clobbering distributed defaults
+        dask.config.update(
+            dask.config.config, {"jobqueue": wrapper_config.jobqueue_config}
+        )
+        dask.config.update(dask.config.config, wrapper_config.dask_config)
         cluster = load_cluster_from_string(args.cluster, Cluster)
 
-        try:
-            from dask_jobqueue import OARCluster  # type: ignore
-        except Exception:
-            OARCluster = None
-        if OARCluster is not None and isinstance(cluster, OARCluster):
-            if wrapper_config.memory_per_core_property_name is None:
-                raise RuntimeError(
-                    "Parameter 'memory_per_core_property_name' is required for OARCluster"
-                )
+        from distributed import LocalCluster
 
-        cluster.adapt(
-            minimum_jobs=int(wrapper_config.interactive),
-            maximum_jobs=wrapper_config.maximum_jobs,
+        if isinstance(cluster, type) and issubclass(cluster, LocalCluster):
+            cluster = cluster(
+                n_workers=1,
+                host=wrapper_config.common["scheduler-options"]["host"],
+                scheduler_port=wrapper_config.scheduler_port,
+                dashboard_address=":" + str(wrapper_config.dashboard_port),
+                # also not read from config: scheduler protocol and security
+            )
+        else:
+            try:
+                from dask_jobqueue import OARCluster  # type: ignore
+            except Exception:
+                OARCluster = None
+            if OARCluster is not None and isinstance(cluster, OARCluster):
+                if wrapper_config.memory_per_core_property_name is None:
+                    raise RuntimeError(
+                        "Parameter 'memory_per_core_property_name' is required for OARCluster"
+                    )
+
+        if not isinstance(cluster, LocalCluster):
+            cluster.adapt(
+                minimum_jobs=int(wrapper_config.interactive),
+                maximum_jobs=wrapper_config.maximum_jobs,
+            )
+
+        status_tracker.write_running(
+            wrapper_config.scheduler_port, wrapper_config.dashboard_port
         )
 
-        status_tracker.write_running(wrapper_config.scheduler_port, wrapper_config.dashboard_port)
+        print("Dask scheduler address:")
+        print(cluster.scheduler_address)
+
+        print("Dask dashboard address:")
+        print(cluster.dashboard_link)
+
     except BaseException as exc:
         raise_startup_error(exc)
 

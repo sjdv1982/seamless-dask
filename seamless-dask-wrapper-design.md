@@ -138,9 +138,9 @@ Otherwise, if no default is specified, they are mandatory.
 
 - internal-port-range => distributed.worker.port and distributed.nanny.port. Default: port-range command-line parameter
 
-- lifetime-stagger => distributed.worker.lifetime-stagger. Default: 4m
+- lifetime-stagger => distributed.worker.lifetime.stagger. Default: 4m
 
-- lifetime => distributed.worker.lifetime. Default: walltime minus lifetime-stagger minus 1m
+- lifetime => distributed.worker.lifetime.duration. Default: walltime minus lifetime-stagger minus 1m
 
 In case of default: Note that "walltime" is in hh:mm:ss format. All three values (walltime, lifetime-stagger and 1m) are understood by `dask.utils.parse_timedelta`. The subtraction result `td` can be converted to string using f"{int(td.total_seconds())}s"
 
@@ -179,7 +179,7 @@ These ports are propagated to jobqueue's "scheduler-options" dict as "port" and 
 
 ### 3. Configuration
 
-Dask (including `distributed`) is imported, and all propagations are performed using `dask.config.set`.
+Dask (including `distributed`) is imported, and all propagations are merged into the existing config.
 
 ### 4. Cluster string evaluation
 
