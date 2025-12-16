@@ -11,3 +11,6 @@ dependencies = [
     "dask",
     "distributed",
 ]
+
+[project.scripts]
+seamless-dask-wrapper = "seamless_dask.wrapper:main"
