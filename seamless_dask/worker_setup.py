@@ -72,6 +72,7 @@ class SeamlessWorkerPlugin(WorkerPlugin):
             from seamless.transformer import has_spawned, spawn
             from seamless.config import set_remote_clients
             from .permissions import configure as configure_permissions
+            import os
 
             threads = getattr(worker.state, "nthreads", None)
             if threads is not None and threads < self.num_workers:
@@ -97,6 +98,8 @@ class SeamlessWorkerPlugin(WorkerPlugin):
             except Exception:
                 LOGGER.debug("Failed to configure permission manager", exc_info=True)
             if not has_spawned():
+                # Dask worker processes do not run as MainProcess; allow spawning anyway.
+                os.environ.setdefault("SEAMLESS_ALLOW_CHILD_SPAWN", "1")
                 spawn(self.num_workers)
                 LOGGER.info(
                     "Spawned Seamless workers inside Dask worker %s (count=%d, threads=%s)",

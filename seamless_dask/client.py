@@ -6,7 +6,7 @@ import time
 import traceback
 import uuid
 import asyncio
-from typing import Any, Dict, Iterable, Mapping, Optional, Tuple, Coroutine
+from typing import Any, Dict, Iterable, Mapping, Optional, Tuple, Callable, Coroutine
 
 import dask.config
 from distributed import Client, Future
@@ -30,23 +30,16 @@ dask.config.set({"distributed.scheduler.unknown-task-duration": "1m"})
 dask.config.set({"distributed.scheduler.target-duration": "10m"})
 
 
-def _get_worker_loop() -> asyncio.AbstractEventLoop | None:
-    try:
-        worker = get_worker()
-    except ValueError:
-        return None
-    return getattr(worker, "seamless_loop", None)
-
-
-def _run_on_worker_loop(coro: Coroutine[Any, Any, Any]) -> Any:
+def _run_on_worker_loop(coro_factory: Callable[[], Coroutine[Any, Any, Any]]) -> Any:
     loop = _get_worker_loop()
     if loop is not None and not loop.is_closed():
         try:
+            coro = coro_factory()
             return asyncio.run_coroutine_threadsafe(coro, loop).result()
-        except RuntimeError:
-            # Fall back if loop is stopping/closed.
+        except Exception:
             pass
-    return asyncio.run(coro)
+    # Fallback: run in a fresh loop with a fresh coroutine
+    return asyncio.run(coro_factory())
 
 
 async def _resolve_buffer_async(checksum: Checksum) -> Buffer | None:
@@ -61,7 +54,7 @@ def _fat_checksum_task(checksum_hex: str) -> Tuple[str, Buffer | None, str | Non
     """Resolve a checksum into a buffer on a worker."""
     try:
         checksum = Checksum(checksum_hex)
-        buffer_obj = _run_on_worker_loop(_resolve_buffer_async(checksum))
+        buffer_obj = _run_on_worker_loop(lambda: _resolve_buffer_async(checksum))
         return (
             checksum.hex(),
             buffer_obj if isinstance(buffer_obj, Buffer) else None,
@@ -117,7 +110,7 @@ def _run_base(
         tf_checksum = Checksum(tf_checksum_hex)
 
         result_checksum = _run_on_worker_loop(
-            transformer_worker.dispatch_to_workers(
+            lambda: transformer_worker.dispatch_to_workers(
                 transformation_dict,
                 tf_checksum=tf_checksum,
                 tf_dunder=tf_dunder,
@@ -132,7 +125,9 @@ def _run_base(
 
         result_buffer: Buffer | None
         try:
-            result_buffer = _run_on_worker_loop(_resolve_buffer_async(result_checksum))
+            result_buffer = _run_on_worker_loop(
+                lambda: _resolve_buffer_async(result_checksum)
+            )
             if not isinstance(result_buffer, Buffer):
                 result_buffer = None
         except Exception:
@@ -361,3 +356,9 @@ class SeamlessDaskClient:
 
 
 __all__ = ["SeamlessDaskClient", "_fat_checksum_task"]
+def _get_worker_loop() -> asyncio.AbstractEventLoop | None:
+    try:
+        worker = get_worker()
+    except ValueError:
+        return None
+    return getattr(worker, "seamless_loop", None)
