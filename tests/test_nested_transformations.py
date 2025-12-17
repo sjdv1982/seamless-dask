@@ -3,8 +3,8 @@ import os
 import pytest
 from seamless.transformer import delayed
 from seamless_transformer import worker
-from seamless_dask.default import default_client
-from seamless_dask.transformer_client import set_dask_client
+from seamless_dask.dummy_scheduler import create_dummy_client
+from seamless_dask.transformer_client import set_seamless_dask_client
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -30,65 +30,63 @@ def _test_nested_transformations(local, OFFSET):
     main_pid = os.getpid()
     assert not worker.has_spawned()
 
-    with default_client(workers=1, worker_threads=3) as sd_client:
-        set_dask_client(sd_client)
-        try:
+    sd_client = create_dummy_client(workers=1, worker_threads=3, spawn_workers=3)
+    set_seamless_dask_client(sd_client)
+    try:
+
+        @delayed
+        def outer(label, local):
+            import os
+            from seamless.transformer import delayed
 
             @delayed
-            def outer(label, local):
+            def inner(label):
+                import datetime
                 import os
-                from seamless.transformer import delayed
+                import time
 
-                @delayed
-                def inner(label):
-                    import datetime
-                    import os
-                    import time
+                return (
+                    label,
+                    os.getpid(),
+                    datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    time.perf_counter_ns(),
+                )
 
-                    return (
-                        label,
-                        os.getpid(),
-                        datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                        time.perf_counter_ns(),
-                    )
+            inner.local = local
 
-                inner.local = local
+            tf_first = inner(label + "-1").start()
+            tf_second = inner(label + "-2").start()
+            first = tf_first.run()
+            second = tf_second.run()
 
-                tf_first = inner(label + "-1").start()
-                tf_second = inner(label + "-2").start()
-                first = tf_first.run()
-                second = tf_second.run()
+            return {"outer_pid": os.getpid(), "results": (first, second)}
 
-                return {"outer_pid": os.getpid(), "results": (first, second)}
+        combined = outer("beta" + str(OFFSET), local)
 
-            combined = outer("beta" + str(OFFSET), local)
+        first_run = combined.run()
+        first_result, second_result = first_run["results"]
 
-            first_run = combined.run()
-            first_result, second_result = first_run["results"]
+        futures = combined._dask_futures  # type: ignore[attr-defined]
+        assert futures is not None
+        base_key = futures.base.key
+        locations = sd_client.client.who_has(futures.base)
+        assert locations.get(base_key), "Outer transformation did not execute on a worker"
 
-            futures = combined._dask_futures  # type: ignore[attr-defined]
-            assert futures is not None
-            base_key = futures.base.key
-            locations = sd_client.client.who_has(futures.base)
-            assert locations.get(
-                base_key
-            ), "Outer transformation did not execute on a worker"
+        assert first_run["outer_pid"] != main_pid
+        assert first_result[0] == "beta" + str(OFFSET) + "-1", first_result
+        assert second_result[0] == "beta" + str(OFFSET) + "-2", second_result
+        assert first_result[1] != main_pid
 
-            assert first_run["outer_pid"] != main_pid
-            assert first_result[0] == "beta" + str(OFFSET) + "-1", first_result
-            assert second_result[0] == "beta" + str(OFFSET) + "-2", second_result
-            assert first_result[1] != main_pid
-
-            repeat_tf = outer("beta" + str(OFFSET), local)
-            repeat_run = repeat_tf.run()
-            all_results = {
-                _canonical_result(first_result),
-                _canonical_result(second_result),
-                *(_canonical_result(r) for r in repeat_run["results"]),
-            }
-            assert len(all_results) == 2
-        finally:
-            set_dask_client(None)
+        repeat_tf = outer("beta" + str(OFFSET), local)
+        repeat_run = repeat_tf.run()
+        all_results = {
+            _canonical_result(first_result),
+            _canonical_result(second_result),
+            *(_canonical_result(r) for r in repeat_run["results"]),
+        }
+        assert len(all_results) == 2
+    finally:
+        set_seamless_dask_client(None)
 
 
 def test_nested_transformations_local():

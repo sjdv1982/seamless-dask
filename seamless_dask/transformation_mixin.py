@@ -12,7 +12,7 @@ from seamless import Checksum
 from seamless_transformer.transformation_utils import tf_get_buffer
 
 from .permissions import release_permission, request_permission
-from .transformer_client import get_dask_client
+from .transformer_client import get_seamless_dask_client
 from .types import (
     TransformationFutures,
     TransformationInputSpec,
@@ -30,7 +30,7 @@ class TransformationDaskMixin:
 
     # ---- public helpers used by Transformation ----------------------------
     def _dask_client(self) -> Optional["SeamlessDaskClient"]:
-        return get_dask_client()
+        return get_seamless_dask_client()
 
     def _compute_with_dask(self, require_value: bool) -> Checksum | None:
         client = self._dask_client()

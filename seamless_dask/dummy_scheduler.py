@@ -11,7 +11,9 @@ import threading
 from concurrent.futures import Future
 from typing import Tuple
 
-from distributed import Scheduler, Worker
+from distributed import Client, Scheduler, Worker
+
+from .client import SeamlessDaskClient
 
 LOGGER = logging.getLogger(__name__)
 
@@ -78,6 +80,27 @@ async def serve_dummy_scheduler(
         LOGGER.info("Dummy scheduler stopped")
 
     return scheduler.address
+
+
+def create_dummy_client(
+    *, workers: int = 1, worker_threads: int = 9, spawn_workers: int = 3
+) -> SeamlessDaskClient:
+    """
+    Start a dummy scheduler with local workers and return a connected Seamless client.
+
+    The returned client is annotated with the underlying Dask client and scheduler
+    handle so that set_seamless_dask_client(None) can shut everything down.
+    """
+
+    scheduler = start_dummy_scheduler(
+        workers=workers, worker_threads=worker_threads, register_at_exit=False
+    )
+    dask_client = Client(scheduler.address, timeout="10s")
+    sd_client = SeamlessDaskClient(dask_client, worker_plugin_workers=spawn_workers)
+    # Stash handles for teardown when the client is cleared.
+    setattr(sd_client, "_dummy_scheduler_handle", scheduler)
+    setattr(sd_client, "_dummy_dask_client", dask_client)
+    return sd_client
 
 
 def _build_parser() -> argparse.ArgumentParser:
