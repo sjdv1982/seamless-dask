@@ -140,16 +140,14 @@ class SeamlessDaskClient:
         self,
         client: Client,
         *,
-        resource: str = "default",
-        strong_cache_ttl: float = 10.0,
+        fat_future_ttl: float = 10.0,
         worker_plugin_workers: int = 3,
     ) -> None:
         self._client = client
-        self._resource = resource
-        self._ttl = strong_cache_ttl
+        self._fat_future_ttl = fat_future_ttl
         self._fat_checksum_cache: dict[str, tuple[Future, float]] = {}
         self._transformation_cache: dict[str, tuple[TransformationFutures, float]] = {}
-        ensure_configured(workers=worker_plugin_workers, throttle=3)
+        ensure_configured(workers=worker_plugin_workers)
         self._register_worker_plugin(worker_plugin_workers)
 
     # --- public API -----------------------------------------------------
@@ -157,29 +155,25 @@ class SeamlessDaskClient:
     def client(self) -> Client:
         return self._client
 
-    def get_fat_checksum_future(
-        self, checksum: Checksum | str, *, resource: Optional[str] = None
-    ) -> Future:
+    def get_fat_checksum_future(self, checksum: Checksum | str) -> Future:
         """Return (or build) a fat-checksum future for the checksum."""
         self._prune_caches()
         checksum_hex = (
             checksum.hex() if isinstance(checksum, Checksum) else str(checksum)
         )
-        resource = resource or self._resource
-        key = self._fat_checksum_key(checksum_hex, resource)
-        cached = self._fat_checksum_cache.get(key)
+        cached = self._fat_checksum_cache.get(checksum_hex)
         if cached is not None and not cached[0].cancelled():
-            self._fat_checksum_cache[key] = (cached[0], self._expiry())
+            self._fat_checksum_cache[checksum_hex] = (cached[0], self._expiry())
             return cached[0]
 
         future = self._client.submit(
             _fat_checksum_task,
             checksum_hex,
             pure=False,
-            key=key,
+            key="fat-checksum-" + checksum_hex,
             resources={"S": 1},
         )
-        self._fat_checksum_cache[key] = (future, self._expiry())
+        self._fat_checksum_cache[checksum_hex] = (future, self._expiry())
         return future
 
     def submit_transformation(
@@ -187,7 +181,6 @@ class SeamlessDaskClient:
     ) -> TransformationFutures:
         """Submit a transformation to Dask and return its futures."""
         self._prune_caches()
-        resource = submission.resource or self._resource
         tf_checksum_hex = submission.tf_checksum
 
         if tf_checksum_hex:
@@ -208,8 +201,9 @@ class SeamlessDaskClient:
             "require_value": submission.require_value,
         }
         input_futures = dict(submission.input_futures)
-        base_key = self._build_key("base", resource, tf_checksum_hex)
-        thin_key = self._build_key("thin", resource, tf_checksum_hex)
+        resource_string = None  # TODO: get from tf_dunder
+        base_key = self._build_key("base", resource_string, tf_checksum_hex)
+        thin_key = self._build_key("thin", resource_string, tf_checksum_hex)
 
         base_future = self._client.submit(
             _run_base,
@@ -225,7 +219,7 @@ class SeamlessDaskClient:
 
         fat_future = None
         if need_fat:
-            fat_key = self._build_key("fat", resource, tf_checksum_hex)
+            fat_key = self._build_key("fat", resource_string, tf_checksum_hex)
             fat_future = self._client.submit(
                 _run_fat,
                 base_future,
@@ -242,30 +236,28 @@ class SeamlessDaskClient:
         )
 
         thin_future.add_done_callback(
-            lambda fut: self._register_transformation(
-                tf_checksum_hex, resource, futures, fut
-            )
+            lambda fut: self._register_transformation(tf_checksum_hex, futures, fut)
         )
         if tf_checksum_hex:
             self._store_transformation(tf_checksum_hex, futures)
 
         return futures
 
-    def ensure_fat_future(
-        self, futures: TransformationFutures, *, resource: Optional[str] = None
-    ) -> Future:
+    def ensure_fat_future(self, futures: TransformationFutures) -> Future:
         """Create or return the fat future for a transformation."""
         if futures.fat is not None and not futures.fat.cancelled():
             return futures.fat
-        resource = resource or self._resource
         tf_hex = futures.tf_checksum
-        fat_key = self._build_key("fat", resource, tf_hex)
+        resource_string = None  # TODO: extract from tf_dunder
+        fat_key = self._build_key("fat", resource_string, tf_hex)
         futures.fat = self._client.submit(
             _run_fat, futures.base, pure=False, key=fat_key, resources={"S": 1}
         )
         if futures.result_checksum:
-            fat_cache_key = self._fat_checksum_key(futures.result_checksum, resource)
-            self._fat_checksum_cache[fat_cache_key] = (futures.fat, self._expiry())
+            self._fat_checksum_cache[futures.result_checksum] = (
+                futures.fat,
+                self._expiry(),
+            )
         if tf_hex:
             self._store_transformation(tf_hex, futures)
         return futures.fat
@@ -279,16 +271,18 @@ class SeamlessDaskClient:
             # Best-effort: worker might already have the plugin registered.
             pass
 
-    def _build_key(self, prefix: str, resource: str, checksum_hex: str | None) -> str:
+    def _build_key(
+        self, prefix: str, resource_string: str | None, checksum_hex: str | None
+    ) -> str:
         if checksum_hex is None:
             checksum_hex = uuid.uuid4().hex
-        return f"{prefix}-{resource}-{checksum_hex}"
-
-    def _fat_checksum_key(self, checksum_hex: str, resource: str) -> str:
-        return f"fat-checksum-{resource}-{checksum_hex}"
+        if not resource_string:
+            return f"{prefix}-{checksum_hex}"
+        else:
+            return f"{prefix}-{resource_string}-{checksum_hex}"
 
     def _expiry(self) -> float:
-        return time.monotonic() + self._ttl
+        return time.monotonic() + self._fat_future_ttl
 
     def _prune_caches(self) -> None:
         now = time.monotonic()
@@ -306,7 +300,6 @@ class SeamlessDaskClient:
     def _register_transformation(
         self,
         tf_checksum_hint: str | None,
-        resource: str,
         futures: TransformationFutures,
         thin_future: Future,
     ) -> None:
@@ -321,9 +314,11 @@ class SeamlessDaskClient:
         if result_checksum_hex:
             futures.result_checksum = result_checksum_hex
             if futures.fat is not None:
-                fat_key = self._fat_checksum_key(result_checksum_hex, resource)
-                if fat_key not in self._fat_checksum_cache:
-                    self._fat_checksum_cache[fat_key] = (futures.fat, self._expiry())
+                if result_checksum_hex not in self._fat_checksum_cache:
+                    self._fat_checksum_cache[result_checksum_hex] = (
+                        futures.fat,
+                        self._expiry(),
+                    )
 
 
 __all__ = ["SeamlessDaskClient", "_fat_checksum_task"]

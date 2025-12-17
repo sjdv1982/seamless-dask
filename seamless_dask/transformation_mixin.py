@@ -82,9 +82,7 @@ class TransformationDaskMixin:
                 permission_granted=True,
             )
             tf_checksum_hex, result_checksum_hex, exc = await asyncio.wrap_future(
-                asyncio.get_running_loop().run_in_executor(
-                    None, futures.thin.result
-                )
+                asyncio.get_running_loop().run_in_executor(None, futures.thin.result)
             )
         except Exception:
             self._exception = traceback.format_exc().strip("\n") + "\n"
@@ -105,12 +103,6 @@ class TransformationDaskMixin:
         return self._result_checksum
 
     # ---- internals --------------------------------------------------------
-    def _get_resource(self) -> str:
-        meta = getattr(self, "_meta", None)
-        if isinstance(meta, dict):
-            return meta.get("resource", "default")
-        return "default"
-
     def _env_allows_local(self) -> bool:
         """Stub for environment analysis; currently always returns True."""
 
@@ -192,7 +184,6 @@ class TransformationDaskMixin:
 
         inputs: dict[str, TransformationInputSpec] = {}
         input_futures: dict[str, Any] = {}
-        resource = self._get_resource()
         for pinname, value in transformation_dict.items():
             if pinname.startswith("__"):
                 continue
@@ -229,9 +220,7 @@ class TransformationDaskMixin:
                 checksum=checksum_hex,
                 kind="checksum",
             )
-            input_futures[pinname] = client.get_fat_checksum_future(
-                checksum_hex, resource=resource
-            )
+            input_futures[pinname] = client.get_fat_checksum_future(checksum_hex)
 
         return TransformationSubmission(
             transformation_dict=transformation_dict,
@@ -240,7 +229,6 @@ class TransformationDaskMixin:
             tf_checksum=tf_checksum_hex,
             tf_dunder=getattr(self, "_tf_dunder", {}),
             scratch=getattr(self, "_scratch", False),
-            resource=resource,
             meta=getattr(self, "_meta", {}) or {},
             require_value=require_value,
         )
@@ -270,7 +258,7 @@ class TransformationDaskMixin:
                     self._dask_futures = futures
                     if need_fat and futures.fat is None:
                         futures.fat = client.ensure_fat_future(
-                            futures, resource=self._get_resource()
+                            futures,
                         )
                     return futures
             try:
@@ -283,9 +271,7 @@ class TransformationDaskMixin:
                 if permission_granted and not permission_released:
                     release_permission()
         if need_fat and futures.fat is None:
-            futures.fat = client.ensure_fat_future(
-                futures, resource=self._get_resource()
-            )
+            futures.fat = client.ensure_fat_future(futures)
         return futures
 
 

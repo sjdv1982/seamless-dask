@@ -29,7 +29,6 @@ class TransformationSubmission:
     tf_checksum: Optional[str]
     tf_dunder: Dict[str, Any]
     scratch: bool
-    resource: str = "default"
     meta: MutableMapping[str, Any] = field(default_factory=dict)
     require_value: bool = False
 
