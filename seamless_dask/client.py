@@ -142,13 +142,14 @@ class SeamlessDaskClient:
         *,
         fat_future_ttl: float = 10.0,
         worker_plugin_workers: int = 3,
+        remote_clients: dict | None = None,
     ) -> None:
         self._client = client
         self._fat_future_ttl = fat_future_ttl
         self._fat_checksum_cache: dict[str, tuple[Future, float]] = {}
         self._transformation_cache: dict[str, tuple[TransformationFutures, float]] = {}
         ensure_configured(workers=worker_plugin_workers)
-        self._register_worker_plugin(worker_plugin_workers)
+        self._register_worker_plugin(worker_plugin_workers, remote_clients)
 
     # --- public API -----------------------------------------------------
     @property
@@ -263,10 +264,14 @@ class SeamlessDaskClient:
         return futures.fat
 
     # --- internals ------------------------------------------------------
-    def _register_worker_plugin(self, worker_count: int) -> None:
+    def _register_worker_plugin(
+        self, worker_count: int, remote_clients: dict | None
+    ) -> None:
         try:
-            plugin = SeamlessWorkerPlugin(num_workers=worker_count)
-            self._client.register_plugin(plugin, name="seamless-worker-spawn")
+            plugin = SeamlessWorkerPlugin(
+                num_workers=worker_count, remote_clients=remote_clients
+            )
+            self._client.register_plugin(plugin, name="seamless-worker-setup")
         except Exception:
             # Best-effort: worker might already have the plugin registered.
             pass

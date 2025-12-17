@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any
 
@@ -15,12 +16,14 @@ LOGGER = logging.getLogger(__name__)
 class SeamlessWorkerPlugin(WorkerPlugin):
     """Ensure a Seamless worker pool is available inside every Dask worker."""
 
-    def __init__(self, *, num_workers: int = 3) -> None:
+    def __init__(self, *, num_workers: int, remote_clients: dict | None) -> None:
         self.num_workers = num_workers
+        self.remote_clients = remote_clients
 
     def setup(self, worker) -> None:  # type: ignore[override]
         try:
             from seamless.transformer import has_spawned, spawn
+            from seamless.config import set_remote_clients
             from .permissions import configure as configure_permissions
 
             threads = getattr(worker.state, "nthreads", None)
@@ -54,6 +57,15 @@ class SeamlessWorkerPlugin(WorkerPlugin):
                     self.num_workers,
                     threads,
                 )
+
+            if self.remote_clients is not None:
+                set_remote_clients(self.remote_clients)
+                LOGGER.info(
+                    "Set remote clients inside Dask worker %s: %s",
+                    worker.name,
+                    json.dumps(self.remote_clients, indent=4),
+                )
+
         except Exception as exc:  # pragma: no cover - best-effort safety
             LOGGER.error(
                 "Failed to spawn Seamless workers inside Dask worker %s: %s",
