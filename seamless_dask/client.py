@@ -12,7 +12,7 @@ import dask.config
 from distributed import Client, Future
 from distributed.worker import get_worker
 
-from seamless import Buffer, Checksum
+from seamless import Buffer, Checksum, CacheMissError
 from seamless_transformer import worker as transformer_worker
 from seamless_transformer.transformation_utils import tf_get_buffer
 
@@ -48,6 +48,47 @@ async def _resolve_buffer_async(checksum: Checksum) -> Buffer | None:
         buffer_obj.tempref()
         return buffer_obj
     return None
+
+
+async def _fetch_cached_result_async(
+    tf_checksum: Checksum, require_value: bool
+) -> Checksum | None:
+    """Fetch a cached transformation result from the remote database, if any."""
+    try:
+        from seamless_remote import database_remote
+    except Exception:
+        return None
+
+    try:
+        result_checksum = await database_remote.get_transformation_result(tf_checksum)
+        if result_checksum is None:
+            return None
+        if require_value:
+            try:
+                await result_checksum.resolution()
+            except CacheMissError:
+                return None
+            except Exception:
+                return None
+        return result_checksum
+    except Exception:
+        return None
+
+
+async def _promise_and_write_result_async(
+    tf_checksum: Checksum, result_checksum: Checksum
+) -> None:
+    """Promise the result checksum and persist it to the remote database."""
+    try:
+        from seamless_remote import buffer_remote, database_remote
+    except Exception:
+        return
+    try:
+        await buffer_remote.promise(result_checksum)
+        await database_remote.set_transformation_result(tf_checksum, result_checksum)
+    except Exception:
+        # Best-effort; failures are swallowed to avoid task crashes.
+        return
 
 
 def _fat_checksum_task(checksum_hex: str) -> Tuple[str, Buffer | None, str | None]:
@@ -109,6 +150,41 @@ def _run_base(
             tf_checksum_hex = tf_buffer.get_checksum().hex()
         tf_checksum = Checksum(tf_checksum_hex)
 
+        # Fast path: check remote database on the worker before recomputing.
+        cached_checksum = _run_on_worker_loop(
+            lambda: _fetch_cached_result_async(tf_checksum, require_value)
+        )
+        if isinstance(cached_checksum, Checksum):
+            result_checksum = cached_checksum
+            result_checksum_hex = result_checksum.hex()
+            result_buffer = None
+            if require_value:
+                try:
+                    result_buffer = _run_on_worker_loop(
+                        lambda: _resolve_buffer_async(result_checksum)
+                    )
+                    if not isinstance(result_buffer, Buffer):
+                        result_buffer = None
+                except Exception:
+                    result_buffer = None
+                if result_buffer is None:
+                    # fall back to full execution if value unavailable
+                    pass
+                else:
+                    _run_on_worker_loop(
+                        lambda: _promise_and_write_result_async(
+                            tf_checksum, result_checksum
+                        )
+                    )
+                    return tf_checksum_hex, result_checksum_hex, result_buffer, None
+            else:
+                _run_on_worker_loop(
+                    lambda: _promise_and_write_result_async(
+                        tf_checksum, result_checksum
+                    )
+                )
+                return tf_checksum_hex, result_checksum_hex, None, None
+
         result_checksum = _run_on_worker_loop(
             lambda: transformer_worker.dispatch_to_workers(
                 transformation_dict,
@@ -133,7 +209,22 @@ def _run_base(
         except Exception:
             result_buffer = None
         if require_value and result_buffer is None:
-            return tf_checksum_hex, result_checksum_hex, None, "Result value unavailable"
+            return (
+                tf_checksum_hex,
+                result_checksum_hex,
+                None,
+                "Result value unavailable",
+            )
+
+        try:
+            tf_checksum_obj = Checksum(tf_checksum_hex)
+            _run_on_worker_loop(
+                lambda: _promise_and_write_result_async(
+                    tf_checksum_obj, result_checksum
+                )
+            )
+        except Exception:
+            pass
 
         return tf_checksum_hex, result_checksum_hex, result_buffer, None
     except Exception:
@@ -356,6 +447,8 @@ class SeamlessDaskClient:
 
 
 __all__ = ["SeamlessDaskClient", "_fat_checksum_task"]
+
+
 def _get_worker_loop() -> asyncio.AbstractEventLoop | None:
     try:
         worker = get_worker()

@@ -8,7 +8,7 @@ import time
 import traceback
 from typing import Any, Dict, Optional, TYPE_CHECKING
 
-from seamless import Checksum
+from seamless import Checksum, CacheMissError
 from seamless_transformer.transformation_utils import tf_get_buffer
 
 from .permissions import release_permission, request_permission
@@ -37,9 +37,36 @@ class TransformationDaskMixin:
         if client is None:
             return None
 
-        use_dask = self._wait_for_permission(env_requires_remote=False)
-        if not use_dask:
+        # When execution is 'remote', Dask is mandatory; do not fall back locally.
+        try:
+            from seamless_config.select import get_execution
+
+            env_requires_remote = get_execution() == "remote"
+        except Exception:
+            env_requires_remote = False
+
+        permission_acquired = self._wait_for_permission(
+            env_requires_remote=env_requires_remote
+        )
+        if not permission_acquired:
             return self._run_local_fallback_sync(require_value=require_value)
+
+        submission = self._build_dask_submission(
+            client, require_value=require_value, need_fat=False
+        )
+        cached = self._try_database_cache_sync(
+            submission.tf_checksum, require_value=require_value
+        )
+        if cached is not None:
+            release_permission()
+            if submission.tf_checksum:
+                self._transformation_checksum = Checksum(submission.tf_checksum)
+                self._constructed = True
+            self._result_checksum = cached
+            self._evaluated = True
+            self._exception = None
+            return self._result_checksum
+
         try:
             futures = self._ensure_dask_futures(
                 client,
@@ -49,6 +76,8 @@ class TransformationDaskMixin:
             )
             tf_checksum_hex, result_checksum_hex, exc = futures.thin.result()
         except Exception:
+            if permission_acquired:
+                release_permission()
             self._exception = traceback.format_exc().strip("\n") + "\n"
             self._constructed = True
             self._evaluated = True
@@ -70,9 +99,34 @@ class TransformationDaskMixin:
         client = self._dask_client()
         if client is None:
             return None
-        use_dask = await self._wait_for_permission_async(env_requires_remote=False)
-        if not use_dask:
+        try:
+            from seamless_config.select import get_execution
+
+            env_requires_remote = get_execution() == "remote"
+        except Exception:
+            env_requires_remote = False
+
+        permission_acquired = await self._wait_for_permission_async(
+            env_requires_remote=env_requires_remote
+        )
+        if not permission_acquired:
             return await self._run_local_fallback_async(require_value=require_value)
+
+        submission = self._build_dask_submission(
+            client, require_value=require_value, need_fat=False
+        )
+        cached = await self._try_database_cache_async(
+            submission.tf_checksum, require_value=require_value
+        )
+        if cached is not None:
+            release_permission()
+            if submission.tf_checksum:
+                self._transformation_checksum = Checksum(submission.tf_checksum)
+                self._constructed = True
+            self._result_checksum = cached
+            self._evaluated = True
+            self._exception = None
+            return self._result_checksum
 
         try:
             futures = self._ensure_dask_futures(
@@ -85,6 +139,8 @@ class TransformationDaskMixin:
                 asyncio.get_running_loop().run_in_executor(None, futures.thin.result)
             )
         except Exception:
+            if permission_acquired:
+                release_permission()
             self._exception = traceback.format_exc().strip("\n") + "\n"
             self._constructed = True
             self._evaluated = True
@@ -273,6 +329,68 @@ class TransformationDaskMixin:
         if need_fat and futures.fat is None:
             futures.fat = client.ensure_fat_future(futures)
         return futures
+
+
+    # ---- remote cache helpers -----------------------------------------------
+    @classmethod
+    def _try_database_cache_sync(
+        cls, tf_checksum_hex: str | None, *, require_value: bool
+    ) -> Checksum | None:
+        if not tf_checksum_hex:
+            return None
+        try:
+            from seamless_remote import database_remote
+        except Exception:
+            return None
+
+        tf_checksum = Checksum(tf_checksum_hex)
+
+        async def _fetch():
+            result = await database_remote.get_transformation_result(tf_checksum)
+            if result is None:
+                return None
+            if require_value:
+                try:
+                    await result.resolution()
+                except CacheMissError:
+                    return None
+                except Exception:
+                    return None
+            return result
+
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(_fetch())
+        finally:
+            try:
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            except Exception:
+                pass
+            loop.close()
+
+    @classmethod
+    async def _try_database_cache_async(
+        cls, tf_checksum_hex: str | None, *, require_value: bool
+    ) -> Checksum | None:
+        if not tf_checksum_hex:
+            return None
+        try:
+            from seamless_remote import database_remote
+        except Exception:
+            return None
+
+        tf_checksum = Checksum(tf_checksum_hex)
+        result = await database_remote.get_transformation_result(tf_checksum)
+        if result is None:
+            return None
+        if require_value:
+            try:
+                await result.resolution()
+            except CacheMissError:
+                return None
+            except Exception:
+                return None
+        return result
 
 
 __all__ = ["TransformationDaskMixin"]
