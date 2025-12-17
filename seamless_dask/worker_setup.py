@@ -5,12 +5,59 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 from typing import Any
 
 from distributed.diagnostics.plugin import WorkerPlugin
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _run_loop_forever(loop: asyncio.AbstractEventLoop) -> None:
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+
+
+def _ensure_worker_loop(worker) -> asyncio.AbstractEventLoop | None:
+    loop = getattr(worker, "seamless_loop", None)
+    if loop is not None and not loop.is_closed():
+        return loop
+
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(
+        target=_run_loop_forever, args=(loop,), name="seamless-worker-loop", daemon=True
+    )
+    thread.start()
+    worker.seamless_loop = loop
+    worker.seamless_loop_thread = thread
+    return loop
+
+
+def _stop_worker_loop(worker) -> None:
+    loop = getattr(worker, "seamless_loop", None)
+    thread = getattr(worker, "seamless_loop_thread", None)
+    if loop is None or loop.is_closed():
+        return
+    try:
+        loop.call_soon_threadsafe(loop.stop)
+    except Exception:
+        LOGGER.debug("Failed to stop worker loop cleanly", exc_info=True)
+    if thread is not None:
+        try:
+            thread.join(timeout=1.0)
+        except Exception:
+            LOGGER.debug("Failed to join worker loop thread", exc_info=True)
+    try:
+        loop.close()
+    except Exception:
+        LOGGER.debug("Failed to close worker loop", exc_info=True)
+    for attr in ("seamless_loop", "seamless_loop_thread"):
+        if hasattr(worker, attr):
+            try:
+                delattr(worker, attr)
+            except Exception:
+                pass
 
 
 class SeamlessWorkerPlugin(WorkerPlugin):
@@ -66,6 +113,8 @@ class SeamlessWorkerPlugin(WorkerPlugin):
                     json.dumps(self.remote_clients, indent=4),
                 )
 
+            _ensure_worker_loop(worker)
+
         except Exception as exc:  # pragma: no cover - best-effort safety
             LOGGER.error(
                 "Failed to spawn Seamless workers inside Dask worker %s: %s",
@@ -74,6 +123,7 @@ class SeamlessWorkerPlugin(WorkerPlugin):
             )
 
     def teardown(self, worker) -> None:  # type: ignore[override]
+        _stop_worker_loop(worker)
         try:
             from seamless_transformer import worker as seamless_worker
 

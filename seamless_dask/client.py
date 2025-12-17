@@ -5,13 +5,15 @@ from __future__ import annotations
 import time
 import traceback
 import uuid
-from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
+import asyncio
+from typing import Any, Dict, Iterable, Mapping, Optional, Tuple, Coroutine
 
 import dask.config
 from distributed import Client, Future
+from distributed.worker import get_worker
 
 from seamless import Buffer, Checksum
-from seamless_transformer.transformation_cache import run_sync
+from seamless_transformer import worker as transformer_worker
 from seamless_transformer.transformation_utils import tf_get_buffer
 
 from .permissions import ensure_configured
@@ -28,13 +30,38 @@ dask.config.set({"distributed.scheduler.unknown-task-duration": "1m"})
 dask.config.set({"distributed.scheduler.target-duration": "10m"})
 
 
+def _get_worker_loop() -> asyncio.AbstractEventLoop | None:
+    try:
+        worker = get_worker()
+    except ValueError:
+        return None
+    return getattr(worker, "seamless_loop", None)
+
+
+def _run_on_worker_loop(coro: Coroutine[Any, Any, Any]) -> Any:
+    loop = _get_worker_loop()
+    if loop is not None and not loop.is_closed():
+        try:
+            return asyncio.run_coroutine_threadsafe(coro, loop).result()
+        except RuntimeError:
+            # Fall back if loop is stopping/closed.
+            pass
+    return asyncio.run(coro)
+
+
+async def _resolve_buffer_async(checksum: Checksum) -> Buffer | None:
+    buffer_obj = await checksum.resolution()
+    if isinstance(buffer_obj, Buffer):
+        buffer_obj.tempref()
+        return buffer_obj
+    return None
+
+
 def _fat_checksum_task(checksum_hex: str) -> Tuple[str, Buffer | None, str | None]:
     """Resolve a checksum into a buffer on a worker."""
     try:
         checksum = Checksum(checksum_hex)
-        buffer_obj = checksum.resolve()
-        if isinstance(buffer_obj, Buffer):
-            buffer_obj.tempref()
+        buffer_obj = _run_on_worker_loop(_resolve_buffer_async(checksum))
         return (
             checksum.hex(),
             buffer_obj if isinstance(buffer_obj, Buffer) else None,
@@ -89,22 +116,29 @@ def _run_base(
             tf_checksum_hex = tf_buffer.get_checksum().hex()
         tf_checksum = Checksum(tf_checksum_hex)
 
-        result_checksum = run_sync(
-            transformation_dict,
-            tf_checksum=tf_checksum,
-            tf_dunder=tf_dunder,
-            scratch=scratch,
-            require_fingertip=require_value,
+        result_checksum = _run_on_worker_loop(
+            transformer_worker.dispatch_to_workers(
+                transformation_dict,
+                tf_checksum=tf_checksum,
+                tf_dunder=tf_dunder,
+                scratch=scratch,
+            )
         )
-        result_checksum_hex = Checksum(result_checksum).hex()
+        if isinstance(result_checksum, str):
+            return tf_checksum_hex, None, None, result_checksum
+        result_checksum = Checksum(result_checksum)
+
+        result_checksum_hex = result_checksum.hex()
 
         result_buffer: Buffer | None
         try:
-            result_buffer = result_checksum.resolve()
+            result_buffer = _run_on_worker_loop(_resolve_buffer_async(result_checksum))
             if not isinstance(result_buffer, Buffer):
                 result_buffer = None
         except Exception:
             result_buffer = None
+        if require_value and result_buffer is None:
+            return tf_checksum_hex, result_checksum_hex, None, "Result value unavailable"
 
         return tf_checksum_hex, result_checksum_hex, result_buffer, None
     except Exception:
