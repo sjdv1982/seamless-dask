@@ -37,23 +37,23 @@ class TransformationDaskMixin:
         if client is None:
             return None
 
-        # Build submission up front to obtain tf_checksum for DB cache checks.
-        submission = self._build_dask_submission(
-            client, require_value=require_value, need_fat=False
-        )
-
-        # Fast path: try remote DB before acquiring permissions.
-        cached = self._try_database_cache_sync(
-            submission.tf_checksum, require_value=require_value
-        )
-        if cached is not None:
-            if submission.tf_checksum:
-                self._transformation_checksum = Checksum(submission.tf_checksum)
+        # Fast path for dependency-free transformations: check DB before any Dask submit.
+        if self._constructed:
+            tf_checksum_hex = self._transformation_checksum.hex()
+        else:
+            tf_checksum_hex = self._compute_tf_checksum_no_deps()
+        if tf_checksum_hex is not None:
+            if not self._constructed:
+                self._transformation_checksum = Checksum(tf_checksum_hex)
                 self._constructed = True
-            self._result_checksum = cached
-            self._evaluated = True
-            self._exception = None
-            return self._result_checksum
+            cached = self._try_database_cache_sync(
+                tf_checksum_hex, require_value=require_value
+            )
+            if cached is not None:
+                self._result_checksum = cached
+                self._evaluated = True
+                self._exception = None
+                return self._result_checksum
 
         # When execution is 'remote', Dask is mandatory; do not fall back locally.
         try:
@@ -68,6 +68,25 @@ class TransformationDaskMixin:
         )
         if not permission_acquired:
             return self._run_local_fallback_sync(require_value=require_value)
+
+        # No-deps database cache check after permission acquisition (still avoids submission).
+        if tf_checksum_hex is not None:
+            cached = self._try_database_cache_sync(
+                tf_checksum_hex, require_value=require_value
+            )
+            if cached is not None:
+                if permission_acquired:
+                    release_permission()
+                self._transformation_checksum = Checksum(tf_checksum_hex)
+                self._constructed = True
+                self._result_checksum = cached
+                self._evaluated = True
+                self._exception = None
+                return self._result_checksum
+
+        submission = self._build_dask_submission(
+            client, require_value=require_value, need_fat=False
+        )
 
         try:
             futures = self._ensure_dask_futures(
@@ -102,20 +121,18 @@ class TransformationDaskMixin:
         if client is None:
             return None
 
-        submission = self._build_dask_submission(
-            client, require_value=require_value, need_fat=False
-        )
-        cached = await self._try_database_cache_async(
-            submission.tf_checksum, require_value=require_value
-        )
-        if cached is not None:
-            if submission.tf_checksum:
-                self._transformation_checksum = Checksum(submission.tf_checksum)
+        tf_checksum_hex = self._compute_tf_checksum_no_deps()
+        if tf_checksum_hex is not None:
+            cached = await self._try_database_cache_async(
+                tf_checksum_hex, require_value=require_value
+            )
+            if cached is not None:
+                self._transformation_checksum = Checksum(tf_checksum_hex)
                 self._constructed = True
-            self._result_checksum = cached
-            self._evaluated = True
-            self._exception = None
-            return self._result_checksum
+                self._result_checksum = cached
+                self._evaluated = True
+                self._exception = None
+                return self._result_checksum
 
         try:
             from seamless_config.select import get_execution
@@ -130,21 +147,24 @@ class TransformationDaskMixin:
         if not permission_acquired:
             return await self._run_local_fallback_async(require_value=require_value)
 
+        # No-deps database cache check after permission acquisition (still avoids submission).
+        if tf_checksum_hex is not None:
+            cached = await self._try_database_cache_async(
+                tf_checksum_hex, require_value=require_value
+            )
+            if cached is not None:
+                if permission_acquired:
+                    release_permission()
+                self._transformation_checksum = Checksum(tf_checksum_hex)
+                self._constructed = True
+                self._result_checksum = cached
+                self._evaluated = True
+                self._exception = None
+                return self._result_checksum
+
         submission = self._build_dask_submission(
             client, require_value=require_value, need_fat=False
         )
-        cached = await self._try_database_cache_async(
-            submission.tf_checksum, require_value=require_value
-        )
-        if cached is not None:
-            release_permission()
-            if submission.tf_checksum:
-                self._transformation_checksum = Checksum(submission.tf_checksum)
-                self._constructed = True
-            self._result_checksum = cached
-            self._evaluated = True
-            self._exception = None
-            return self._result_checksum
 
         try:
             futures = self._ensure_dask_futures(
@@ -237,7 +257,11 @@ class TransformationDaskMixin:
         return self._result_checksum
 
     def _build_dask_submission(
-        self, client: "SeamlessDaskClient", *, require_value: bool, need_fat: bool
+        self,
+        client: "SeamlessDaskClient",
+        *,
+        require_value: bool,
+        need_fat: bool,
     ) -> TransformationSubmission:
         pretransformation = getattr(self, "_pretransformation", None)
         if pretransformation is None:
@@ -348,6 +372,24 @@ class TransformationDaskMixin:
             futures.fat = client.ensure_fat_future(futures)
         return futures
 
+    def _compute_tf_checksum_no_deps(self) -> str | None:
+        """Return tf_checksum hex if there are no upstream dependencies; otherwise None."""
+        try:
+            pretransformation = getattr(self, "_pretransformation", None)
+            if pretransformation is None:
+                return None
+            upstream_dependencies = getattr(self, "_upstream_dependencies", {}) or {}
+            tf_dict, dependencies = pretransformation.build_partial_transformation(
+                upstream_dependencies
+            )
+            if dependencies:
+                return None
+            tf_buffer = tf_get_buffer(tf_dict)
+            tf_buffer.tempref()
+            tf_checksum = tf_buffer.get_checksum()
+            return tf_checksum.hex()
+        except Exception:
+            return None
 
     # ---- remote cache helpers -----------------------------------------------
     @classmethod
