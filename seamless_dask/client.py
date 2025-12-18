@@ -7,6 +7,7 @@ import traceback
 import uuid
 import asyncio
 import sys
+import threading
 from typing import Any, Dict, Iterable, Mapping, Optional, Tuple, Callable, Coroutine
 
 import dask.config
@@ -41,6 +42,30 @@ def _run_on_worker_loop(coro_factory: Callable[[], Coroutine[Any, Any, Any]]) ->
             pass
     # Fallback: run in a fresh loop with a fresh coroutine
     return asyncio.run(coro_factory())
+
+
+def _run_coro_blocking(coro: Coroutine[Any, Any, Any]) -> Any:
+    """Run a coroutine to completion in a fresh event loop (avoids nested-loop issues)."""
+
+    try:
+        return asyncio.run(coro)
+    except RuntimeError:
+        # Fall back to a dedicated thread if we're already inside a running loop.
+        result: dict[str, Any] = {}
+        error: dict[str, BaseException] = {}
+
+        def _runner():
+            try:
+                result["value"] = asyncio.run(coro)
+            except BaseException as exc:
+                error["exc"] = exc
+
+        t = threading.Thread(target=_runner, name="promise-blocking-runner")
+        t.start()
+        t.join()
+        if error:
+            raise error["exc"]
+        return result.get("value")
 
 
 async def _resolve_buffer_async(checksum: Checksum) -> Buffer | None:
@@ -273,6 +298,7 @@ class SeamlessDaskClient:
         self._transformation_cache: dict[str, tuple[TransformationFutures, float]] = {}
         self._is_local_cluster = bool(is_local_cluster)
         self._interactive = bool(interactive)
+        self._promised_targets: dict[str, set[str]] = {}
         ensure_configured(workers=worker_plugin_workers)
         self._register_worker_plugin(worker_plugin_workers, remote_clients)
         self._warn_if_no_workers()
@@ -288,6 +314,7 @@ class SeamlessDaskClient:
         checksum_hex = (
             checksum.hex() if isinstance(checksum, Checksum) else str(checksum)
         )
+        self._ensure_promised(checksum_hex)
         cached = self._fat_checksum_cache.get(checksum_hex)
         if cached is not None and not cached[0].cancelled():
             self._fat_checksum_cache[checksum_hex] = (cached[0], self._expiry())
@@ -435,6 +462,42 @@ class SeamlessDaskClient:
             return
 
         print("[seamless-dask] Scheduler reports 0 workers attached", file=sys.stderr)
+
+    def _ensure_promised(self, checksum_hex: str) -> None:
+        """Best-effort: make sure write servers have been promised this checksum."""
+
+        has_local_buffer = False
+        try:
+            from seamless.caching.buffer_cache import get_buffer_cache
+
+            cache = get_buffer_cache()
+            cs_obj = Checksum(checksum_hex)
+            with cache.lock:
+                if cs_obj in cache.strong_cache or cs_obj in cache.weak_cache:
+                    has_local_buffer = True
+        except Exception:
+            pass
+        if not has_local_buffer:
+            return
+
+        try:
+            from seamless_remote import buffer_remote
+        except Exception:
+            return
+
+        clients = getattr(buffer_remote, "_write_server_clients", []) or []
+        for client in clients:
+            target = getattr(client, "url", None) or getattr(client, "directory", None)
+            if target is None:
+                target = f"client-{id(client)}"
+            promised = self._promised_targets.setdefault(target, set())
+            if checksum_hex in promised:
+                continue
+            try:
+                _run_coro_blocking(client.promise(Checksum(checksum_hex)))
+                promised.add(checksum_hex)
+            except Exception:
+                continue
 
     def _build_key(
         self, prefix: str, resource_string: str | None, checksum_hex: str | None

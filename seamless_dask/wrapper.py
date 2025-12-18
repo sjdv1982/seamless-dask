@@ -148,61 +148,21 @@ def dask_key_to_env_var(key: str) -> str:
 
 
 def parse_timedelta_value(value: Any) -> timedelta:
-    if isinstance(value, timedelta):
-        return value
-    if isinstance(value, (int, float)):
-        return timedelta(seconds=float(value))
-    if not isinstance(value, str):
-        raise TypeError(f"Cannot interpret timedelta from {type(value)}")
-    text = value.strip()
-    if ":" in text:
-        parts = text.split(":")
-        if len(parts) == 2:
-            hours = 0
-            minutes, seconds = parts
-        elif len(parts) == 3:
-            hours, minutes, seconds = parts
-        else:
-            raise ValueError(f"Invalid time format: {value}")
-        return timedelta(
-            hours=float(hours or 0),
-            minutes=float(minutes or 0),
-            seconds=float(seconds or 0),
-        )
-    suffix_map = {
-        "ns": 1e-9,
-        "us": 1e-6,
-        "ms": 1e-3,
-        "s": 1.0,
-        "sec": 1.0,
-        "secs": 1.0,
-        "m": 60.0,
-        "min": 60.0,
-        "mins": 60.0,
-        "h": 3600.0,
-        "hr": 3600.0,
-        "hrs": 3600.0,
-        "d": 86400.0,
-        "w": 604800.0,
-    }
-    number = ""
-    suffix = ""
-    for idx, ch in enumerate(text):
-        if ch.isdigit() or ch in ".-+":
-            number += ch
-        else:
-            suffix = text[idx:].strip()
-            break
-    if suffix == "" and text != number:
-        suffix = text[len(number) :].strip()
-    number = number.strip()
-    if not number:
-        raise ValueError(f"Invalid time format: {value}")
-    suffix = suffix or "s"
-    suffix = suffix.lower()
-    if suffix not in suffix_map:
-        raise ValueError(f"Unsupported time unit: {suffix} in {value}")
-    return timedelta(seconds=float(number) * suffix_map[suffix])
+    """Parse a time interval using Dask utilities (no distributed/jobqueue import)."""
+
+    import dask.utils
+
+    parsed = dask.utils.parse_timedelta(value)
+    if isinstance(parsed, timedelta):
+        return parsed
+    # dask.utils.parse_timedelta may return a numeric value (seconds)
+    if isinstance(parsed, (int, float)):
+        return timedelta(seconds=float(parsed))
+    # Fallback: try to coerce stringified numeric seconds
+    try:
+        return timedelta(seconds=float(parsed))
+    except Exception as exc:  # pragma: no cover - defensive
+        raise TypeError(f"Cannot interpret timedelta from {parsed!r}") from exc
 
 
 def normalize_port_range(value: Any) -> Tuple[int, int]:
@@ -648,6 +608,15 @@ def main():
         cluster = load_cluster_from_string(args.cluster, Cluster)
 
         if isinstance(cluster, type) and issubclass(cluster, LocalCluster):
+            if wrapper_config.maximum_jobs == 1:
+                assert wrapper_config.worker_lifetime is None
+                assert wrapper_config.worker_lifetime_stagger is None
+                # KLUDGE
+                # Observing weird worker retiring behavior, shouldn't happen...
+                # This should squash it (on top of the restart in the keep cluster alive)
+                wrapper_config.worker_lifetime = "24h"
+                wrapper_config.worker_lifetime_stagger = "10m"
+                # /KLUDGE
             cluster = cluster(
                 n_workers=wrapper_config.maximum_jobs,
                 host=wrapper_config.common["scheduler-options"]["host"],

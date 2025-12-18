@@ -1,0 +1,3 @@
+- Fat/Thin task durations: The doc suggests nonzero default durations for fat futures to cover the slower hashstore path; we rely on dask defaults (unknown-task-duration set to 1m globally), but fat/thin themselves are not given explicit durations. May be acceptable, but not aligned with the “small nonzero” guidance.
+
+- Resource-aware cache keys: Transformation and fat-cache entries are keyed only by checksum, not by resource. If you have multi-resource queues, the doc warns that keys should incorporate resource to avoid cross-resource interference; we don’t.
