@@ -37,6 +37,24 @@ class TransformationDaskMixin:
         if client is None:
             return None
 
+        # Build submission up front to obtain tf_checksum for DB cache checks.
+        submission = self._build_dask_submission(
+            client, require_value=require_value, need_fat=False
+        )
+
+        # Fast path: try remote DB before acquiring permissions.
+        cached = self._try_database_cache_sync(
+            submission.tf_checksum, require_value=require_value
+        )
+        if cached is not None:
+            if submission.tf_checksum:
+                self._transformation_checksum = Checksum(submission.tf_checksum)
+                self._constructed = True
+            self._result_checksum = cached
+            self._evaluated = True
+            self._exception = None
+            return self._result_checksum
+
         # When execution is 'remote', Dask is mandatory; do not fall back locally.
         try:
             from seamless_config.select import get_execution
@@ -50,22 +68,6 @@ class TransformationDaskMixin:
         )
         if not permission_acquired:
             return self._run_local_fallback_sync(require_value=require_value)
-
-        submission = self._build_dask_submission(
-            client, require_value=require_value, need_fat=False
-        )
-        cached = self._try_database_cache_sync(
-            submission.tf_checksum, require_value=require_value
-        )
-        if cached is not None:
-            release_permission()
-            if submission.tf_checksum:
-                self._transformation_checksum = Checksum(submission.tf_checksum)
-                self._constructed = True
-            self._result_checksum = cached
-            self._evaluated = True
-            self._exception = None
-            return self._result_checksum
 
         try:
             futures = self._ensure_dask_futures(
@@ -99,6 +101,22 @@ class TransformationDaskMixin:
         client = self._dask_client()
         if client is None:
             return None
+
+        submission = self._build_dask_submission(
+            client, require_value=require_value, need_fat=False
+        )
+        cached = await self._try_database_cache_async(
+            submission.tf_checksum, require_value=require_value
+        )
+        if cached is not None:
+            if submission.tf_checksum:
+                self._transformation_checksum = Checksum(submission.tf_checksum)
+                self._constructed = True
+            self._result_checksum = cached
+            self._evaluated = True
+            self._exception = None
+            return self._result_checksum
+
         try:
             from seamless_config.select import get_execution
 

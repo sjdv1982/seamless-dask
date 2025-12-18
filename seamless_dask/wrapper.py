@@ -259,6 +259,11 @@ def merge_flat_config(flat_config: Mapping[str, Any]) -> Dict[str, Any]:
 class WrapperConfig:
     common: Dict[str, Dict[str, Any]]
     worker_threads: int
+    worker_port_range: str
+    nanny_port_range: str
+    worker_lifetime: Any
+    worker_lifetime_stagger: Any
+    worker_resources: Optional[Dict[str, Any]]
     jobqueue_config: Dict[str, Dict[str, Any]]
     dask_config: Dict[str, Any]
     env_exports: List[str]
@@ -407,9 +412,11 @@ def build_wrapper_configuration(
         "distributed.scheduler.target-duration": target_duration,
         "distributed.worker.port": internal_port_range_str,
         "distributed.nanny.port": internal_port_range_str,
-        "distributed.worker.lifetime.stagger": lifetime_stagger,
-        "distributed.worker.lifetime.duration": lifetime_value,
     }
+    if lifetime_stagger is not None:
+        dask_config_flat["distributed.worker.lifetime.stagger"] = lifetime_stagger
+    if lifetime_value is not None:
+        dask_config_flat["distributed.worker.lifetime.duration"] = lifetime_value
     if dask_resources is not None:
         dask_config_flat["distributed.worker.resources"] = dict(dask_resources)
     for key, val in extra_dask_config.items():
@@ -443,10 +450,21 @@ def build_wrapper_configuration(
             raise RuntimeError("Parameter 'maximum_jobs' must be an integer if defined")
         if maximum_jobs <= 0:
             raise RuntimeError("Parameter 'maximum_jobs' must be positive")
+    else:
+        maximum_jobs = 1  # default: single worker
+
+    if maximum_jobs == 1:
+        lifetime_value = None
+        lifetime_stagger = None
 
     return WrapperConfig(
         common=jobqueue_common,
         worker_threads=worker_threads,
+        worker_port_range=internal_port_range_str,
+        nanny_port_range=internal_port_range_str,
+        worker_lifetime=lifetime_value,
+        worker_lifetime_stagger=lifetime_stagger,
+        worker_resources=dict(dask_resources) if dask_resources is not None else None,
         jobqueue_config=jobqueue_config,
         dask_config=merge_flat_config(dask_config_flat),
         env_exports=env_exports,
@@ -587,26 +605,36 @@ def main():
 
     try:
         import dask
-        from distributed.deploy.cluster import Cluster
-    except BaseException as exc:
-        raise_startup_error(exc)
 
-    try:
         # Merge into the existing config to avoid clobbering distributed defaults
         dask.config.update(
             dask.config.config, {"jobqueue": wrapper_config.jobqueue_config}
         )
+        for modname in sys.modules.keys():
+            assert not modname.startswith("distributed"), modname
         dask.config.update(dask.config.config, wrapper_config.dask_config)
-        cluster = load_cluster_from_string(args.cluster, Cluster)
 
+        from distributed.deploy.cluster import Cluster
         from distributed import LocalCluster
+
+    except BaseException as exc:
+        raise_startup_error(exc)
+
+    try:
+        cluster = load_cluster_from_string(args.cluster, Cluster)
 
         if isinstance(cluster, type) and issubclass(cluster, LocalCluster):
             cluster = cluster(
-                n_workers=1,
+                n_workers=wrapper_config.maximum_jobs,
                 host=wrapper_config.common["scheduler-options"]["host"],
                 scheduler_port=wrapper_config.scheduler_port,
                 dashboard_address=":" + str(wrapper_config.dashboard_port),
+                threads_per_worker=wrapper_config.worker_threads,
+                worker_port=wrapper_config.worker_port_range,
+                port=wrapper_config.nanny_port_range,
+                lifetime=wrapper_config.worker_lifetime,
+                lifetime_stagger=wrapper_config.worker_lifetime_stagger,
+                resources=wrapper_config.worker_resources,
                 # also not read from config: scheduler protocol and security
             )
         else:
@@ -620,6 +648,7 @@ def main():
                         "Parameter 'memory_per_core_property_name' is required for OARCluster"
                     )
 
+        assert isinstance(cluster, Cluster)
         if not isinstance(cluster, LocalCluster):
             cluster.adapt(
                 minimum_jobs=int(wrapper_config.interactive),
