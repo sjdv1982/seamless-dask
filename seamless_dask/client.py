@@ -6,6 +6,7 @@ import time
 import traceback
 import uuid
 import asyncio
+import sys
 from typing import Any, Dict, Iterable, Mapping, Optional, Tuple, Callable, Coroutine
 
 import dask.config
@@ -263,13 +264,18 @@ class SeamlessDaskClient:
         fat_future_ttl: float = 10.0,
         worker_plugin_workers: int = 3,
         remote_clients: dict | None = None,
+        is_local_cluster: bool | None = None,
+        interactive: bool = False,
     ) -> None:
         self._client = client
         self._fat_future_ttl = fat_future_ttl
         self._fat_checksum_cache: dict[str, tuple[Future, float]] = {}
         self._transformation_cache: dict[str, tuple[TransformationFutures, float]] = {}
+        self._is_local_cluster = bool(is_local_cluster)
+        self._interactive = bool(interactive)
         ensure_configured(workers=worker_plugin_workers)
         self._register_worker_plugin(worker_plugin_workers, remote_clients)
+        self._warn_if_no_workers()
 
     # --- public API -----------------------------------------------------
     @property
@@ -401,13 +407,34 @@ class SeamlessDaskClient:
         self, worker_count: int, remote_clients: dict | None
     ) -> None:
         try:
+            # Avoid re-registering if scheduler already has the plugin.
+            already_registered = self._client.run_on_scheduler(
+                lambda dask_scheduler: "seamless-worker-setup"
+                in getattr(dask_scheduler, "worker_plugins", {})
+            )
+            if already_registered:
+                return
             plugin = SeamlessWorkerPlugin(
                 num_workers=worker_count, remote_clients=remote_clients
             )
             self._client.register_plugin(plugin, name="seamless-worker-setup")
         except Exception:
-            # Best-effort: worker might already have the plugin registered.
+            # Best-effort: worker might already have the plugin registered or scheduler unreachable.
             pass
+
+    def _warn_if_no_workers(self) -> None:
+        """Emit a warning if the scheduler reports zero connected workers."""
+
+        if not (self._is_local_cluster or self._interactive):
+            return
+        try:
+            info = self._client.scheduler_info()
+            if info.get("workers"):
+                return
+        except Exception:
+            return
+
+        print("[seamless-dask] Scheduler reports 0 workers attached", file=sys.stderr)
 
     def _build_key(
         self, prefix: str, resource_string: str | None, checksum_hex: str | None

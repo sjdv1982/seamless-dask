@@ -83,7 +83,10 @@ async def serve_dummy_scheduler(
 
 
 def create_dummy_client(
-    *, workers: int = 1, worker_threads: int = 9, spawn_workers: int = 3
+    *,
+    workers: int = 1,
+    worker_threads: int = 9,
+    spawn_workers: int = 3,
 ) -> SeamlessDaskClient:
     """
     Start a dummy scheduler with local workers and return a connected Seamless client.
@@ -96,7 +99,11 @@ def create_dummy_client(
         workers=workers, worker_threads=worker_threads, register_at_exit=False
     )
     dask_client = Client(scheduler.address, timeout="10s")
-    sd_client = SeamlessDaskClient(dask_client, worker_plugin_workers=spawn_workers)
+    sd_client = SeamlessDaskClient(
+        dask_client,
+        worker_plugin_workers=spawn_workers,
+        interactive=True,
+    )
     # Stash handles for teardown when the client is cleared.
     setattr(sd_client, "_dummy_scheduler_handle", scheduler)
     setattr(sd_client, "_dummy_dask_client", dask_client)

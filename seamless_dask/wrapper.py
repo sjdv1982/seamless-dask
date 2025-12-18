@@ -523,8 +523,11 @@ def _scheduler_activity(dask_scheduler, monitor_id: str):
     return {"client_count": client_count, "task_count": len(active_tasks)}
 
 
-def keep_cluster_alive(cluster, timeout: Optional[float]):
+def keep_cluster_alive(
+    cluster, timeout: Optional[float], *, is_local: bool, target_workers: int
+):
     from distributed import Client
+    import warnings
 
     monitor_client = Client(
         cluster, set_as_default=False, name="seamless-dask-wrapper-monitor"
@@ -548,10 +551,31 @@ def keep_cluster_alive(cluster, timeout: Optional[float]):
             else:
                 if last_activity is None:
                     last_activity = time.monotonic()
-                elif (
-                    timeout is not None and time.monotonic() - last_activity >= timeout
-                ):
-                    break
+                else:
+                    idle_for = time.monotonic() - last_activity
+                    if timeout is not None and idle_for >= timeout:
+                        break
+                    if is_local:
+                        try:
+                            current = getattr(cluster, "workers", None)
+                            worker_count = len(current) if current is not None else 0
+                            if worker_count == 0:
+                                try:
+                                    warnings.warn(
+                                        "[seamless-dask-wrapper] LocalCluster reports 0 workers; attempting restart/scale",
+                                        RuntimeWarning,
+                                    )
+                                    restart = getattr(cluster, "restart", None)
+                                    if callable(restart):
+                                        restart()
+                                    else:
+                                        scale = getattr(cluster, "scale", None)
+                                        if callable(scale):
+                                            scale(max(target_workers, 1))
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
             time.sleep(INACTIVITY_CHECK_INTERVAL)
     finally:
         try:
@@ -676,9 +700,15 @@ def main():
     signal.signal(signal.SIGINT, raise_system_exit)
 
     try:
-        keep_cluster_alive(cluster, args.timeout)
+        keep_cluster_alive(
+            cluster,
+            args.timeout,
+            is_local=isinstance(cluster, LocalCluster),
+            target_workers=wrapper_config.maximum_jobs,
+        )
     finally:
         try:
+            print("Shutdown after timeout")
             cluster.close()
         except Exception:
             pass
