@@ -368,6 +368,7 @@ class SeamlessDaskClient:
             key=base_key,
             resources={"S": 1},
             priority=10,
+            retries=3,
         )
         thin_future = self._client.submit(
             _run_thin,
@@ -375,7 +376,7 @@ class SeamlessDaskClient:
             pure=False,
             key=thin_key,
             resources={"S": 1},
-            priority=11,
+            priority=20,
         )
 
         fat_future = None

@@ -152,6 +152,21 @@ def parse_timedelta_value(value: Any) -> timedelta:
 
     import dask.utils
 
+    # Allow plain HH:MM:SS (or MM:SS) strings, which dask.utils.parse_timedelta
+    # may reject.
+    if isinstance(value, str) and ":" in value:
+        parts = value.split(":")
+        if all(p.isdigit() for p in parts):
+            try:
+                if len(parts) == 3:
+                    h, m, s = (int(p) for p in parts)
+                    return timedelta(hours=h, minutes=m, seconds=s)
+                if len(parts) == 2:
+                    m, s = (int(p) for p in parts)
+                    return timedelta(minutes=m, seconds=s)
+            except Exception:
+                pass
+
     parsed = dask.utils.parse_timedelta(value)
     if isinstance(parsed, timedelta):
         return parsed
@@ -353,7 +368,14 @@ def build_wrapper_configuration(
             "dashboard_address": str(dashboard_port),
             "host": host,
         },
-        "worker-extra-args": [f"--nthreads {worker_threads}"],
+        # "worker-extra-args": [f"--nthreads {worker_threads}"],
+        # KLUDGE
+        "worker-extra-args": [
+            f"--nthreads {worker_threads}",
+            f"--worker-port={internal_port_range_str}",
+            f"--nanny-port={internal_port_range_str}",
+        ],
+        # /KLUDGE
     }
     if partition is not None:
         jobqueue_common["queue"] = partition
@@ -643,6 +665,11 @@ def main():
 
         assert isinstance(cluster, Cluster)
         if not isinstance(cluster, LocalCluster):
+            print(
+                "adapt cluster:",
+                int(wrapper_config.interactive),
+                wrapper_config.maximum_jobs,
+            )
             cluster.adapt(
                 minimum_jobs=int(wrapper_config.interactive),
                 maximum_jobs=wrapper_config.maximum_jobs,
