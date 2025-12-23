@@ -32,9 +32,32 @@ class TransformationDaskMixin:
     def _dask_client(self) -> Optional["SeamlessDaskClient"]:
         return get_seamless_dask_client()
 
+    def _remote_storage_error(self) -> str | None:
+        try:
+            from seamless_config.select import get_execution
+        except Exception:
+            return None
+        if get_execution() != "remote":
+            return None
+        try:
+            from seamless_remote import buffer_remote, database_remote
+        except Exception:
+            return "Remote execution requires hashserver and database server"
+        if not buffer_remote.has_write_server():
+            return "Remote execution requires an active hashserver"
+        if not database_remote.has_write_server():
+            return "Remote execution requires an active database server"
+        return None
+
     def _compute_with_dask(self, require_value: bool) -> Checksum | None:
         client = self._dask_client()
         if client is None:
+            return None
+        storage_error = self._remote_storage_error()
+        if storage_error:
+            self._exception = storage_error + "\n"
+            self._constructed = True
+            self._evaluated = True
             return None
 
         # Fast path for dependency-free transformations: check DB before any Dask submit.
@@ -119,6 +142,12 @@ class TransformationDaskMixin:
     async def _compute_with_dask_async(self, require_value: bool) -> Checksum | None:
         client = self._dask_client()
         if client is None:
+            return None
+        storage_error = self._remote_storage_error()
+        if storage_error:
+            self._exception = storage_error + "\n"
+            self._constructed = True
+            self._evaluated = True
             return None
 
         tf_checksum_hex = self._compute_tf_checksum_no_deps()
