@@ -234,6 +234,7 @@ def merge_flat_config(flat_config: Mapping[str, Any]) -> Dict[str, Any]:
 class WrapperConfig:
     common: Dict[str, Dict[str, Any]]
     worker_threads: int
+    worker_processes: int
     worker_port_range: str
     nanny_port_range: str
     worker_lifetime: Any
@@ -288,22 +289,43 @@ def build_wrapper_configuration(
         parameters.get("job_script_prologue"), "job_script_prologue"
     )
 
-    transformation_throttle = parameters.get(
-        "transformation_throttle", DEFAULT_TRANSFORMATION_THROTTLE
-    )
-    try:
-        transformation_throttle = int(transformation_throttle)
-    except Exception:
-        raise RuntimeError("Parameter 'transformation_throttle' must be an integer")
-    if transformation_throttle <= 0:
-        raise RuntimeError("Parameter 'transformation_throttle' must be positive")
-
-    worker_threads = cores * transformation_throttle
-    env_exports: List[str] = [
-        format_bash_export(
-            "SEAMLESS_WORKER_TRANSFORMATION_THROTTLE", transformation_throttle
+    env_exports: List[str] = []
+    worker_threads_raw = parameters.get("worker_threads")
+    if worker_threads_raw is not None:
+        try:
+            worker_threads = int(worker_threads_raw)
+        except Exception:
+            raise RuntimeError("Parameter 'worker_threads' must be an integer")
+        if worker_threads <= 0:
+            raise RuntimeError("Parameter 'worker_threads' must be positive")
+    else:
+        transformation_throttle = parameters.get(
+            "transformation_throttle", DEFAULT_TRANSFORMATION_THROTTLE
         )
-    ]
+        try:
+            transformation_throttle = int(transformation_throttle)
+        except Exception:
+            raise RuntimeError("Parameter 'transformation_throttle' must be an integer")
+        if transformation_throttle <= 0:
+            raise RuntimeError("Parameter 'transformation_throttle' must be positive")
+
+        worker_threads = cores * transformation_throttle
+        env_exports.append(
+            format_bash_export(
+                "SEAMLESS_WORKER_TRANSFORMATION_THROTTLE", transformation_throttle
+            )
+        )
+
+    worker_processes_raw = parameters.get("processes")
+    if worker_processes_raw is None:
+        worker_processes = 1
+    else:
+        try:
+            worker_processes = int(worker_processes_raw)
+        except Exception:
+            raise RuntimeError("Parameter 'processes' must be an integer")
+        if worker_processes <= 0:
+            raise RuntimeError("Parameter 'processes' must be positive")
 
     unknown_task_duration = parameters.get(
         "unknown-task-duration", DEFAULT_UNKNOWN_TASK_DURATION
@@ -356,7 +378,7 @@ def build_wrapper_configuration(
     )
 
     jobqueue_common: Dict[str, Any] = {
-        "processes": 1,
+        "processes": worker_processes,
         "python": "python",
         "walltime": walltime,
         "cores": cores,
@@ -442,6 +464,7 @@ def build_wrapper_configuration(
     return WrapperConfig(
         common=jobqueue_common,
         worker_threads=worker_threads,
+        worker_processes=worker_processes,
         worker_port_range=internal_port_range_str,
         nanny_port_range=internal_port_range_str,
         worker_lifetime=lifetime_value,
