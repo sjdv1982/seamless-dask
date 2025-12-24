@@ -233,7 +233,7 @@ def merge_flat_config(flat_config: Mapping[str, Any]) -> Dict[str, Any]:
 @dataclass
 class WrapperConfig:
     common: Dict[str, Dict[str, Any]]
-    worker_threads: int
+    worker_threads: Optional[int]
     worker_processes: int
     worker_port_range: str
     nanny_port_range: str
@@ -290,6 +290,10 @@ def build_wrapper_configuration(
     )
 
     env_exports: List[str] = []
+    if "pure_dask" in parameters:
+        pure_dask = parse_bool(parameters.get("pure_dask"), "pure_dask")
+    else:
+        pure_dask = False
     worker_threads_raw = parameters.get("worker_threads")
     if worker_threads_raw is not None:
         try:
@@ -299,22 +303,29 @@ def build_wrapper_configuration(
         if worker_threads <= 0:
             raise RuntimeError("Parameter 'worker_threads' must be positive")
     else:
-        transformation_throttle = parameters.get(
-            "transformation_throttle", DEFAULT_TRANSFORMATION_THROTTLE
-        )
-        try:
-            transformation_throttle = int(transformation_throttle)
-        except Exception:
-            raise RuntimeError("Parameter 'transformation_throttle' must be an integer")
-        if transformation_throttle <= 0:
-            raise RuntimeError("Parameter 'transformation_throttle' must be positive")
-
-        worker_threads = cores * transformation_throttle
-        env_exports.append(
-            format_bash_export(
-                "SEAMLESS_WORKER_TRANSFORMATION_THROTTLE", transformation_throttle
+        if pure_dask:
+            worker_threads = None
+        else:
+            transformation_throttle = parameters.get(
+                "transformation_throttle", DEFAULT_TRANSFORMATION_THROTTLE
             )
-        )
+            try:
+                transformation_throttle = int(transformation_throttle)
+            except Exception:
+                raise RuntimeError(
+                    "Parameter 'transformation_throttle' must be an integer"
+                )
+            if transformation_throttle <= 0:
+                raise RuntimeError(
+                    "Parameter 'transformation_throttle' must be positive"
+                )
+
+            worker_threads = cores * transformation_throttle
+            env_exports.append(
+                format_bash_export(
+                    "SEAMLESS_WORKER_TRANSFORMATION_THROTTLE", transformation_throttle
+                )
+            )
 
     worker_processes_raw = parameters.get("processes")
     if worker_processes_raw is None:
@@ -377,6 +388,13 @@ def build_wrapper_configuration(
         host, port_range[0], port_range[1], exclude=(scheduler_port,)
     )
 
+    worker_extra_args = [
+        f"--worker-port={internal_port_range_str}",
+        f"--nanny-port={internal_port_range_str}",
+    ]
+    if worker_threads is not None:
+        worker_extra_args.insert(0, f"--nthreads {worker_threads}")
+
     jobqueue_common: Dict[str, Any] = {
         "processes": worker_processes,
         "python": "python",
@@ -390,13 +408,8 @@ def build_wrapper_configuration(
             "dashboard_address": str(dashboard_port),
             "host": host,
         },
-        # "worker-extra-args": [f"--nthreads {worker_threads}"],
         # KLUDGE
-        "worker-extra-args": [
-            f"--nthreads {worker_threads}",
-            f"--worker-port={internal_port_range_str}",
-            f"--nanny-port={internal_port_range_str}",
-        ],
+        "worker-extra-args": worker_extra_args,
         # /KLUDGE
     }
     if partition is not None:
@@ -662,19 +675,21 @@ def main():
                 wrapper_config.worker_lifetime = "24h"
                 wrapper_config.worker_lifetime_stagger = "10m"
                 # /KLUDGE
-            cluster = cluster(
-                n_workers=wrapper_config.maximum_jobs,
-                host=wrapper_config.common["scheduler-options"]["host"],
-                scheduler_port=wrapper_config.scheduler_port,
-                dashboard_address=":" + str(wrapper_config.dashboard_port),
-                threads_per_worker=wrapper_config.worker_threads,
-                worker_port=wrapper_config.worker_port_range,
-                port=wrapper_config.nanny_port_range,
-                lifetime=wrapper_config.worker_lifetime,
-                lifetime_stagger=wrapper_config.worker_lifetime_stagger,
-                resources=wrapper_config.worker_resources,
+            cluster_kwargs = {
+                "n_workers": wrapper_config.maximum_jobs,
+                "host": wrapper_config.common["scheduler-options"]["host"],
+                "scheduler_port": wrapper_config.scheduler_port,
+                "dashboard_address": ":" + str(wrapper_config.dashboard_port),
+                "worker_port": wrapper_config.worker_port_range,
+                "port": wrapper_config.nanny_port_range,
+                "lifetime": wrapper_config.worker_lifetime,
+                "lifetime_stagger": wrapper_config.worker_lifetime_stagger,
+                "resources": wrapper_config.worker_resources,
                 # also not read from config: scheduler protocol and security
-            )
+            }
+            if wrapper_config.worker_threads is not None:
+                cluster_kwargs["threads_per_worker"] = wrapper_config.worker_threads
+            cluster = cluster(**cluster_kwargs)
         else:
             try:
                 from dask_jobqueue import OARCluster  # type: ignore
