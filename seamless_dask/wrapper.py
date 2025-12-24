@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import random
@@ -15,7 +16,17 @@ from dataclasses import dataclass
 from datetime import timedelta
 from importlib import import_module
 from types import FunctionType
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple
+from typing import (
+    Any,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    MutableMapping,
+    Optional,
+    TextIO,
+    Tuple,
+)
 
 
 STATUS_FILE_WAIT_TIMEOUT = 20.0
@@ -38,6 +49,39 @@ JOBQUEUE_SYSTEMS = (
 )
 
 status_tracker: "StatusFileTracker | None" = None
+log_handle: Optional[TextIO] = None
+
+
+def configure_log_handle(status_contents: Mapping[str, Any]) -> None:
+    global log_handle
+    log_path = status_contents.get("log")
+    if not isinstance(log_path, str) or not log_path:
+        return
+    try:
+        log_handle = open(log_path, "a", encoding="utf-8")
+    except Exception:
+        log_handle = None
+
+
+def _close_log_handle() -> None:
+    global log_handle
+    if log_handle is None:
+        return
+    try:
+        log_handle.close()
+    except Exception:
+        pass
+    log_handle = None
+
+
+atexit.register(_close_log_handle)
+
+
+def log_print(*args: Any, **kwargs: Any) -> None:
+    if log_handle is not None:
+        kwargs["file"] = log_handle
+    kwargs.setdefault("flush", True)
+    print(*args, **kwargs)
 
 
 class StatusFileTracker:
@@ -233,6 +277,7 @@ def merge_flat_config(flat_config: Mapping[str, Any]) -> Dict[str, Any]:
 @dataclass
 class WrapperConfig:
     common: Dict[str, Dict[str, Any]]
+    cores: int
     worker_threads: Optional[int]
     worker_processes: int
     worker_port_range: str
@@ -248,6 +293,7 @@ class WrapperConfig:
     interactive: bool
     maximum_jobs: Optional[int]
     memory_per_core_property_name: Optional[str]
+    pure_dask: bool
 
 
 def build_wrapper_configuration(
@@ -476,6 +522,7 @@ def build_wrapper_configuration(
 
     return WrapperConfig(
         common=jobqueue_common,
+        cores=cores,
         worker_threads=worker_threads,
         worker_processes=worker_processes,
         worker_port_range=internal_port_range_str,
@@ -491,6 +538,7 @@ def build_wrapper_configuration(
         interactive=interactive,
         maximum_jobs=maximum_jobs,
         memory_per_core_property_name=memory_per_core_property_name,
+        pure_dask=pure_dask,
     )
 
 
@@ -630,6 +678,7 @@ def main():
 
     global status_tracker
     status_file_contents = wait_for_status_file(args.status_file)
+    configure_log_handle(status_file_contents)
     parameters = status_file_contents.get("parameters", {}) or {}
     status_tracker = StatusFileTracker(args.status_file, status_file_contents)
 
@@ -646,6 +695,15 @@ def main():
         raise_startup_error(exc)
 
     try:
+        log_print("Dask worker configuration:")
+        log_print(f"cores: {wrapper_config.cores}")
+        log_print(f"processes: {wrapper_config.worker_processes}")
+        if wrapper_config.worker_threads is None:
+            log_print("worker_threads: jobqueue default")
+        else:
+            log_print(f"worker_threads: {wrapper_config.worker_threads}")
+        log_print(f"pure_dask: {wrapper_config.pure_dask}")
+
         import dask
 
         # Merge into the existing config to avoid clobbering distributed defaults
@@ -703,7 +761,7 @@ def main():
 
         assert isinstance(cluster, Cluster)
         if not isinstance(cluster, LocalCluster):
-            print(
+            log_print(
                 "adapt cluster:",
                 int(wrapper_config.interactive),
                 wrapper_config.maximum_jobs,
@@ -717,11 +775,26 @@ def main():
             wrapper_config.scheduler_port, wrapper_config.dashboard_port
         )
 
-        print("Dask scheduler address:")
-        print(cluster.scheduler_address)
+        print_script = getattr(cluster, "job_script", None)
+        if callable(print_script):
+            try:
+                job_script = print_script()
+            except Exception as exc:
+                log_print(f"Failed to generate job script: {exc}")
+            else:
+                label = (
+                    "SLURM job script:"
+                    if cluster.__class__.__name__ == "SLURMCluster"
+                    else "Job script:"
+                )
+                log_print(label)
+                log_print(job_script.rstrip())
 
-        print("Dask dashboard address:")
-        print(cluster.dashboard_link)
+        log_print("Dask scheduler address:")
+        log_print(cluster.scheduler_address)
+
+        log_print("Dask dashboard address:")
+        log_print(cluster.dashboard_link)
 
     except BaseException as exc:
         raise_startup_error(exc)
@@ -742,7 +815,7 @@ def main():
         )
     finally:
         try:
-            print("Shutdown after timeout")
+            log_print("Shutdown after timeout")
             cluster.close()
         except Exception:
             pass
