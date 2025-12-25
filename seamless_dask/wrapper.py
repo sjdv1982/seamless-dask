@@ -340,6 +340,17 @@ def build_wrapper_configuration(
         pure_dask = parse_bool(parameters.get("pure_dask"), "pure_dask")
     else:
         pure_dask = False
+    worker_processes_raw = parameters.get("processes")
+    if worker_processes_raw is None:
+        worker_processes = cores if pure_dask else 1
+    else:
+        try:
+            worker_processes = int(worker_processes_raw)
+        except Exception:
+            raise RuntimeError("Parameter 'processes' must be an integer")
+        if worker_processes <= 0:
+            raise RuntimeError("Parameter 'processes' must be positive")
+
     worker_threads_raw = parameters.get("worker_threads")
     if worker_threads_raw is not None:
         try:
@@ -350,7 +361,7 @@ def build_wrapper_configuration(
             raise RuntimeError("Parameter 'worker_threads' must be positive")
     else:
         if pure_dask:
-            worker_threads = None
+            worker_threads = 2
         else:
             transformation_throttle = parameters.get(
                 "transformation_throttle", DEFAULT_TRANSFORMATION_THROTTLE
@@ -372,17 +383,6 @@ def build_wrapper_configuration(
                     "SEAMLESS_WORKER_TRANSFORMATION_THROTTLE", transformation_throttle
                 )
             )
-
-    worker_processes_raw = parameters.get("processes")
-    if worker_processes_raw is None:
-        worker_processes = 1
-    else:
-        try:
-            worker_processes = int(worker_processes_raw)
-        except Exception:
-            raise RuntimeError("Parameter 'processes' must be an integer")
-        if worker_processes <= 0:
-            raise RuntimeError("Parameter 'processes' must be positive")
 
     unknown_task_duration = parameters.get(
         "unknown-task-duration", DEFAULT_UNKNOWN_TASK_DURATION
