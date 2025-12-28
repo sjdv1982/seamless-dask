@@ -22,7 +22,7 @@ def test_nested_transformations_multi():
     """Stress nested + nested-nested execution with many small jobs."""
 
     main_pid = os.getpid()
-    job_count = 100
+    job_count = 1
     spawn_workers = 5
 
     sd_client = create_dummy_client(

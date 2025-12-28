@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import random
 import time
 import traceback
@@ -12,7 +13,6 @@ from seamless import Checksum, CacheMissError
 from seamless_transformer.transformation_utils import tf_get_buffer
 
 from .permissions import release_permission, request_permission
-from .transformer_client import get_seamless_dask_client
 from .types import (
     TransformationFutures,
     TransformationInputSpec,
@@ -23,6 +23,19 @@ if TYPE_CHECKING:  # pragma: no cover - type checking only
     from .client import SeamlessDaskClient
 
 
+def _ensure_remote_clients_from_env() -> None:
+    payload = os.environ.get("SEAMLESS_DASK_REMOTE_CLIENTS")
+    if not payload:
+        return
+    try:
+        import json
+        from seamless.config import set_remote_clients
+
+        set_remote_clients(json.loads(payload))
+    except Exception:
+        pass
+
+
 class TransformationDaskMixin:
     """Shared Dask helpers for seamless-transformer Transformation."""
 
@@ -30,6 +43,8 @@ class TransformationDaskMixin:
 
     # ---- public helpers used by Transformation ----------------------------
     def _dask_client(self) -> Optional["SeamlessDaskClient"]:
+        from .transformer_client import get_seamless_dask_client
+
         return get_seamless_dask_client()
 
     def _remote_storage_error(self) -> str | None:
@@ -43,6 +58,8 @@ class TransformationDaskMixin:
             from seamless_remote import buffer_remote, database_remote
         except Exception:
             return "Remote execution requires hashserver and database server"
+        if not buffer_remote.has_write_server() or not database_remote.has_write_server():
+            _ensure_remote_clients_from_env()
         if not buffer_remote.has_write_server():
             return "Remote execution requires an active hashserver"
         if not database_remote.has_write_server():

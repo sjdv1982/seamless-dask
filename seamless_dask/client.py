@@ -135,6 +135,21 @@ def _run_base(
     payload: Dict[str, Any], input_results: Mapping[str, Tuple[Any, ...]]
 ) -> Tuple[str | None, str | None, Buffer | None, str | None]:
     """Worker task that performs the transformation itself."""
+
+    from seamless_dask.client import SeamlessDaskClient
+    from seamless_dask.transformer_client import (
+        get_seamless_dask_client,
+        set_seamless_dask_client,
+    )
+    import distributed
+
+    client = get_seamless_dask_client()
+    if client is None:
+        dask_client = distributed.get_client()
+        assert dask_client is not None
+        client = SeamlessDaskClient(dask_client)
+        set_seamless_dask_client(client)
+
     tf_checksum_hex = payload.get("tf_checksum")
     transformation_dict = dict(payload.get("transformation_dict") or {})
     inputs = payload.get("inputs") or []
@@ -301,6 +316,14 @@ class SeamlessDaskClient:
         self._promised_targets: dict[str, set[str]] = {}
         ensure_configured(workers=worker_plugin_workers)
         self._register_worker_plugin(worker_plugin_workers, remote_clients)
+
+        self._client.submit(lambda: 42)
+        print("Wait for workers to connect...")
+        for _ in range(20):
+            if self._client.scheduler_info().get("workers"):
+                break
+            time.sleep(1)
+
         self._warn_if_no_workers()
 
     # --- public API -----------------------------------------------------

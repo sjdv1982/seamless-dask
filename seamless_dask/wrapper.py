@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import argparse
 import atexit
 import json
@@ -31,6 +32,10 @@ from typing import (
 
 STATUS_FILE_WAIT_TIMEOUT = 20.0
 INACTIVITY_CHECK_INTERVAL = 1.0
+WORKER_RECOVERY_INTERVAL = 30.0
+WORKER_STUCK_TIMEOUT = 300.0
+ADAPTIVE_WAIT_COUNT = 20
+ADAPTIVE_INTERVAL = "30s"
 DEFAULT_TMPDIR = "/tmp"
 DEFAULT_TRANSFORMATION_THROTTLE = 3
 DEFAULT_UNKNOWN_TASK_DURATION = "1m"
@@ -50,6 +55,8 @@ JOBQUEUE_SYSTEMS = (
 
 status_tracker: "StatusFileTracker | None" = None
 log_handle: Optional[TextIO] = None
+
+logging.basicConfig(format="%(levelname)s:%(message)s", level=logging.DEBUG)
 
 
 def configure_log_handle(status_contents: Mapping[str, Any]) -> None:
@@ -493,12 +500,25 @@ def build_wrapper_configuration(
 
     jobqueue_config: Dict[str, Dict[str, Any]] = {}
     for system in JOBQUEUE_SYSTEMS:
-        prologue = list(base_prologue) + env_exports
+        prologue = list(base_prologue)
+        if system == "slurm":
+            if log_handle is not None:
+                log_name = log_handle.name + "-%j"
+                prologue += [f"#SBATCH --output={log_name}.out"]
+                prologue += [f"#SBATCH --error={log_name}.err"]
+
+        prologue += env_exports
         if system == "slurm":
             prologue.append("export PYTHON_CPU_COUNT=$SLURM_JOB_CPUS_PER_NODE")
         config = dict(jobqueue_common)
         config["job-script-prologue"] = prologue
         jobqueue_config[system] = config
+        if system == "slurm":
+            worker_name = "worker-$SLURM_JOB_ID"
+            if "worker-extra-args" not in config:
+                config["worker-extra-args"] = []
+            worker_extra_args = config["worker-extra-args"]
+            worker_extra_args += ["--name", worker_name]
 
     if "interactive" in parameters:
         interactive = parse_bool(parameters.get("interactive"), "interactive")
@@ -581,16 +601,39 @@ def load_cluster_from_string(cluster_string: str, cluster_base: Any):
 
 def _scheduler_activity(dask_scheduler, monitor_id: str):
     client_count = len([cid for cid in dask_scheduler.clients if cid != monitor_id])
+    worker_count = len(getattr(dask_scheduler, "workers", {}))
     active_tasks = [
         ts
         for ts in dask_scheduler.tasks.values()
         if getattr(ts, "state", None) not in ("released", "forgotten")
     ]
-    return {"client_count": client_count, "task_count": len(active_tasks)}
+    return {
+        "client_count": client_count,
+        "worker_count": worker_count,
+        "task_count": len(active_tasks),
+    }
+
+
+def _dummy_task():
+    return None
+
+
+def _submit_dummy_task(client, label: str):
+    try:
+        key = f"seamless-dask-wrapper-dummy-{label}-{time.time_ns()}"
+        return client.submit(_dummy_task, pure=False, key=key)
+    except Exception:
+        return None
 
 
 def keep_cluster_alive(
-    cluster, timeout: Optional[float], *, is_local: bool, target_workers: int
+    cluster,
+    timeout: Optional[float],
+    *,
+    is_local: bool,
+    target_workers: int,
+    interactive: bool,
+    adaptive_settings: Optional[Mapping[str, Any]] = None,
 ):
     from distributed import Client
     import warnings
@@ -599,7 +642,15 @@ def keep_cluster_alive(
         cluster, set_as_default=False, name="seamless-dask-wrapper-monitor"
     )
     last_activity: Optional[float] = None
+    last_recovery_attempt: Optional[float] = None
+    no_worker_since: Optional[float] = None
+    saw_worker: bool = False
+    dummy_futures: List[Any] = []
     try:
+        if interactive and not is_local:
+            future = _submit_dummy_task(monitor_client, "startup")
+            if future is not None:
+                dummy_futures.append(future)
         while True:
             try:
                 activity = monitor_client.run_on_scheduler(
@@ -611,7 +662,67 @@ def keep_cluster_alive(
                     or activity.get("task_count", 0) > 0
                 )
             except Exception:
+                activity = {}
                 has_activity = False
+            if not is_local:
+                now = time.monotonic()
+                worker_count = int(activity.get("worker_count", 0) or 0)
+                task_count = int(activity.get("task_count", 0) or 0)
+                if worker_count > 0:
+                    saw_worker = True
+                if worker_count == 0 and task_count > 0:
+                    if not saw_worker:
+                        no_worker_since = None
+                        time.sleep(INACTIVITY_CHECK_INTERVAL)
+                        continue
+                    if no_worker_since is None:
+                        no_worker_since = now
+                else:
+                    no_worker_since = None
+                stuck = bool(
+                    no_worker_since is not None
+                    and (now - no_worker_since) >= WORKER_STUCK_TIMEOUT
+                )
+                if worker_count == 0 and task_count > 0:
+                    if (
+                        last_recovery_attempt is None
+                        or now - last_recovery_attempt >= WORKER_RECOVERY_INTERVAL
+                    ):
+                        last_recovery_attempt = now
+                        if adaptive_settings is not None:
+                            try:
+                                adapt = getattr(cluster, "adapt", None)
+                                if callable(adapt):
+                                    adapt(**adaptive_settings)
+                            except Exception:
+                                pass
+                        try:
+                            warnings.warn(
+                                "[seamless-dask-wrapper] Scheduler has pending tasks but no workers; forcing jobqueue rescale",
+                                RuntimeWarning,
+                            )
+                            correct_state = getattr(cluster, "_correct_state", None)
+                            if callable(correct_state):
+                                sync = getattr(cluster, "sync", None)
+                                if callable(sync):
+                                    sync(correct_state)
+                                else:
+                                    correct_state()
+                        except Exception:
+                            pass
+                        try:
+                            scale = getattr(cluster, "scale", None)
+                            if callable(scale):
+                                if interactive or stuck:
+                                    scale(0)
+                                    no_worker_since = None
+                                scale(max(target_workers, 1))
+                        except Exception:
+                            pass
+                        if interactive:
+                            future = _submit_dummy_task(monitor_client, "recovery")
+                            if future is not None:
+                                dummy_futures.append(future)
             if has_activity:
                 last_activity = None
             else:
@@ -642,6 +753,8 @@ def keep_cluster_alive(
                                     pass
                         except Exception:
                             pass
+            if dummy_futures:
+                dummy_futures = [fut for fut in dummy_futures if not fut.done()]
             time.sleep(INACTIVITY_CHECK_INTERVAL)
     finally:
         try:
@@ -766,10 +879,18 @@ def main():
                 int(wrapper_config.interactive),
                 wrapper_config.maximum_jobs,
             )
-            cluster.adapt(
-                minimum_jobs=int(wrapper_config.interactive),
-                maximum_jobs=wrapper_config.maximum_jobs,
-            )
+            adaptive_settings = {
+                "minimum_jobs": int(wrapper_config.interactive),
+                "maximum_jobs": wrapper_config.maximum_jobs,
+                "target_duration": parameters.get(
+                    "target-duration", DEFAULT_TARGET_DURATION
+                ),
+                "wait_count": ADAPTIVE_WAIT_COUNT,
+                "interval": ADAPTIVE_INTERVAL,
+            }
+            cluster.adapt(**adaptive_settings)
+        else:
+            adaptive_settings = None
 
         status_tracker.write_running(
             wrapper_config.scheduler_port, wrapper_config.dashboard_port
@@ -812,6 +933,8 @@ def main():
             args.timeout,
             is_local=isinstance(cluster, LocalCluster),
             target_workers=wrapper_config.maximum_jobs,
+            interactive=wrapper_config.interactive,
+            adaptive_settings=adaptive_settings,
         )
     finally:
         try:

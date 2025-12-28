@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sys
 import threading
 from typing import Any
 
@@ -68,62 +69,87 @@ class SeamlessWorkerPlugin(WorkerPlugin):
         self.remote_clients = remote_clients
 
     def setup(self, worker) -> None:  # type: ignore[override]
-        try:
-            from seamless.transformer import has_spawned, spawn
-            from seamless.config import set_remote_clients
-            from .permissions import configure as configure_permissions
-            import os
 
-            threads = getattr(worker.state, "nthreads", None)
-            if threads is not None and threads < self.num_workers:
-                raise RuntimeError(
-                    f"Dask worker threads ({threads}) "
-                    f"must be at least Seamless worker count ({self.num_workers})"
-                )
+        import logging
 
-            def _update_resources(value: int) -> None:
-                """Push the current permission counter to the scheduler."""
+        def _get_worker_logger(worker) -> logging.Logger:
+            logger = getattr(worker, "logger", None)
+            if isinstance(logger, logging.Logger):
+                return logger
+            return logging.getLogger("distributed.worker")
 
-                try:
-                    loop = getattr(worker.loop, "asyncio_loop", None) or worker.loop
-                    coro = worker.set_resources(S=float(value))
-                    asyncio.run_coroutine_threadsafe(coro, loop)
-                except Exception:
-                    LOGGER.debug("Failed to update worker resources", exc_info=True)
+        worker_logger = _get_worker_logger(worker)
+        worker_logger.info("Seamless worker setup started")
+        from seamless.transformer import has_spawned, spawn
+        from seamless.config import set_remote_clients
+        from .permissions import configure as configure_permissions
+        import os
 
+        threads = getattr(worker.state, "nthreads", None)
+        if threads is not None and threads < self.num_workers:
+            raise RuntimeError(
+                f"Dask worker threads ({threads}) "
+                f"must be at least Seamless worker count ({self.num_workers})"
+            )
+
+        scheduler = getattr(worker, "scheduler", None)
+        scheduler_address = getattr(scheduler, "address", None)
+        if scheduler_address:
+            os.environ.setdefault("SEAMLESS_DASK_SCHEDULER", scheduler_address)
+        os.environ.setdefault("SEAMLESS_DASK_WORKERS", str(self.num_workers))
+
+        if self.remote_clients is not None:
+            set_remote_clients(self.remote_clients)
+            worker_logger.info(
+                "Set remote clients inside Dask worker %s: %s",
+                worker.name,
+                json.dumps(self.remote_clients, indent=4),
+            )
             try:
-                configure_permissions(
-                    workers=self.num_workers, resource_updater=_update_resources
+                os.environ.setdefault(
+                    "SEAMLESS_DASK_REMOTE_CLIENTS",
+                    json.dumps(self.remote_clients),
                 )
             except Exception:
-                LOGGER.debug("Failed to configure permission manager", exc_info=True)
-            if not has_spawned():
-                # Dask worker processes do not run as MainProcess; allow spawning anyway.
-                os.environ.setdefault("SEAMLESS_ALLOW_CHILD_SPAWN", "1")
-                spawn(self.num_workers)
-                LOGGER.info(
-                    "Spawned Seamless workers inside Dask worker %s (count=%d, threads=%s)",
-                    worker.name,
-                    self.num_workers,
-                    threads,
+                worker_logger.debug(
+                    "Failed to serialize remote clients for child workers",
+                    exc_info=True,
                 )
 
-            if self.remote_clients is not None:
-                set_remote_clients(self.remote_clients)
-                LOGGER.info(
-                    "Set remote clients inside Dask worker %s: %s",
-                    worker.name,
-                    json.dumps(self.remote_clients, indent=4),
-                )
+        def _update_resources(value: int) -> None:
+            """Push the current permission counter to the scheduler."""
 
-            _ensure_worker_loop(worker)
+            try:
+                loop = getattr(worker.loop, "asyncio_loop", None) or worker.loop
+                coro = worker.set_resources(S=float(value))
+                asyncio.run_coroutine_threadsafe(coro, loop)
+            except Exception:
+                worker_logger.debug("Failed to update worker resources", exc_info=True)
 
-        except Exception as exc:  # pragma: no cover - best-effort safety
-            LOGGER.error(
-                "Failed to spawn Seamless workers inside Dask worker %s: %s",
-                getattr(worker, "name", "<unknown>"),
-                exc,
+        try:
+            configure_permissions(
+                workers=self.num_workers, resource_updater=_update_resources
             )
+        except Exception:
+            worker_logger.debug("Failed to configure permission manager", exc_info=True)
+        if not has_spawned():
+            # Dask worker processes do not run as MainProcess; allow spawning anyway.
+            os.environ.setdefault("SEAMLESS_ALLOW_CHILD_SPAWN", "1")
+            spawn(self.num_workers, dask_available=True)
+            worker_logger.info(
+                "Spawned Seamless workers inside Dask worker %s (count=%d, threads=%s)",
+                worker.name,
+                self.num_workers,
+                threads,
+            )
+
+        if self.remote_clients is not None:
+            from seamless_config.select import select_execution
+
+            select_execution("remote")
+
+        _ensure_worker_loop(worker)
+        worker_logger.info("Seamless worker setup completed")
 
     def teardown(self, worker) -> None:  # type: ignore[override]
         _stop_worker_loop(worker)
