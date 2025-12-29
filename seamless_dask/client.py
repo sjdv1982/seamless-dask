@@ -380,7 +380,11 @@ class SeamlessDaskClient:
         }
         input_futures = dict(submission.input_futures)
         resource_string = None  # TODO: get from tf_dunder
-        base_key = self._build_key("base", resource_string, tf_checksum_hex)
+        base_prefix = "base"
+        ccs = submission.transformation_dict.get("__code_checksum__")
+        if ccs is not None:
+            base_prefix += "_" + str(ccs)
+        base_key = self._build_key(base_prefix, resource_string, tf_checksum_hex)
         thin_key = self._build_key("thin", resource_string, tf_checksum_hex)
 
         base_future = self._client.submit(
