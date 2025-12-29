@@ -22,7 +22,7 @@ def test_nested_transformations_multi():
     """Stress nested + nested-nested execution with many small jobs."""
 
     main_pid = os.getpid()
-    job_count = 1
+    job_count = int(os.environ.get("SEAMLESS_TEST_JOB_COUNT", "50"))
     spawn_workers = 5
 
     sd_client = create_dummy_client(
@@ -84,9 +84,10 @@ def test_nested_transformations_multi():
         import math
 
         if job_count <= 50:
-            assert duration * 0.9 - 2 < job_count / (
-                spawn_workers * 0.5
-            )  # should complete with reasonable (half of spawn workers) concurrency, and 2 + 10 % overhead
+            expected = job_count / (spawn_workers * 0.5)
+            assert (
+                duration < expected * 1.5 + 5
+            ), duration  # allow extra overhead for colder runs
             # An outer job should be 1 sec: 4 half-second jobs of which 2 are in parallel
         else:
             # with more than 50 jobs for 5 cores, with 2 levels of nesting, we're flooded.

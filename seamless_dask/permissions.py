@@ -126,6 +126,16 @@ class PermissionManager:
                 cond.wait()
             return bool(entry["result"])
 
+    def try_request(self) -> bool:
+        """Non-blocking permission request; returns False when at capacity."""
+
+        with self._lock:
+            if self._s_counter < self.capacity:
+                self._s_counter += 1.0
+                self._sync_resources()
+                return True
+            return False
+
     def release(self) -> None:
         """Release a previously granted permission."""
 
@@ -202,6 +212,13 @@ def request_permission() -> bool:
     return _manager.request()  # type: ignore[union-attr]
 
 
+def try_request_permission() -> bool:
+    """Non-blocking permission request."""
+    if _manager is None:
+        configure(workers=1)
+    return _manager.try_request()  # type: ignore[union-attr]
+
+
 def release_permission() -> None:
     """Release a previously granted permission token."""
     if _manager is None:
@@ -227,4 +244,5 @@ __all__ = [
     "shutdown_permission_manager",
     "release_permission",
     "request_permission",
+    "try_request_permission",
 ]
