@@ -103,9 +103,14 @@ class TransformationDaskMixin:
         except Exception:
             env_requires_remote = False
 
-        permission_acquired = self._wait_for_permission(
-            env_requires_remote=env_requires_remote
-        )
+        permission_granted = False
+        if self._skip_permission_gate():
+            permission_acquired = True
+        else:
+            permission_acquired = self._wait_for_permission(
+                env_requires_remote=env_requires_remote
+            )
+            permission_granted = permission_acquired
         if not permission_acquired:
             return self._run_local_fallback_sync(require_value=require_value)
 
@@ -115,7 +120,7 @@ class TransformationDaskMixin:
                 tf_checksum_hex, require_value=require_value
             )
             if cached is not None:
-                if permission_acquired:
+                if permission_granted:
                     release_permission()
                 self._transformation_checksum = Checksum(tf_checksum_hex)
                 self._constructed = True
@@ -133,11 +138,11 @@ class TransformationDaskMixin:
                 client,
                 require_value=require_value,
                 need_fat=False,
-                permission_granted=True,
+                permission_granted=permission_granted,
             )
             tf_checksum_hex, result_checksum_hex, exc = futures.thin.result()
         except Exception:
-            if permission_acquired:
+            if permission_granted:
                 release_permission()
             self._exception = traceback.format_exc().strip("\n") + "\n"
             self._constructed = True
@@ -187,9 +192,14 @@ class TransformationDaskMixin:
         except Exception:
             env_requires_remote = False
 
-        permission_acquired = await self._wait_for_permission_async(
-            env_requires_remote=env_requires_remote
-        )
+        permission_granted = False
+        if self._skip_permission_gate():
+            permission_acquired = True
+        else:
+            permission_acquired = await self._wait_for_permission_async(
+                env_requires_remote=env_requires_remote
+            )
+            permission_granted = permission_acquired
         if not permission_acquired:
             return await self._run_local_fallback_async(require_value=require_value)
 
@@ -199,7 +209,7 @@ class TransformationDaskMixin:
                 tf_checksum_hex, require_value=require_value
             )
             if cached is not None:
-                if permission_acquired:
+                if permission_granted:
                     release_permission()
                 self._transformation_checksum = Checksum(tf_checksum_hex)
                 self._constructed = True
@@ -217,13 +227,13 @@ class TransformationDaskMixin:
                 client,
                 require_value=require_value,
                 need_fat=False,
-                permission_granted=True,
+                permission_granted=permission_granted,
             )
             tf_checksum_hex, result_checksum_hex, exc = await asyncio.wrap_future(
                 asyncio.get_running_loop().run_in_executor(None, futures.thin.result)
             )
         except Exception:
-            if permission_acquired:
+            if permission_granted:
                 release_permission()
             self._exception = traceback.format_exc().strip("\n") + "\n"
             self._constructed = True
@@ -246,6 +256,30 @@ class TransformationDaskMixin:
     def _env_allows_local(self) -> bool:
         """Stub for environment analysis; currently always returns True."""
 
+        return True
+
+    def _skip_permission_gate(self) -> bool:
+        """Skip Dask throttling for driver transforms or top-level submissions."""
+
+        meta = getattr(self, "_meta", None)
+        if isinstance(meta, dict) and meta.get("driver"):
+            return True
+        try:
+            from seamless import is_worker
+        except Exception:
+            return False
+        try:
+            if is_worker():
+                return False
+        except Exception:
+            return False
+        try:
+            from seamless_transformer import worker as st_worker
+
+            if st_worker.has_spawned():
+                return False
+        except Exception:
+            return False
         return True
 
     def _wait_for_permission(self, *, env_requires_remote: bool) -> bool:

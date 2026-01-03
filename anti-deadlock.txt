@@ -35,6 +35,8 @@ The core of the solution is that compute_with_dask must be preceded by a blockin
 "permission asking routine". For top-level transformations, this routine runs directly.
 For nested transformations, there will be a request to the parent where the routine is run
 and the nesting transformation waits for it.
+The permission routine is bypassed when the transformation meta has driver=True, or when
+running in a process that is not a Seamless worker and has not spawned a local worker pool.
 
 3. Whenever permission is given, increment S by one. As long as S is no larger than T * N,
 give permission instantly. This will make more and more of the Dask worker thread pool available.
