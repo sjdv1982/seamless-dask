@@ -31,6 +31,13 @@ dask.config.set({"distributed.worker.daemon": False})
 dask.config.set({"distributed.scheduler.unknown-task-duration": "1m"})
 dask.config.set({"distributed.scheduler.target-duration": "10m"})
 
+def _noop_42() -> int:
+    return 42
+
+
+def _has_worker_plugin(dask_scheduler) -> bool:
+    return "seamless-worker-setup" in getattr(dask_scheduler, "worker_plugins", {})
+
 
 def _run_on_worker_loop(coro_factory: Callable[[], Coroutine[Any, Any, Any]]) -> Any:
     loop = _get_worker_loop()
@@ -317,7 +324,7 @@ class SeamlessDaskClient:
         ensure_configured(workers=worker_plugin_workers)
         self._register_worker_plugin(worker_plugin_workers, remote_clients)
 
-        self._client.submit(lambda: 42)
+        self._client.submit(_noop_42)
         print("Wait for workers to connect...")
         for _ in range(20):
             if self._client.scheduler_info().get("workers"):
@@ -463,10 +470,7 @@ class SeamlessDaskClient:
     ) -> None:
         try:
             # Avoid re-registering if scheduler already has the plugin.
-            already_registered = self._client.run_on_scheduler(
-                lambda dask_scheduler: "seamless-worker-setup"
-                in getattr(dask_scheduler, "worker_plugins", {})
-            )
+            already_registered = self._client.run_on_scheduler(_has_worker_plugin)
             if already_registered:
                 return
             plugin = SeamlessWorkerPlugin(
