@@ -693,9 +693,10 @@ def keep_cluster_alive(
                         last_recovery_attempt = now
                         if adaptive_settings is not None:
                             try:
-                                adapt = getattr(cluster, "adapt", None)
-                                if callable(adapt):
-                                    adapt(**adaptive_settings)
+                                minimum_jobs = adaptive_settings["minimum_jobs"]
+                                if minimum_jobs:
+                                    cluster.scale(minimum_jobs)
+                                cluster.adapt(**adaptive_settings)
                             except Exception:
                                 pass
                         try:
@@ -881,8 +882,9 @@ def main():
                 int(wrapper_config.interactive),
                 wrapper_config.maximum_jobs,
             )
+            minimum_jobs = int(wrapper_config.interactive)
             adaptive_settings = {
-                "minimum_jobs": int(wrapper_config.interactive),
+                "minimum_jobs": minimum_jobs,
                 "maximum_jobs": wrapper_config.maximum_jobs,
                 "target_duration": parameters.get(
                     "target-duration", DEFAULT_TARGET_DURATION
@@ -890,6 +892,8 @@ def main():
                 "wait_count": ADAPTIVE_WAIT_COUNT,
                 "interval": ADAPTIVE_INTERVAL,
             }
+            if minimum_jobs:
+                cluster.scale(minimum_jobs)
             cluster.adapt(**adaptive_settings)
         else:
             adaptive_settings = None
