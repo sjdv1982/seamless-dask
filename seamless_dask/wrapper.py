@@ -667,7 +667,9 @@ def keep_cluster_alive(
             if not is_local:
                 now = time.monotonic()
                 worker_count = int(activity.get("worker_count", 0) or 0)
-                task_count = int(activity.get("task_count", 0) or 0)
+                task_count = max(
+                    int(activity.get("task_count", 0) or 0) - len(dummy_futures), 0
+                )
                 if worker_count > 0:
                     saw_worker = True
                 if worker_count == 0 and task_count > 0:
