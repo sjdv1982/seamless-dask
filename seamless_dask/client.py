@@ -546,11 +546,25 @@ class SeamlessDaskClient:
 
     def _prune_caches(self) -> None:
         now = time.monotonic()
-        for cache in (self._fat_checksum_cache, self._transformation_cache):
-            for key in list(cache.keys()):
-                _, expiry = cache[key]
-                if expiry < now:
-                    cache.pop(key, None)
+        for key in list(self._fat_checksum_cache.keys()):
+            future, expiry = self._fat_checksum_cache[key]
+            if expiry < now:
+                self._fat_checksum_cache.pop(key, None)
+                try:
+                    future.release()
+                except Exception:
+                    pass
+        for key in list(self._transformation_cache.keys()):
+            futures, expiry = self._transformation_cache[key]
+            if expiry < now:
+                self._transformation_cache.pop(key, None)
+                for future in (futures.base, futures.thin, futures.fat):
+                    if future is None:
+                        continue
+                    try:
+                        future.release()
+                    except Exception:
+                        pass
 
     def _store_transformation(
         self, tf_checksum_hex: str, futures: TransformationFutures
