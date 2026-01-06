@@ -231,6 +231,25 @@ def parse_timedelta_value(value: Any) -> timedelta:
         raise TypeError(f"Cannot interpret timedelta from {parsed!r}") from exc
 
 
+def scale_target_duration(value: Any, divisor: float) -> Any:
+    if value is None:
+        return None
+    try:
+        divisor = float(divisor)
+    except Exception:
+        return value
+    if divisor <= 0 or divisor == 1.0:
+        return value
+    try:
+        td = parse_timedelta_value(value)
+    except Exception:
+        return value
+    seconds = td.total_seconds() / divisor
+    if seconds <= 0:
+        return value
+    return seconds
+
+
 def normalize_port_range(value: Any) -> Tuple[int, int]:
     if isinstance(value, (list, tuple)) and len(value) == 2:
         start, end = value
@@ -626,6 +645,23 @@ def _submit_dummy_task(client, label: str):
         return None
 
 
+class _SuppressOOBFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            return "Run out-of-band function" not in record.getMessage()
+        except Exception:
+            return True
+
+
+def _install_oob_log_filter():
+    logger = logging.getLogger("distributed.scheduler")
+    if not any(isinstance(flt, _SuppressOOBFilter) for flt in logger.filters):
+        logger.addFilter(_SuppressOOBFilter())
+    root = logging.getLogger()
+    if not any(isinstance(flt, _SuppressOOBFilter) for flt in root.filters):
+        root.addFilter(_SuppressOOBFilter())
+
+
 def keep_cluster_alive(
     cluster,
     timeout: Optional[float],
@@ -641,6 +677,10 @@ def keep_cluster_alive(
     monitor_client = Client(
         cluster, set_as_default=False, name="seamless-dask-wrapper-monitor"
     )
+    try:
+        monitor_client.run_on_scheduler(_install_oob_log_filter)
+    except Exception:
+        pass
     last_activity: Optional[float] = None
     last_recovery_attempt: Optional[float] = None
     no_worker_since: Optional[float] = None
@@ -883,12 +923,16 @@ def main():
                 wrapper_config.maximum_jobs,
             )
             minimum_jobs = int(wrapper_config.interactive)
+            target_duration = parameters.get("target-duration", DEFAULT_TARGET_DURATION)
+            if not wrapper_config.pure_dask:
+                worker_threads = wrapper_config.worker_threads or 0
+                if wrapper_config.cores > 0 and worker_threads > 0:
+                    ratio = worker_threads / wrapper_config.cores
+                    target_duration = scale_target_duration(target_duration, ratio)
             adaptive_settings = {
                 "minimum_jobs": minimum_jobs,
                 "maximum_jobs": wrapper_config.maximum_jobs,
-                "target_duration": parameters.get(
-                    "target-duration", DEFAULT_TARGET_DURATION
-                ),
+                "target_duration": target_duration,
                 "wait_count": ADAPTIVE_WAIT_COUNT,
                 "interval": ADAPTIVE_INTERVAL,
             }
