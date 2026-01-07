@@ -32,12 +32,20 @@ Every Dask worker has N units of S, so up to N base tasks will run in parallel. 
 and fat-checksum tasks do not claim S.
 
 2. Any non-local transformation will try to call "compute_with_dask" (sync or async).
-The core of the solution is that compute_with_dask must be preceded by a blocking 
+The core of the solution is that compute_with_dask must be preceded by a blocking
 "permission asking routine". For top-level transformations, this routine runs directly.
 For nested transformations, there will be a request to the parent where the routine is run
 and the nesting transformation waits for it.
 The permission routine is bypassed when the transformation meta has driver=True, or when
 running in a process that is not a Seamless worker and has not spawned a local worker pool.
+Additionally, a driver execution context is used when a transformation runs: if the
+transformation dict contains __meta__.driver=True, a thread-local flag is set for the
+duration of that transformation's execution. Any nested transformations submitted from
+within the same thread will then bypass the permission routine, even if they are not
+marked driver=True themselves. This context is thread-safe (stored in threading.local())
+and is restored after each transformation finishes, so sequential tasks do not leak state.
+Note that the driver context does not automatically propagate to new threads spawned inside
+the transformation body.
 
 3. Whenever permission is given, increment S by one. As long as S is no larger than T * N,
 give permission instantly. This will make more and more of the Dask worker thread pool available.

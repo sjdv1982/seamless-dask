@@ -265,6 +265,13 @@ class TransformationDaskMixin:
         if isinstance(meta, dict) and meta.get("driver"):
             return True
         try:
+            from seamless_transformer.run import is_driver_context
+
+            if is_driver_context():
+                return True
+        except Exception:
+            pass
+        try:
             from seamless import is_worker
         except Exception:
             return False
@@ -351,6 +358,15 @@ class TransformationDaskMixin:
         transformation_dict, dependencies = (
             pretransformation.build_partial_transformation(upstream_dependencies)
         )
+        meta = getattr(self, "_meta", {}) or {}
+        if meta:
+            existing_meta = transformation_dict.get("__meta__")
+            if isinstance(existing_meta, dict):
+                merged_meta = dict(existing_meta)
+                merged_meta.update(meta)
+            else:
+                merged_meta = dict(meta)
+            transformation_dict["__meta__"] = merged_meta
         tf_checksum_hex: str | None = None
         if not dependencies:
             tf_buffer = tf_get_buffer(transformation_dict)
