@@ -592,6 +592,34 @@ class SeamlessDaskClient:
             futures.fat.add_done_callback(_on_done)
         self._touch_transformation_cache(tf_checksum_hex, futures)
 
+    def release_transformation_futures(
+        self, futures: TransformationFutures, *, cancel: bool = True
+    ) -> None:
+        """Release and optionally cancel a transformation's futures and cache entries."""
+
+        tf_checksum_hex = futures.tf_checksum
+        if tf_checksum_hex:
+            cached = self._transformation_cache.get(tf_checksum_hex)
+            if cached is not None and cached[0] is futures:
+                self._transformation_cache.pop(tf_checksum_hex, None)
+        if futures.result_checksum and futures.fat is not None:
+            cached = self._fat_checksum_cache.get(futures.result_checksum)
+            if cached is not None and cached[0] is futures.fat:
+                self._fat_checksum_cache.pop(futures.result_checksum, None)
+
+        for future in (futures.base, futures.thin, futures.fat):
+            if future is None:
+                continue
+            try:
+                future.release()
+            except Exception:
+                pass
+            if cancel:
+                try:
+                    self._client.cancel(future, force=True)
+                except Exception:
+                    pass
+
     def _prune_caches(self) -> None:
         now = time.monotonic()
         for key in list(self._fat_checksum_cache.keys()):

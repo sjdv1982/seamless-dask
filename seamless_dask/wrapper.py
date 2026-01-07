@@ -1620,10 +1620,22 @@ def main():
             minimum_jobs = int(wrapper_config.interactive)
             target_duration = parameters.get("target-duration", DEFAULT_TARGET_DURATION)
             if not wrapper_config.pure_dask:
-                worker_threads = wrapper_config.worker_threads or 0
-                if wrapper_config.cores > 0 and worker_threads > 0:
-                    ratio = worker_threads / wrapper_config.cores
-                    target_duration = scale_target_duration(target_duration, ratio)
+                scale_factor = None
+                if wrapper_config.worker_resources is not None:
+                    try:
+                        scale_factor = float(
+                            wrapper_config.worker_resources.get("S")  # type: ignore[arg-type]
+                        )
+                    except Exception:
+                        scale_factor = None
+                    if scale_factor is not None and scale_factor <= 0:
+                        scale_factor = None
+                if scale_factor is None and wrapper_config.cores > 0:
+                    scale_factor = float(wrapper_config.cores)
+                if scale_factor:
+                    target_duration = scale_target_duration(
+                        target_duration, 1.0 / scale_factor
+                    )
             adaptive_settings = {
                 "minimum_jobs": minimum_jobs,
                 "maximum_jobs": wrapper_config.maximum_jobs,
