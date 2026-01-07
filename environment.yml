@@ -2,7 +2,7 @@ name: seamless-dask
 channels:
   - conda-forge
 dependencies:
-  - python>=3.13
+  - python=3.12.* # for pure-dask. Seamless transformations should be more resistant
   - aiofiles
   - dask
   - distributed

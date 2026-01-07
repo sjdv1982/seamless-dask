@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 import argparse
 import atexit
+import asyncio
+import inspect
 import json
 import os
 import random
@@ -13,6 +15,11 @@ import signal
 import socket
 import sys
 import time
+import math
+import threading
+import traceback
+import queue
+from concurrent.futures import Future
 from dataclasses import dataclass
 from datetime import timedelta
 from importlib import import_module
@@ -34,8 +41,12 @@ STATUS_FILE_WAIT_TIMEOUT = 20.0
 INACTIVITY_CHECK_INTERVAL = 1.0
 WORKER_RECOVERY_INTERVAL = 30.0
 WORKER_STUCK_TIMEOUT = 300.0
-ADAPTIVE_WAIT_COUNT = 20
+ADAPTIVE_WAIT_COUNT = 10
 ADAPTIVE_INTERVAL = "30s"
+ADAPTIVE_TARGET_TIMEOUT = 5.0
+ADAPTIVE_TARGET_WARN_INTERVAL = 30.0
+SCHEDULER_ACTIVITY_TIMEOUT = 5.0
+SCHEDULER_ACTIVITY_WARN_INTERVAL = 30.0
 DEFAULT_TMPDIR = "/tmp"
 DEFAULT_TRANSFORMATION_THROTTLE = 3
 DEFAULT_UNKNOWN_TASK_DURATION = "1m"
@@ -55,6 +66,8 @@ JOBQUEUE_SYSTEMS = (
 
 status_tracker: "StatusFileTracker | None" = None
 log_handle: Optional[TextIO] = None
+_OOB_HANDLE_PATCHED = False
+_ORIGINAL_LOGGER_HANDLE = None
 
 logging.basicConfig(format="%(levelname)s:%(message)s", level=logging.DEBUG)
 
@@ -91,6 +104,54 @@ def log_print(*args: Any, **kwargs: Any) -> None:
     print(*args, **kwargs)
 
 
+def log_exception(context: str, exc: BaseException) -> None:
+    log_print(f"[seamless-dask-wrapper] {context}:", repr(exc))
+    try:
+        details = "".join(
+            traceback.format_exception(type(exc), exc, exc.__traceback__)
+        ).rstrip()
+    except Exception:
+        return
+    if details:
+        log_print(details)
+
+
+class _DaemonExecutor:
+    def __init__(self, name: str) -> None:
+        self._queue: queue.SimpleQueue = queue.SimpleQueue()
+        self._shutdown = False
+        self._thread = threading.Thread(target=self._run, name=name, daemon=True)
+        self._thread.start()
+
+    def submit(self, fn, *args, **kwargs) -> Future:
+        fut: Future = Future()
+        if self._shutdown:
+            fut.set_exception(RuntimeError("Executor is shut down"))
+            return fut
+        self._queue.put((fn, args, kwargs, fut))
+        return fut
+
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is None:
+                break
+            fn, args, kwargs, fut = item
+            if fut.set_running_or_notify_cancel():
+                try:
+                    result = fn(*args, **kwargs)
+                except BaseException as exc:
+                    fut.set_exception(exc)
+                else:
+                    fut.set_result(result)
+
+    def shutdown(self, wait: bool = False) -> None:
+        self._shutdown = True
+        self._queue.put(None)
+        if wait:
+            self._thread.join()
+
+
 class StatusFileTracker:
     def __init__(self, path: str, base_contents: dict):
         self.path = path
@@ -117,6 +178,15 @@ class StatusFileTracker:
         payload = dict(self._base_contents)
         payload["status"] = "failed"
         self._write(payload)
+
+    def delete(self):
+        log_print(f"[seamless-dask-wrapper] delete status file: {self.path}")
+        try:
+            os.remove(self.path)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
 
 
 def raise_startup_error(exc: BaseException):
@@ -248,6 +318,359 @@ def scale_target_duration(value: Any, divisor: float) -> Any:
     if seconds <= 0:
         return value
     return seconds
+
+
+def _duration_seconds(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return parse_timedelta_value(value).total_seconds()
+    except Exception:
+        return None
+
+
+def _get_attr_value(obj: Any, *names: str) -> Any:
+    for name in names:
+        if hasattr(obj, name):
+            return getattr(obj, name)
+    return None
+
+
+def _run_coro_blocking(coro):
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    result: dict[str, Any] = {}
+    error: dict[str, BaseException] = {}
+
+    def _runner():
+        try:
+            result["value"] = asyncio.run(coro)
+        except BaseException as exc:
+            error["exc"] = exc
+
+    thread = threading.Thread(target=_runner, name="adaptive-target-runner")
+    thread.start()
+    thread.join()
+    if error:
+        raise error["exc"]
+    return result.get("value")
+
+
+def _resolve_awaitable(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return _run_coro_blocking(value)
+    return value
+
+
+_WAITING_AWARE_ADAPTIVE: Any | None = None
+_SCHEDULER_ACTIVITY_LOCK = threading.Lock()
+_LAST_SCHEDULER_ACTIVITY: Dict[str, Any] | None = None
+
+
+def _record_scheduler_activity(activity: Any) -> None:
+    if not isinstance(activity, dict):
+        return
+    snapshot = dict(activity)
+    snapshot["timestamp"] = time.monotonic()
+    global _LAST_SCHEDULER_ACTIVITY
+    with _SCHEDULER_ACTIVITY_LOCK:
+        _LAST_SCHEDULER_ACTIVITY = snapshot
+
+
+def _get_cached_activity() -> Dict[str, Any] | None:
+    with _SCHEDULER_ACTIVITY_LOCK:
+        if _LAST_SCHEDULER_ACTIVITY is None:
+            return None
+        return dict(_LAST_SCHEDULER_ACTIVITY)
+
+
+def _make_waiting_aware_adaptive():
+    global _WAITING_AWARE_ADAPTIVE
+    if _WAITING_AWARE_ADAPTIVE is not None:
+        return _WAITING_AWARE_ADAPTIVE
+
+    try:
+        from distributed.deploy.adaptive import Adaptive as DaskAdaptive
+    except Exception:
+        return None
+
+    class WaitingAwareAdaptive(DaskAdaptive):
+        async def target(self) -> int:  # type: ignore[override]
+            try:
+                base_target = super().target()
+                if inspect.isawaitable(base_target):
+                    base_target = await base_target
+                base_target_int = int(base_target)
+            except Exception:
+                base_target_int = 0
+
+            target_duration = _get_attr_value(
+                self, "target_duration", "_target_duration"
+            )
+            target_seconds = _duration_seconds(target_duration)
+            if not target_seconds or target_seconds <= 0:
+                return base_target_int
+
+            activity = _get_cached_activity()
+            if activity is None:
+                return base_target_int
+
+            counts = activity.get("task_state_counts") or {}
+            if not hasattr(counts, "get"):
+                counts = {}
+            waiting = 0
+            waiting_counts: Dict[str, int] = {}
+            for state in ("waiting", "queued", "no-worker"):
+                try:
+                    count = int(counts.get(state, 0) or 0)
+                except Exception:
+                    continue
+                waiting_counts[state] = count
+                waiting += count
+
+            unknown = activity.get("unknown_task_duration")
+            try:
+                unknown = float(unknown)
+            except Exception:
+                unknown = None
+            if unknown is None or unknown <= 0:
+                unknown = _duration_seconds(
+                    _get_attr_value(
+                        self, "unknown_task_duration", "_unknown_task_duration"
+                    )
+                )
+            if unknown is None:
+                unknown = 0.0
+
+            base_occupancy = activity.get("total_occupancy")
+            try:
+                base_occupancy = float(base_occupancy or 0.0)
+            except Exception:
+                base_occupancy = 0.0
+            waiting_occupancy = 0.0
+            waiting_unknown = 0
+            waiting_with_duration = 0
+            prefix_counts_from_prefixes: Dict[str, int] = {}
+            prefix_durations: Dict[str, float] = {}
+            task_prefixes = activity.get("task_prefixes") or {}
+            try:
+                items = task_prefixes.items() if hasattr(task_prefixes, "items") else []
+                for name, meta in items:
+                    if not isinstance(meta, Mapping):
+                        continue
+                    duration = meta.get("duration_average")
+                    state_counts = meta.get("state_counts") or {}
+                    if duration is not None:
+                        try:
+                            duration_val = float(duration)
+                        except Exception:
+                            duration_val = None
+                        if duration_val is not None and duration_val > 0:
+                            prefix_durations[str(name)] = duration_val
+                    if isinstance(state_counts, Mapping):
+                        prefix_waiting = 0
+                        for state in ("waiting", "queued", "no-worker"):
+                            try:
+                                prefix_waiting += int(state_counts.get(state, 0) or 0)
+                            except Exception:
+                                continue
+                        if prefix_waiting:
+                            prefix_counts_from_prefixes[str(name)] = prefix_waiting
+            except Exception:
+                prefix_durations = {}
+                prefix_counts_from_prefixes = {}
+
+            prefix_counts: Dict[str, int] = {}
+            prefix_source = None
+            waiting_prefix_counts = activity.get("waiting_prefix_counts") or {}
+            if isinstance(waiting_prefix_counts, Mapping):
+                for name, count in waiting_prefix_counts.items():
+                    try:
+                        count_val = int(count)
+                    except Exception:
+                        continue
+                    if count_val > 0:
+                        prefix_counts[str(name)] = count_val
+                if prefix_counts:
+                    prefix_source = "tasks"
+            if not prefix_counts:
+                prefix_counts = prefix_counts_from_prefixes
+                if prefix_counts:
+                    prefix_source = "prefixes"
+
+            if prefix_source == "tasks" and waiting == 0:
+                try:
+                    waiting = sum(prefix_counts.values())
+                except Exception:
+                    pass
+
+            if waiting <= 0:
+                prefix_counts = {}
+
+            if prefix_counts:
+                for prefix_name, count in prefix_counts.items():
+                    duration = prefix_durations.get(prefix_name)
+                    if duration is None or duration <= 0:
+                        duration = unknown
+                        waiting_unknown += count
+                    else:
+                        waiting_with_duration += count
+                    waiting_occupancy += count * duration
+            else:
+                waiting_occupancy = waiting * unknown
+                waiting_unknown = waiting
+
+            occupancy = base_occupancy + waiting_occupancy
+
+            target_raw = (
+                int(math.ceil(occupancy / target_seconds)) if occupancy > 0 else 0
+            )
+            target = target_raw
+
+            minimum = _get_attr_value(self, "minimum", "_minimum")
+            maximum = _get_attr_value(self, "maximum", "_maximum")
+            if minimum is not None:
+                try:
+                    target = max(target, int(minimum))
+                except Exception:
+                    pass
+            if maximum is not None:
+                try:
+                    target = min(target, int(maximum))
+                except Exception:
+                    pass
+
+            log_print(
+                "[seamless-dask-wrapper] Adaptive terms:",
+                f"waiting={waiting}",
+                f"waiting_waiting={waiting_counts.get('waiting', 0)}",
+                f"waiting_queued={waiting_counts.get('queued', 0)}",
+                f"waiting_no_worker={waiting_counts.get('no-worker', 0)}",
+                f"unknown={unknown}",
+                f"waiting_occupancy={waiting_occupancy}",
+                f"waiting_with_duration={waiting_with_duration}",
+                f"waiting_unknown={waiting_unknown}",
+                f"base_occupancy={base_occupancy}",
+                f"occupancy={occupancy}",
+                f"target_seconds={target_seconds}",
+                f"target_raw={target_raw}",
+                f"minimum={minimum}",
+                f"maximum={maximum}",
+            )
+
+            if prefix_counts:
+                top_prefixes = sorted(
+                    prefix_counts.items(), key=lambda item: item[1], reverse=True
+                )[:5]
+                prefix_summary = []
+                for prefix_name, count in top_prefixes:
+                    duration = prefix_durations.get(prefix_name)
+                    if duration is None or duration <= 0:
+                        duration = unknown
+                        source = "unknown"
+                    else:
+                        source = "learned"
+                    prefix_summary.append(
+                        f"{prefix_name}:{count}x{duration:.2f}s({source})"
+                    )
+                log_print(
+                    "[seamless-dask-wrapper] Adaptive prefixes:",
+                    "; ".join(prefix_summary),
+                )
+
+            return target
+
+    _WAITING_AWARE_ADAPTIVE = WaitingAwareAdaptive
+    return WaitingAwareAdaptive
+
+
+def _adapt_cluster(cluster, adaptive_settings: Mapping[str, Any] | None):
+    if adaptive_settings is None:
+        return None
+    adaptive_cls = _make_waiting_aware_adaptive()
+    if adaptive_cls is None:
+        adaptive = cluster.adapt(**adaptive_settings)
+        if adaptive is not None:
+            setattr(cluster, "_adaptive", adaptive)
+        return adaptive
+    try:
+        adaptive = cluster.adapt(Adaptive=adaptive_cls, **adaptive_settings)
+    except TypeError:
+        try:
+            adaptive = cluster.adapt(adaptive_class=adaptive_cls, **adaptive_settings)
+        except TypeError:
+            normalized = dict(adaptive_settings)
+            if "minimum_jobs" in normalized and "minimum" not in normalized:
+                normalized["minimum"] = normalized.pop("minimum_jobs")
+            if "maximum_jobs" in normalized and "maximum" not in normalized:
+                normalized["maximum"] = normalized.pop("maximum_jobs")
+            adaptive = adaptive_cls(cluster, **normalized)
+            setattr(cluster, "_adaptive", adaptive)
+            start = getattr(adaptive, "start", None)
+            if callable(start):
+                try:
+                    start()
+                except Exception:
+                    pass
+            return adaptive
+    if adaptive is not None:
+        setattr(cluster, "_adaptive", adaptive)
+    return adaptive
+
+
+def _ensure_waiting_aware_adaptive(
+    cluster, adaptive_settings: Mapping[str, Any] | None
+):
+    if adaptive_settings is None:
+        return None
+    adaptive_cls = _make_waiting_aware_adaptive()
+    adaptive = getattr(cluster, "_adaptive", None)
+    if adaptive_cls is None:
+        if adaptive is None:
+            adaptive = _adapt_cluster(cluster, adaptive_settings)
+        return adaptive
+    if adaptive is not None and isinstance(adaptive, adaptive_cls):
+        return adaptive
+    if adaptive is not None:
+        log_print(
+            "[seamless-dask-wrapper] Replacing Adaptive instance:",
+            f"class={adaptive.__class__.__name__}",
+        )
+        try:
+            close = getattr(adaptive, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            pass
+    adaptive = _adapt_cluster(cluster, adaptive_settings)
+    adaptive = getattr(cluster, "_adaptive", adaptive)
+    if adaptive is not None and not isinstance(adaptive, adaptive_cls):
+        log_print(
+            "[seamless-dask-wrapper] Adaptive replacement failed:",
+            f"class={adaptive.__class__.__name__}",
+        )
+    return adaptive
+
+
+def _log_adaptive_target(cluster, adaptive) -> None:
+    if adaptive is None:
+        log_print("[seamless-dask-wrapper] Adaptive target: missing")
+        return
+    try:
+        target = _resolve_awaitable(adaptive.target())
+    except Exception as exc:
+        log_print(
+            "[seamless-dask-wrapper] Adaptive target failed:",
+            repr(exc),
+        )
+        return
+    log_print(
+        "[seamless-dask-wrapper] Adaptive target:",
+        f"class={adaptive.__class__.__name__}",
+        f"target={target}",
+    )
 
 
 def normalize_port_range(value: Any) -> Tuple[int, int]:
@@ -619,6 +1042,20 @@ def load_cluster_from_string(cluster_string: str, cluster_base: Any):
 
 
 def _scheduler_activity(dask_scheduler, monitor_id: str):
+    def _to_seconds(value: Any) -> float | None:
+        if value is None:
+            return None
+        try:
+            total_seconds = getattr(value, "total_seconds", None)
+            if callable(total_seconds):
+                return float(total_seconds())
+        except Exception:
+            pass
+        try:
+            return float(value)
+        except Exception:
+            return None
+
     client_count = len([cid for cid in dask_scheduler.clients if cid != monitor_id])
     worker_count = len(getattr(dask_scheduler, "workers", {}))
     active_tasks = [
@@ -626,10 +1063,99 @@ def _scheduler_activity(dask_scheduler, monitor_id: str):
         for ts in dask_scheduler.tasks.values()
         if getattr(ts, "state", None) not in ("released", "forgotten")
     ]
+    task_state_counts = getattr(dask_scheduler, "task_state_counts", {}) or {}
+    if callable(task_state_counts):
+        try:
+            task_state_counts = task_state_counts()
+        except Exception:
+            task_state_counts = {}
+    try:
+        task_state_counts = {
+            state: int(count) for state, count in task_state_counts.items()
+        }
+    except Exception:
+        task_state_counts = {}
+
+    waiting_prefix_counts: Dict[str, int] = {}
+    try:
+        try:
+            from distributed.utils import key_split as _key_split
+        except Exception:
+            try:
+                from dask.utils import key_split as _key_split  # type: ignore
+            except Exception:
+                _key_split = None  # type: ignore
+
+        def _prefix_for_task(ts) -> str | None:
+            prefix = getattr(ts, "prefix", None)
+            if prefix:
+                return str(prefix)
+            key = getattr(ts, "key", None)
+            if key is None:
+                return None
+            if _key_split is not None:
+                try:
+                    return str(_key_split(key))
+                except Exception:
+                    return None
+            return str(key)
+
+        for ts in active_tasks:
+            if getattr(ts, "state", None) in ("waiting", "queued", "no-worker"):
+                prefix = _prefix_for_task(ts)
+                if prefix:
+                    waiting_prefix_counts[prefix] = (
+                        waiting_prefix_counts.get(prefix, 0) + 1
+                    )
+    except Exception:
+        waiting_prefix_counts = {}
+
+    task_prefixes = getattr(dask_scheduler, "task_prefixes", None)
+    if callable(task_prefixes):
+        try:
+            task_prefixes = task_prefixes()
+        except Exception:
+            task_prefixes = {}
+    if task_prefixes is None:
+        task_prefixes = {}
+
+    prefix_summary: Dict[str, Dict[str, Any]] = {}
+    try:
+        values = task_prefixes.values() if hasattr(task_prefixes, "values") else []
+        for prefix_obj in values:
+            name = getattr(prefix_obj, "name", None) or str(prefix_obj)
+            duration = _to_seconds(getattr(prefix_obj, "duration_average", None))
+            state_counts = getattr(prefix_obj, "state_counts", None)
+            if state_counts is None:
+                state_counts = getattr(prefix_obj, "states", None)
+            if not isinstance(state_counts, Mapping):
+                state_counts = {}
+            try:
+                state_counts = {
+                    state: int(count) for state, count in state_counts.items()
+                }
+            except Exception:
+                state_counts = {}
+            prefix_summary[str(name)] = {
+                "duration_average": duration,
+                "state_counts": state_counts,
+            }
+    except Exception:
+        prefix_summary = {}
+
+    total_occupancy = _to_seconds(getattr(dask_scheduler, "total_occupancy", None))
+    unknown_task_duration = _to_seconds(
+        getattr(dask_scheduler, "unknown_task_duration", None)
+    )
     return {
         "client_count": client_count,
         "worker_count": worker_count,
         "task_count": len(active_tasks),
+        "task_state_counts": task_state_counts,
+        "waiting_prefix_counts": waiting_prefix_counts,
+        "task_prefixes": prefix_summary,
+        "total_occupancy": total_occupancy,
+        "unknown_task_duration": unknown_task_duration,
     }
 
 
@@ -654,12 +1180,42 @@ class _SuppressOOBFilter(logging.Filter):
 
 
 def _install_oob_log_filter():
-    logger = logging.getLogger("distributed.scheduler")
-    if not any(isinstance(flt, _SuppressOOBFilter) for flt in logger.filters):
-        logger.addFilter(_SuppressOOBFilter())
-    root = logging.getLogger()
-    if not any(isinstance(flt, _SuppressOOBFilter) for flt in root.filters):
-        root.addFilter(_SuppressOOBFilter())
+    global _OOB_HANDLE_PATCHED, _ORIGINAL_LOGGER_HANDLE
+    flt = _SuppressOOBFilter()
+
+    def _add_filter(logger: logging.Logger) -> None:
+        if not any(
+            isinstance(existing, _SuppressOOBFilter) for existing in logger.filters
+        ):
+            logger.addFilter(flt)
+        for handler in getattr(logger, "handlers", []):
+            if not any(
+                isinstance(existing, _SuppressOOBFilter) for existing in handler.filters
+            ):
+                handler.addFilter(flt)
+
+    _add_filter(logging.getLogger())
+    _add_filter(logging.getLogger("distributed"))
+    _add_filter(logging.getLogger("distributed.scheduler"))
+    _add_filter(logging.getLogger("distributed.core"))
+    for name, logger in logging.Logger.manager.loggerDict.items():
+        if isinstance(logger, logging.Logger) and name.startswith("distributed"):
+            _add_filter(logger)
+
+    if not _OOB_HANDLE_PATCHED:
+        _ORIGINAL_LOGGER_HANDLE = logging.Logger.handle
+
+        def _handle(self, record):  # type: ignore[override]
+            try:
+                msg = record.getMessage()
+            except Exception:
+                msg = None
+            if msg and "Run out-of-band function" in msg:
+                return
+            return _ORIGINAL_LOGGER_HANDLE(self, record)
+
+        logging.Logger.handle = _handle  # type: ignore[assignment]
+        _OOB_HANDLE_PATCHED = True
 
 
 def keep_cluster_alive(
@@ -670,42 +1226,146 @@ def keep_cluster_alive(
     target_workers: int,
     interactive: bool,
     adaptive_settings: Optional[Mapping[str, Any]] = None,
+    adaptive_log_interval: Optional[float] = None,
 ):
     from distributed import Client
     import warnings
 
+    timed_out = False
     monitor_client = Client(
         cluster, set_as_default=False, name="seamless-dask-wrapper-monitor"
     )
+    log_print(
+        "[seamless-dask-wrapper] keep_cluster_alive start:",
+        f"timeout={timeout}",
+        f"is_local={is_local}",
+        f"interactive={interactive}",
+        f"target_workers={target_workers}",
+    )
     try:
+        _install_oob_log_filter()
         monitor_client.run_on_scheduler(_install_oob_log_filter)
-    except Exception:
-        pass
+    except Exception as exc:
+        log_exception("oob log filter install failed", exc)
     last_activity: Optional[float] = None
     last_recovery_attempt: Optional[float] = None
     no_worker_since: Optional[float] = None
     saw_worker: bool = False
     dummy_futures: List[Any] = []
+    adaptive = None
+    last_adaptive_log: Optional[float] = None
+    adaptive_future = None
+    adaptive_started_at: Optional[float] = None
+    adaptive_last_warn: Optional[float] = None
+    activity: Dict[str, Any] = {}
+    activity_future = None
+    activity_started_at: Optional[float] = None
+    activity_last_warn: Optional[float] = None
+    activity_last_update: Optional[float] = None
+    adaptive_executor = _DaemonExecutor("adaptive-target")
+    scheduler_executor = _DaemonExecutor("scheduler-activity")
     try:
         if interactive and not is_local:
             future = _submit_dummy_task(monitor_client, "startup")
             if future is not None:
                 dummy_futures.append(future)
+        if adaptive_settings is not None:
+            adaptive = _ensure_waiting_aware_adaptive(cluster, adaptive_settings)
         while True:
-            try:
-                activity = monitor_client.run_on_scheduler(
-                    _scheduler_activity, monitor_id=monitor_client.id
-                )
-                has_activity = bool(
-                    activity.get("client_count", 0)
-                    > 1  # a monitor client is a client too!
-                    or activity.get("task_count", 0) > 0
-                )
-            except Exception:
-                activity = {}
-                has_activity = False
+            now = time.monotonic()
+            if adaptive_settings is not None and adaptive_log_interval is not None:
+                if last_adaptive_log is not None:
+                    log_print(
+                        "[seamless-dask-wrapper] BOO??",
+                        f"{now - last_adaptive_log:.3f}",
+                        f"{adaptive_log_interval:.3f}",
+                    )
+                if adaptive_future is not None and adaptive_future.done():
+                    try:
+                        adaptive_future.result()
+                    except BaseException as exc:
+                        log_exception("adaptive target logging failed", exc)
+                    adaptive_future = None
+                    adaptive_started_at = None
+                if last_adaptive_log is None or (
+                    now - last_adaptive_log >= adaptive_log_interval
+                ):
+                    log_print("[seamless-dask-wrapper] BOO!!")
+                    adaptive = _ensure_waiting_aware_adaptive(
+                        cluster, adaptive_settings
+                    )
+                    if adaptive_future is None:
+                        try:
+                            adaptive_future = adaptive_executor.submit(
+                                _log_adaptive_target, cluster, adaptive
+                            )
+                            adaptive_started_at = now
+                        except BaseException as exc:
+                            log_exception("adaptive target submit failed", exc)
+                            adaptive_future = None
+                            adaptive_started_at = None
+                    else:
+                        log_print(
+                            "[seamless-dask-wrapper] Adaptive target still running; skipping"
+                        )
+                    last_adaptive_log = now
+                if adaptive_future is not None and adaptive_started_at is not None:
+                    elapsed = now - adaptive_started_at
+                    if elapsed >= ADAPTIVE_TARGET_TIMEOUT:
+                        if (
+                            adaptive_last_warn is None
+                            or now - adaptive_last_warn >= ADAPTIVE_TARGET_WARN_INTERVAL
+                        ):
+                            log_print(
+                                "[seamless-dask-wrapper] Adaptive target still running:",
+                                f"elapsed={elapsed:.2f}s",
+                            )
+                            adaptive_last_warn = now
+            if activity_future is None:
+                try:
+                    activity_future = scheduler_executor.submit(
+                        monitor_client.run_on_scheduler,
+                        _scheduler_activity,
+                        monitor_id=monitor_client.id,
+                    )
+                    activity_started_at = now
+                except BaseException as exc:
+                    log_exception("scheduler activity submit failed", exc)
+                    activity_future = None
+                    activity_started_at = None
+            if activity_future is not None and activity_future.done():
+                try:
+                    activity = activity_future.result()
+                except BaseException as exc:
+                    log_exception("scheduler activity failed", exc)
+                    activity = {}
+                activity_future = None
+                activity_started_at = None
+                activity_last_update = now
+                _record_scheduler_activity(activity)
+            elif activity_future is not None and activity_started_at is not None:
+                elapsed = now - activity_started_at
+                if elapsed >= SCHEDULER_ACTIVITY_TIMEOUT:
+                    if (
+                        activity_last_warn is None
+                        or now - activity_last_warn >= SCHEDULER_ACTIVITY_WARN_INTERVAL
+                    ):
+                        log_print(
+                            "[seamless-dask-wrapper] Scheduler activity call still running:",
+                            f"elapsed={elapsed:.2f}s",
+                        )
+                        activity_last_warn = now
+            has_activity = bool(
+                activity.get("client_count", 0) > 1  # a monitor client is a client too!
+                or activity.get("task_count", 0) > 0
+            )
+            if (
+                activity_future is not None
+                and activity_started_at is not None
+                and (now - activity_started_at) >= SCHEDULER_ACTIVITY_TIMEOUT
+            ):
+                has_activity = True
             if not is_local:
-                now = time.monotonic()
                 worker_count = int(activity.get("worker_count", 0) or 0)
                 task_count = max(
                     int(activity.get("task_count", 0) or 0) - len(dummy_futures), 0
@@ -736,7 +1396,7 @@ def keep_cluster_alive(
                                 minimum_jobs = adaptive_settings["minimum_jobs"]
                                 if minimum_jobs:
                                     cluster.scale(minimum_jobs)
-                                cluster.adapt(**adaptive_settings)
+                                _adapt_cluster(cluster, adaptive_settings)
                             except Exception:
                                 pass
                         try:
@@ -774,6 +1434,11 @@ def keep_cluster_alive(
                 else:
                     idle_for = time.monotonic() - last_activity
                     if timeout is not None and idle_for >= timeout:
+                        log_print(
+                            "[seamless-dask-wrapper] keep_cluster_alive timeout:",
+                            f"idle_for={idle_for:.2f}",
+                        )
+                        timed_out = True
                         break
                     if is_local:
                         try:
@@ -797,13 +1462,43 @@ def keep_cluster_alive(
                         except Exception:
                             pass
             if dummy_futures:
-                dummy_futures = [fut for fut in dummy_futures if not fut.done()]
+                dummy_futures_new = []
+                for fut in dummy_futures:
+                    if fut.done():
+                        key = getattr(fut, "key", None)
+                        fut.release()
+                        try:
+                            scheduler_executor.submit(
+                                monitor_client.cancel, fut, force=True
+                            )
+                        except BaseException as exc:
+                            log_exception("cancel dummy future failed", exc)
+                    else:
+                        dummy_futures_new.append(fut)
+                dummy_futures = dummy_futures_new
+            log_print("[seamless-dask-wrapper] BAA")
             time.sleep(INACTIVITY_CHECK_INTERVAL)
+    except BaseException as exc:
+        log_print("[seamless-dask-wrapper] keep_cluster_alive exception:", repr(exc))
+        raise
     finally:
+        try:
+            adaptive_executor.shutdown(wait=False)
+        except Exception:
+            pass
+        try:
+            scheduler_executor.shutdown(wait=False)
+        except Exception:
+            pass
         try:
             monitor_client.close()
         except Exception:
             pass
+    log_print(
+        "[seamless-dask-wrapper] keep_cluster_alive exit:",
+        f"timed_out={timed_out}",
+    )
+    return timed_out
 
 
 def main():
@@ -936,11 +1631,13 @@ def main():
                 "wait_count": ADAPTIVE_WAIT_COUNT,
                 "interval": ADAPTIVE_INTERVAL,
             }
+            adaptive_log_interval = _duration_seconds(ADAPTIVE_INTERVAL)
             if minimum_jobs:
                 cluster.scale(minimum_jobs)
-            cluster.adapt(**adaptive_settings)
+            _adapt_cluster(cluster, adaptive_settings)
         else:
             adaptive_settings = None
+            adaptive_log_interval = None
 
         status_tracker.write_running(
             wrapper_config.scheduler_port, wrapper_config.dashboard_port
@@ -977,19 +1674,41 @@ def main():
     signal.signal(signal.SIGHUP, raise_system_exit)
     signal.signal(signal.SIGINT, raise_system_exit)
 
+    timed_out = False
     try:
-        keep_cluster_alive(
-            cluster,
-            args.timeout,
-            is_local=isinstance(cluster, LocalCluster),
-            target_workers=wrapper_config.maximum_jobs,
-            interactive=wrapper_config.interactive,
-            adaptive_settings=adaptive_settings,
-        )
+        try:
+            timed_out = keep_cluster_alive(
+                cluster,
+                args.timeout,
+                is_local=isinstance(cluster, LocalCluster),
+                target_workers=wrapper_config.maximum_jobs,
+                interactive=wrapper_config.interactive,
+                adaptive_settings=adaptive_settings,
+                adaptive_log_interval=adaptive_log_interval,
+            )
+        except SystemExit:
+            if status_tracker is not None:
+                if status_tracker.running_written:
+                    status_tracker.delete()
+                else:
+                    status_tracker.write_failed()
+            log_print(
+                "[seamless-dask-wrapper] SystemExit received:",
+                f"running_written={status_tracker.running_written if status_tracker else None}",
+            )
+            raise
+        except BaseException as exc:
+            log_print("[seamless-dask-wrapper] keep_cluster_alive raised:", repr(exc))
+            raise
     finally:
         try:
             log_print("Shutdown after timeout")
             cluster.close()
+        except Exception:
+            pass
+        try:
+            if timed_out and status_tracker is not None:
+                status_tracker.delete()
         except Exception:
             pass
 

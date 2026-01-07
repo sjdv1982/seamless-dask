@@ -27,8 +27,9 @@ cluster-wide. We want to avoid either kind.
 
 Proposed solution. 
 
-1. Define a Dask resource S and every Dask task requires one unit (slot) of S.
-Every Dask worker has N units of S, so up to N Dask tasks will run in parallel.
+1. Define a Dask resource S and only base transformation tasks require one unit (slot) of S.
+Every Dask worker has N units of S, so up to N base tasks will run in parallel. Thin, fat,
+and fat-checksum tasks do not claim S.
 
 2. Any non-local transformation will try to call "compute_with_dask" (sync or async).
 The core of the solution is that compute_with_dask must be preceded by a blocking 

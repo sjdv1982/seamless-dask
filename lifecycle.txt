@@ -12,7 +12,7 @@ This carries the risk of a non-scratch version of a task being ignored if a scra
 
 Case 1: transformation without dependencies (inputs are checksums or values that become checksums). Steps:
 - Construct on the client to get the transformation checksum. Check the remote database/cache; on hit, do not submit to Dask.
-- On miss, build “fat checksum” futures per input checksum. These run on workers, pull `(checksum, buffer, exc)` from hashserver/buffer cache, and use predictable keys `fat-checksum-{checksum.hex()}`. Dask is eager: creating the future starts execution. A weak/strong cache keeps these futures alive; strong entries expire ~10s after last access (refreshed on access). Default-task-duration: “fast”.
+- On miss, build “fat checksum” futures per input checksum. These run on workers, pull `(checksum, buffer, exc)` from hashserver/buffer cache, and use predictable keys `fat-checksum-{checksum.hex()}`. Dask is eager: creating the future starts execution. A weak/strong cache keeps these futures alive; strong entries expire ~10s after completion (refreshed on access once done). Default-task-duration: “fast”.
 - It is now possible to build three futures, keyed deterministically with the transformation checksum (e.g., `base-{tf_checksum}`, `fat-{tf_checksum}`, `thin-{tf_checksum}`); if already running, Dask will reuse them. However, since Dask is eager, we must build them only if needed.
 We will need the thin future if we are running `.compute()` directly from the client. We will need the fat future if we will be running a downstream transformation that has the transformation as a dependency.
 The three futures do the following: 
@@ -34,5 +34,5 @@ Case 2: transformation with dependencies (some inputs are Transformation instanc
 Keying and caches:
 - Dask has no smart intra-worker IPC. For any Dask worker, absolutely set it up a single worker process, and use Seamless spawn (from seamless-transformer) to achieve parallelism. The number
 of worker thread is equal to the number of workers spawned.
-- Keep strong references to long-running futures; the 10s strong-cache TTL is refreshed on access, but the client must maintain references during `.compute()`.
+- Keep strong references to long-running futures; the 10s strong-cache TTL starts after futures are done (and can be refreshed on access once done), so the client must maintain references during `.compute()`.
 - Nested client submissions from workers should avoid blocking; if awaiting nested futures, use `worker_client(secede=True)` to free the worker thread.
