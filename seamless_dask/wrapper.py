@@ -69,7 +69,7 @@ log_handle: Optional[TextIO] = None
 _OOB_HANDLE_PATCHED = False
 _ORIGINAL_LOGGER_HANDLE = None
 
-logging.basicConfig(format="%(levelname)s:%(message)s", level=logging.DEBUG)
+logging.basicConfig(format="%(levelname)s:%(message)s", level=logging.INFO)
 
 
 def configure_log_handle(status_contents: Mapping[str, Any]) -> None:

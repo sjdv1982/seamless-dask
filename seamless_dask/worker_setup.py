@@ -69,7 +69,6 @@ class SeamlessWorkerPlugin(WorkerPlugin):
         self.remote_clients = remote_clients
 
     def setup(self, worker) -> None:  # type: ignore[override]
-
         import logging
 
         def _get_worker_logger(worker) -> logging.Logger:

@@ -214,13 +214,14 @@ def _run_base(
     )
     import distributed
 
-    owner_dask_key = None
-    try:
-        from distributed.worker import thread_state as dask_thread_state
+    owner_dask_key = payload.get("owner_dask_key")
+    if not isinstance(owner_dask_key, str) or not owner_dask_key:
+        try:
+            from distributed.worker import thread_state as dask_thread_state
 
-        owner_dask_key = getattr(dask_thread_state, "key", None)
-    except Exception:
-        owner_dask_key = None
+            owner_dask_key = getattr(dask_thread_state, "key", None)
+        except Exception:
+            owner_dask_key = None
 
     client = get_seamless_dask_client()
     if client is None:
@@ -504,6 +505,8 @@ class SeamlessDaskClient:
             base_prefix += "_" + str(ccs)
         base_key = self._build_key(base_prefix, resource_string, tf_checksum_hex)
         thin_key = self._build_key("thin", resource_string, tf_checksum_hex)
+
+        payload["owner_dask_key"] = base_key
 
         base_future = self._client.submit(
             _run_base,
