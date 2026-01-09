@@ -12,5 +12,8 @@ dependencies = [
     "distributed",
 ]
 
+[tool.setuptools]
+package-dir = {"" = "seamless_dask"}
+
 [project.scripts]
 seamless-dask-wrapper = "seamless_dask.wrapper:main"
