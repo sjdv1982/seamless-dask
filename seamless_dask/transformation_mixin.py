@@ -50,6 +50,20 @@ def _is_valid_checksum(value: Any) -> bool:
     return False
 
 
+def _submission_is_driver(submission: TransformationSubmission) -> bool:
+    if isinstance(submission.meta, dict) and submission.meta.get("driver"):
+        return True
+    tf_dunder = submission.tf_dunder
+    if isinstance(tf_dunder, dict):
+        meta = tf_dunder.get("__meta__")
+        if isinstance(meta, dict) and meta.get("driver"):
+            return True
+    meta = submission.transformation_dict.get("__meta__")
+    if isinstance(meta, dict) and meta.get("driver"):
+        return True
+    return False
+
+
 class TransformationDaskMixin:
     """Shared Dask helpers for seamless-transformer Transformation."""
 
@@ -72,7 +86,10 @@ class TransformationDaskMixin:
             from seamless_remote import buffer_remote, database_remote
         except Exception:
             return "Remote execution requires hashserver and database server"
-        if not buffer_remote.has_write_server() or not database_remote.has_write_server():
+        if (
+            not buffer_remote.has_write_server()
+            or not database_remote.has_write_server()
+        ):
             _ensure_remote_clients_from_env()
         if not buffer_remote.has_write_server():
             return "Remote execution requires an active hashserver"
@@ -167,11 +184,11 @@ class TransformationDaskMixin:
             self._constructed = True
             self._evaluated = True
             return None
-        if result_checksum_hex is not None and not _is_valid_checksum(result_checksum_hex):
+        if result_checksum_hex is not None and not _is_valid_checksum(
+            result_checksum_hex
+        ):
             self._exception = (
-                "Invalid Dask result checksum: "
-                + repr(result_checksum_hex)
-                + "\n"
+                "Invalid Dask result checksum: " + repr(result_checksum_hex) + "\n"
             )
             self._constructed = True
             self._evaluated = True
@@ -267,11 +284,11 @@ class TransformationDaskMixin:
             self._constructed = True
             self._evaluated = True
             return None
-        if result_checksum_hex is not None and not _is_valid_checksum(result_checksum_hex):
+        if result_checksum_hex is not None and not _is_valid_checksum(
+            result_checksum_hex
+        ):
             self._exception = (
-                "Invalid Dask result checksum: "
-                + repr(result_checksum_hex)
-                + "\n"
+                "Invalid Dask result checksum: " + repr(result_checksum_hex) + "\n"
             )
             self._constructed = True
             self._evaluated = True
@@ -474,7 +491,7 @@ class TransformationDaskMixin:
             submission = self._build_dask_submission(
                 client, require_value=require_value, need_fat=need_fat
             )
-            if submission.tf_checksum:
+            if submission.tf_checksum and not _submission_is_driver(submission):
                 cached = client._transformation_cache.get(submission.tf_checksum)  # type: ignore[attr-defined]
                 if cached is not None and not cached[0].base.cancelled():
                     if permission_granted:

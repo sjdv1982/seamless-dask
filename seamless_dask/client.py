@@ -37,6 +37,78 @@ _SEAMLESS_DASK_CLIENT_LOCK = threading.Lock()
 _LOGGER = logging.getLogger(__name__)
 
 
+def _scheduler_has_task_key(dask_scheduler, key: str) -> bool:
+    try:
+        return key in getattr(dask_scheduler, "tasks", {})
+    except Exception:
+        return False
+
+
+def _dask_key_exists(dask_client: Client, key: str) -> bool:
+    try:
+        return bool(dask_client.run_on_scheduler(_scheduler_has_task_key, key=key))
+    except Exception:
+        pass
+    try:
+        get_future = getattr(dask_client, "get_future", None)
+        if callable(get_future):
+            try:
+                future = get_future(key)
+            except Exception:
+                return False
+            return future is not None
+    except Exception:
+        return False
+    return False
+
+
+def _resolve_driver_key(dask_client: Client, base_key: str) -> str:
+    if not _dask_key_exists(dask_client, base_key):
+        return base_key
+    counter = 1
+    while True:
+        suffix = "-copy" if counter == 1 else f"-{counter}-copy"
+        candidate = base_key + suffix
+        if not _dask_key_exists(dask_client, candidate):
+            return candidate
+        counter += 1
+
+
+def _driver_from_meta(meta: Any) -> bool:
+    return isinstance(meta, dict) and bool(meta.get("driver"))
+
+
+def _is_driver_submission(submission: "TransformationSubmission") -> bool:
+    if _driver_from_meta(submission.meta):
+        return True
+    tf_dunder = submission.tf_dunder
+    if isinstance(tf_dunder, dict) and _driver_from_meta(tf_dunder.get("__meta__")):
+        return True
+    if _driver_from_meta(submission.transformation_dict.get("__meta__")):
+        return True
+    return False
+
+
+def _is_driver_payload(payload: Dict[str, Any]) -> bool:
+    tf_dunder = payload.get("tf_dunder")
+    if isinstance(tf_dunder, dict) and _driver_from_meta(tf_dunder.get("__meta__")):
+        return True
+    transformation_dict = payload.get("transformation_dict")
+    if isinstance(transformation_dict, dict) and _driver_from_meta(
+        transformation_dict.get("__meta__")
+    ):
+        return True
+    return False
+
+
+def _base_prefix_for_transformation(transformation_dict: Mapping[str, Any]) -> str:
+    base_prefix = "base"
+    ccs = transformation_dict.get("__code_checksum__")
+    if ccs is not None:
+        base_prefix += "_" + str(ccs)
+    return base_prefix
+
+
 def _parse_cache_prune_interval() -> float:
     raw = os.environ.get("SEAMLESS_DASK_CACHE_PRUNE_INTERVAL", "10")
     try:
@@ -252,6 +324,7 @@ def _run_base(
                 set_seamless_dask_client(client)
 
     tf_checksum_hex = payload.get("tf_checksum")
+    tf_checksum_missing = tf_checksum_hex is None
     transformation_dict = dict(payload.get("transformation_dict") or {})
     inputs = payload.get("inputs") or []
     scratch = bool(payload.get("scratch", False))
@@ -290,6 +363,43 @@ def _run_base(
             tf_buffer = tf_get_buffer(transformation_dict)
             tf_buffer.tempref()
             tf_checksum_hex = tf_buffer.get_checksum().hex()
+        if tf_checksum_missing:
+            # Redirect tasks submitted without a checksum to the deterministic key.
+            base_prefix = _base_prefix_for_transformation(transformation_dict)
+            base_key = client._build_key(base_prefix, None, tf_checksum_hex)
+            if _is_driver_payload(payload):
+                base_key = _resolve_driver_key(client.client, base_key)
+            dedupe_payload = dict(payload)
+            dedupe_payload["tf_checksum"] = tf_checksum_hex
+            dedupe_payload["owner_dask_key"] = base_key
+            try:
+                from distributed import worker_client
+            except Exception:
+                worker_client = None
+            if worker_client is None:
+                future = client.client.submit(
+                    _run_base,
+                    dedupe_payload,
+                    input_results,
+                    pure=False,
+                    key=base_key,
+                    resources={"S": 1},
+                    priority=10,
+                    retries=3,
+                )
+                return future.result()
+            with worker_client() as wc:
+                future = wc.submit(
+                    _run_base,
+                    dedupe_payload,
+                    input_results,
+                    pure=False,
+                    key=base_key,
+                    resources={"S": 1},
+                    priority=10,
+                    retries=3,
+                )
+                return future.result()
         tf_checksum = Checksum(tf_checksum_hex)
 
         # Fast path: check remote database on the worker before recomputing.
@@ -481,8 +591,9 @@ class SeamlessDaskClient:
         """Submit a transformation to Dask and return its futures."""
         self._prune_caches()
         tf_checksum_hex = submission.tf_checksum
+        is_driver = _is_driver_submission(submission)
 
-        if tf_checksum_hex:
+        if tf_checksum_hex and not is_driver:
             with self._cache_lock:
                 cached = self._transformation_cache.get(tf_checksum_hex)
             if cached is not None and not cached[0].base.cancelled():
@@ -499,12 +610,17 @@ class SeamlessDaskClient:
         }
         input_futures = dict(submission.input_futures)
         resource_string = None  # TODO: get from tf_dunder
-        base_prefix = "base"
-        ccs = submission.transformation_dict.get("__code_checksum__")
-        if ccs is not None:
-            base_prefix += "_" + str(ccs)
+        base_prefix = _base_prefix_for_transformation(submission.transformation_dict)
         base_key = self._build_key(base_prefix, resource_string, tf_checksum_hex)
         thin_key = self._build_key("thin", resource_string, tf_checksum_hex)
+
+        key_suffix = ""
+        if is_driver:
+            base_key_original = base_key
+            base_key = _resolve_driver_key(self._client, base_key)
+            if base_key != base_key_original:
+                key_suffix = base_key[len(base_key_original) :]
+                thin_key += key_suffix
 
         payload["owner_dask_key"] = base_key
 
@@ -529,6 +645,8 @@ class SeamlessDaskClient:
         fat_future = None
         if need_fat:
             fat_key = self._build_key("fat", resource_string, tf_checksum_hex)
+            if key_suffix:
+                fat_key += key_suffix
             fat_future = self._client.submit(
                 _run_fat,
                 base_future,
@@ -545,9 +663,11 @@ class SeamlessDaskClient:
         )
 
         thin_future.add_done_callback(
-            lambda fut: self._register_transformation(tf_checksum_hex, futures, fut)
+            lambda fut, store_cache=not is_driver: self._register_transformation(
+                tf_checksum_hex, futures, fut, store_cache=store_cache
+            )
         )
-        if tf_checksum_hex:
+        if tf_checksum_hex and not is_driver:
             self._store_transformation(tf_checksum_hex, futures)
 
         return futures
@@ -806,6 +926,8 @@ class SeamlessDaskClient:
         tf_checksum_hint: str | None,
         futures: TransformationFutures,
         thin_future: Future,
+        *,
+        store_cache: bool = True,
     ) -> None:
         try:
             tf_checksum_hex, result_checksum_hex, exc = thin_future.result()
@@ -814,7 +936,8 @@ class SeamlessDaskClient:
 
         if tf_checksum_hex:
             futures.tf_checksum = tf_checksum_hex
-            self._store_transformation(tf_checksum_hex, futures)
+            if store_cache:
+                self._store_transformation(tf_checksum_hex, futures)
         if result_checksum_hex:
             futures.result_checksum = result_checksum_hex
             if futures.fat is not None:
