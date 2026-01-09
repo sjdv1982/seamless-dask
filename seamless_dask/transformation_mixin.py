@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import random
+import string
 import time
 import traceback
 from typing import Any, Dict, Optional, TYPE_CHECKING
@@ -34,6 +35,19 @@ def _ensure_remote_clients_from_env() -> None:
         set_remote_clients(json.loads(payload))
     except Exception:
         pass
+
+
+_HEX_DIGITS = set(string.hexdigits)
+
+
+def _is_valid_checksum(value: Any) -> bool:
+    if isinstance(value, Checksum):
+        return True
+    if isinstance(value, bytes):
+        return len(value) == 32
+    if isinstance(value, str):
+        return len(value) == 64 and all(ch in _HEX_DIGITS for ch in value)
+    return False
 
 
 class TransformationDaskMixin:
@@ -153,6 +167,15 @@ class TransformationDaskMixin:
             self._constructed = True
             self._evaluated = True
             return None
+        if result_checksum_hex is not None and not _is_valid_checksum(result_checksum_hex):
+            self._exception = (
+                "Invalid Dask result checksum: "
+                + repr(result_checksum_hex)
+                + "\n"
+            )
+            self._constructed = True
+            self._evaluated = True
+            return None
         if tf_checksum_hex:
             self._transformation_checksum = Checksum(tf_checksum_hex)
             self._constructed = True
@@ -244,6 +267,15 @@ class TransformationDaskMixin:
             self._constructed = True
             self._evaluated = True
             return None
+        if result_checksum_hex is not None and not _is_valid_checksum(result_checksum_hex):
+            self._exception = (
+                "Invalid Dask result checksum: "
+                + repr(result_checksum_hex)
+                + "\n"
+            )
+            self._constructed = True
+            self._evaluated = True
+            return None
         if tf_checksum_hex:
             self._transformation_checksum = Checksum(tf_checksum_hex)
             self._constructed = True
@@ -261,16 +293,16 @@ class TransformationDaskMixin:
     def _skip_permission_gate(self) -> bool:
         """Skip Dask throttling for driver transforms or top-level submissions."""
 
-        meta = getattr(self, "_meta", None)
+        meta = None
+        tf_dunder = getattr(self, "_tf_dunder", None)
+        if isinstance(tf_dunder, dict):
+            tf_meta = tf_dunder.get("__meta__")
+            if isinstance(tf_meta, dict):
+                meta = tf_meta
+        if meta is None:
+            meta = getattr(self, "_meta", None)
         if isinstance(meta, dict) and meta.get("driver"):
             return True
-        try:
-            from seamless_transformer.run import is_driver_context
-
-            if is_driver_context():
-                return True
-        except Exception:
-            pass
         try:
             from seamless import is_worker
         except Exception:

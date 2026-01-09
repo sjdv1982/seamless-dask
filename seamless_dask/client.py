@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import logging
 import time
 import traceback
 import uuid
@@ -31,6 +32,67 @@ from .worker_setup import SeamlessWorkerPlugin
 dask.config.set({"distributed.worker.daemon": False})
 dask.config.set({"distributed.scheduler.unknown-task-duration": "1m"})
 dask.config.set({"distributed.scheduler.target-duration": "10m"})
+
+_SEAMLESS_DASK_CLIENT_LOCK = threading.Lock()
+_LOGGER = logging.getLogger(__name__)
+
+
+def _parse_cache_prune_interval() -> float:
+    raw = os.environ.get("SEAMLESS_DASK_CACHE_PRUNE_INTERVAL", "10")
+    try:
+        value = float(raw)
+    except Exception:
+        return 10.0
+    return max(0.0, value)
+
+
+def _describe_dask_client(dask_client: Client | None) -> str:
+    if dask_client is None:
+        return "dask_client=None"
+    scheduler_addr = None
+    client_id = None
+    status = None
+    try:
+        client_id = getattr(dask_client, "id", None)
+    except Exception:
+        client_id = None
+    try:
+        status = getattr(dask_client, "status", None)
+    except Exception:
+        status = None
+    try:
+        scheduler = getattr(dask_client, "scheduler", None)
+        scheduler_addr = getattr(scheduler, "address", None)
+    except Exception:
+        scheduler_addr = None
+    return (
+        "dask_client_id="
+        + str(id(dask_client))
+        + " client_id="
+        + str(client_id)
+        + " status="
+        + str(status)
+        + " scheduler="
+        + str(scheduler_addr)
+    )
+
+
+def _resolve_scheduler_address() -> str | None:
+    addr = os.environ.get("SEAMLESS_DASK_SCHEDULER")
+    if addr:
+        return addr
+    try:
+        worker = get_worker()
+    except Exception:
+        return None
+    addr = getattr(worker, "scheduler_address", None)
+    if isinstance(addr, str) and addr:
+        return addr
+    scheduler = getattr(worker, "scheduler", None)
+    addr = getattr(scheduler, "address", None) if scheduler is not None else None
+    if isinstance(addr, str) and addr:
+        return addr
+    return None
 
 
 def _noop_42() -> int:
@@ -152,12 +214,41 @@ def _run_base(
     )
     import distributed
 
+    owner_dask_key = None
+    try:
+        from distributed.worker import thread_state as dask_thread_state
+
+        owner_dask_key = getattr(dask_thread_state, "key", None)
+    except Exception:
+        owner_dask_key = None
+
     client = get_seamless_dask_client()
     if client is None:
-        dask_client = distributed.get_client()
-        assert dask_client is not None
-        client = SeamlessDaskClient(dask_client)
-        set_seamless_dask_client(client)
+        # Avoid racing multiple base tasks creating/replacing the global client.
+        with _SEAMLESS_DASK_CLIENT_LOCK:
+            client = get_seamless_dask_client()
+            if client is None:
+                scheduler_address = _resolve_scheduler_address()
+                if scheduler_address:
+                    _LOGGER.info(
+                        "[seamless-dask] _run_base creating client pid=%s thread=%s scheduler=%s",
+                        os.getpid(),
+                        threading.current_thread().name,
+                        scheduler_address,
+                    )
+                    dask_client = Client(
+                        scheduler_address, timeout="10s", set_as_default=False
+                    )
+                else:
+                    _LOGGER.warning(
+                        "[seamless-dask] _run_base fallback to distributed.get_client pid=%s thread=%s",
+                        os.getpid(),
+                        threading.current_thread().name,
+                    )
+                    dask_client = distributed.get_client()
+                    assert dask_client is not None
+                client = SeamlessDaskClient(dask_client)
+                set_seamless_dask_client(client)
 
     tf_checksum_hex = payload.get("tf_checksum")
     transformation_dict = dict(payload.get("transformation_dict") or {})
@@ -221,18 +312,8 @@ def _run_base(
                     # fall back to full execution if value unavailable
                     pass
                 else:
-                    _run_on_worker_loop(
-                        lambda: _promise_and_write_result_async(
-                            tf_checksum, result_checksum
-                        )
-                    )
                     return tf_checksum_hex, result_checksum_hex, result_buffer, None
             else:
-                _run_on_worker_loop(
-                    lambda: _promise_and_write_result_async(
-                        tf_checksum, result_checksum
-                    )
-                )
                 return tf_checksum_hex, result_checksum_hex, None, None
 
         result_checksum = _run_on_worker_loop(
@@ -241,6 +322,7 @@ def _run_base(
                 tf_checksum=tf_checksum,
                 tf_dunder=tf_dunder,
                 scratch=scratch,
+                owner_dask_key=owner_dask_key,
             )
         )
         if isinstance(result_checksum, str):
@@ -322,11 +404,21 @@ class SeamlessDaskClient:
         self._transformation_cache: dict[
             str, tuple[TransformationFutures, float | None]
         ] = {}
+        self._cache_lock = threading.RLock()
+        self._prune_stop = threading.Event()
+        self._prune_interval = _parse_cache_prune_interval()
+        self._prune_thread: threading.Thread | None = None
         self._is_local_cluster = bool(is_local_cluster)
         self._interactive = bool(interactive)
         self._promised_targets: dict[str, set[str]] = {}
         ensure_configured(workers=worker_plugin_workers)
         self._register_worker_plugin(worker_plugin_workers, remote_clients)
+        _LOGGER.info(
+            "[seamless-dask] SeamlessDaskClient created pid=%s thread=%s %s",
+            os.getpid(),
+            threading.current_thread().name,
+            _describe_dask_client(self._client),
+        )
 
         self._client.submit(_noop_42)
         print("Wait for workers to connect...")
@@ -336,6 +428,7 @@ class SeamlessDaskClient:
             time.sleep(1)
 
         self._warn_if_no_workers()
+        self._start_prune_thread()
 
     # --- public API -----------------------------------------------------
     @property
@@ -349,7 +442,8 @@ class SeamlessDaskClient:
             checksum.hex() if isinstance(checksum, Checksum) else str(checksum)
         )
         self._ensure_promised(checksum_hex)
-        cached = self._fat_checksum_cache.get(checksum_hex)
+        with self._cache_lock:
+            cached = self._fat_checksum_cache.get(checksum_hex)
         if cached is not None and not cached[0].cancelled():
             self._touch_fat_checksum_cache(checksum_hex, cached[0])
             return cached[0]
@@ -364,6 +458,22 @@ class SeamlessDaskClient:
         self._cache_fat_checksum_future(checksum_hex, future)
         return future
 
+    def get_transformation_futures(
+        self, tf_checksum: Checksum | str
+    ) -> TransformationFutures | None:
+        """Return cached transformation futures if they exist."""
+        tf_checksum_hex = (
+            tf_checksum.hex() if isinstance(tf_checksum, Checksum) else str(tf_checksum)
+        )
+        with self._cache_lock:
+            cached = self._transformation_cache.get(tf_checksum_hex)
+        if cached is None:
+            return None
+        futures = cached[0]
+        if futures.base is not None and futures.base.cancelled():
+            return None
+        return futures
+
     def submit_transformation(
         self, submission: TransformationSubmission, *, need_fat: bool = False
     ) -> TransformationFutures:
@@ -372,7 +482,8 @@ class SeamlessDaskClient:
         tf_checksum_hex = submission.tf_checksum
 
         if tf_checksum_hex:
-            cached = self._transformation_cache.get(tf_checksum_hex)
+            with self._cache_lock:
+                cached = self._transformation_cache.get(tf_checksum_hex)
             if cached is not None and not cached[0].base.cancelled():
                 self._touch_transformation_cache(tf_checksum_hex, cached[0])
                 return cached[0]
@@ -489,6 +600,27 @@ class SeamlessDaskClient:
 
         print("[seamless-dask] Scheduler reports 0 workers attached", file=sys.stderr)
 
+    def _start_prune_thread(self) -> None:
+        if self._prune_interval <= 0:
+            return
+        if self._prune_thread is not None:
+            return
+
+        def _loop() -> None:
+            while not self._prune_stop.wait(self._prune_interval):
+                try:
+                    self._prune_caches()
+                except Exception:
+                    pass
+
+        thread = threading.Thread(
+            target=_loop,
+            name="seamless-dask-cache-prune",
+            daemon=True,
+        )
+        self._prune_thread = thread
+        thread.start()
+
     def _ensure_promised(self, checksum_hex: str) -> None:
         """Best-effort: make sure write servers have been promised this checksum."""
 
@@ -550,38 +682,42 @@ class SeamlessDaskClient:
     def _touch_fat_checksum_cache(self, checksum_hex: str, future: Future) -> None:
         if not future.done():
             return
-        cached = self._fat_checksum_cache.get(checksum_hex)
-        if cached is None or cached[0] is not future:
-            return
-        self._fat_checksum_cache[checksum_hex] = (future, self._expiry())
+        with self._cache_lock:
+            cached = self._fat_checksum_cache.get(checksum_hex)
+            if cached is None or cached[0] is not future:
+                return
+            self._fat_checksum_cache[checksum_hex] = (future, self._expiry())
 
     def _touch_transformation_cache(
         self, tf_checksum_hex: str, futures: TransformationFutures
     ) -> None:
         if not self._transformation_done(futures):
             return
-        cached = self._transformation_cache.get(tf_checksum_hex)
-        if cached is None or cached[0] is not futures:
-            return
-        self._transformation_cache[tf_checksum_hex] = (futures, self._expiry())
+        with self._cache_lock:
+            cached = self._transformation_cache.get(tf_checksum_hex)
+            if cached is None or cached[0] is not futures:
+                return
+            self._transformation_cache[tf_checksum_hex] = (futures, self._expiry())
 
     def _cache_fat_checksum_future(self, checksum_hex: str, future: Future) -> None:
-        cached = self._fat_checksum_cache.get(checksum_hex)
-        if cached is None or cached[0] is not future:
-            self._fat_checksum_cache[checksum_hex] = (future, None)
-            future.add_done_callback(
-                lambda fut, checksum_hex=checksum_hex: self._touch_fat_checksum_cache(
-                    checksum_hex, fut
+        with self._cache_lock:
+            cached = self._fat_checksum_cache.get(checksum_hex)
+            if cached is None or cached[0] is not future:
+                self._fat_checksum_cache[checksum_hex] = (future, None)
+                future.add_done_callback(
+                    lambda fut, checksum_hex=checksum_hex: self._touch_fat_checksum_cache(
+                        checksum_hex, fut
+                    )
                 )
-            )
         self._touch_fat_checksum_cache(checksum_hex, future)
 
     def _cache_transformation_futures(
         self, tf_checksum_hex: str, futures: TransformationFutures
     ) -> None:
-        cached = self._transformation_cache.get(tf_checksum_hex)
-        if cached is None or cached[0] is not futures:
-            self._transformation_cache[tf_checksum_hex] = (futures, None)
+        with self._cache_lock:
+            cached = self._transformation_cache.get(tf_checksum_hex)
+            if cached is None or cached[0] is not futures:
+                self._transformation_cache[tf_checksum_hex] = (futures, None)
 
         def _on_done(_fut: Future) -> None:
             self._touch_transformation_cache(tf_checksum_hex, futures)
@@ -598,51 +734,64 @@ class SeamlessDaskClient:
         """Release and optionally cancel a transformation's futures and cache entries."""
 
         tf_checksum_hex = futures.tf_checksum
-        if tf_checksum_hex:
-            cached = self._transformation_cache.get(tf_checksum_hex)
-            if cached is not None and cached[0] is futures:
-                self._transformation_cache.pop(tf_checksum_hex, None)
-        if futures.result_checksum and futures.fat is not None:
-            cached = self._fat_checksum_cache.get(futures.result_checksum)
-            if cached is not None and cached[0] is futures.fat:
-                self._fat_checksum_cache.pop(futures.result_checksum, None)
+        with self._cache_lock:
+            if tf_checksum_hex:
+                cached = self._transformation_cache.get(tf_checksum_hex)
+                if cached is not None and cached[0] is futures:
+                    self._transformation_cache.pop(tf_checksum_hex, None)
+            if futures.result_checksum and futures.fat is not None:
+                cached = self._fat_checksum_cache.get(futures.result_checksum)
+                if cached is not None and cached[0] is futures.fat:
+                    self._fat_checksum_cache.pop(futures.result_checksum, None)
 
         for future in (futures.base, futures.thin, futures.fat):
             if future is None:
                 continue
+            if cancel:
+                try:
+                    if not future.cancelled() and not future.done():
+                        self._client.cancel(future, force=True)
+                except Exception:
+                    pass
             try:
                 future.release()
             except Exception:
                 pass
-            if cancel:
-                try:
-                    self._client.cancel(future, force=True)
-                except Exception:
-                    pass
 
     def _prune_caches(self) -> None:
         now = time.monotonic()
-        for key in list(self._fat_checksum_cache.keys()):
-            future, expiry = self._fat_checksum_cache[key]
-            if expiry is None or expiry >= now or not future.done():
-                continue
-            self._fat_checksum_cache.pop(key, None)
+        fat_release: list[Future] = []
+        trans_release: list[Future] = []
+        with self._cache_lock:
+            for key in list(self._fat_checksum_cache.keys()):
+                future, expiry = self._fat_checksum_cache[key]
+                if expiry is None or expiry >= now or not future.done():
+                    continue
+                self._fat_checksum_cache.pop(key, None)
+                fat_release.append(future)
+            for key in list(self._transformation_cache.keys()):
+                futures, expiry = self._transformation_cache[key]
+                if (
+                    expiry is None
+                    or expiry >= now
+                    or not self._transformation_done(futures)
+                ):
+                    continue
+                self._transformation_cache.pop(key, None)
+                for future in (futures.base, futures.thin, futures.fat):
+                    if future is None:
+                        continue
+                    trans_release.append(future)
+        for future in fat_release:
             try:
                 future.release()
             except Exception:
                 pass
-        for key in list(self._transformation_cache.keys()):
-            futures, expiry = self._transformation_cache[key]
-            if expiry is None or expiry >= now or not self._transformation_done(futures):
-                continue
-            self._transformation_cache.pop(key, None)
-            for future in (futures.base, futures.thin, futures.fat):
-                if future is None:
-                    continue
-                try:
-                    future.release()
-                except Exception:
-                    pass
+        for future in trans_release:
+            try:
+                future.release()
+            except Exception:
+                pass
 
     def _store_transformation(
         self, tf_checksum_hex: str, futures: TransformationFutures

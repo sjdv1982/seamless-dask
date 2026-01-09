@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import logging
+import os
+import threading
+import traceback
 from typing import Optional
 
 try:  # pragma: no cover - optional dependency wiring
@@ -13,6 +17,29 @@ from .permissions import shutdown_permission_manager
 
 _current_client: Optional["SeamlessDaskClient"] = None
 _close_hook_registered = False
+_LOGGER = logging.getLogger(__name__)
+
+
+def _describe_client(client: Optional["SeamlessDaskClient"]) -> str:
+    if client is None:
+        return "client=None"
+    dask_client = getattr(client, "_dummy_dask_client", None) or getattr(
+        client, "client", None
+    )
+    scheduler_addr = None
+    try:
+        scheduler = getattr(dask_client, "scheduler", None)
+        scheduler_addr = getattr(scheduler, "address", None)
+    except Exception:
+        scheduler_addr = None
+    return (
+        "client_id="
+        + str(id(client))
+        + " dask_client_id="
+        + str(id(dask_client))
+        + " scheduler="
+        + str(scheduler_addr)
+    )
 
 
 def _shutdown_client(client: "SeamlessDaskClient") -> None:
@@ -47,6 +74,16 @@ def set_seamless_dask_client(client: Optional["SeamlessDaskClient"]) -> None:
 
     if client is None:
         if _current_client is not None:
+            _LOGGER.info(
+                "[seamless-dask] Clearing SeamlessDaskClient pid=%s thread=%s %s",
+                os.getpid(),
+                threading.current_thread().name,
+                _describe_client(_current_client),
+            )
+            _LOGGER.debug(
+                "[seamless-dask] Clear stack:\n%s",
+                "".join(traceback.format_stack(limit=8)),
+            )
             _shutdown_client(_current_client)
         _current_client = None
         return
@@ -61,7 +98,21 @@ def set_seamless_dask_client(client: Optional["SeamlessDaskClient"]) -> None:
             pass
 
     if _current_client is not None:
+        _LOGGER.info(
+            "[seamless-dask] Replacing SeamlessDaskClient pid=%s thread=%s old=%s new=%s",
+            os.getpid(),
+            threading.current_thread().name,
+            _describe_client(_current_client),
+            _describe_client(client),
+        )
         _shutdown_client(_current_client)
+    else:
+        _LOGGER.info(
+            "[seamless-dask] Registering SeamlessDaskClient pid=%s thread=%s %s",
+            os.getpid(),
+            threading.current_thread().name,
+            _describe_client(client),
+        )
 
     _current_client = client
 

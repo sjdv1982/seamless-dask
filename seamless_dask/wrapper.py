@@ -367,6 +367,7 @@ def _resolve_awaitable(value: Any) -> Any:
 _WAITING_AWARE_ADAPTIVE: Any | None = None
 _SCHEDULER_ACTIVITY_LOCK = threading.Lock()
 _LAST_SCHEDULER_ACTIVITY: Dict[str, Any] | None = None
+_ADAPTIVE_BASE_WEIGHT: float | None = None
 
 
 def _record_scheduler_activity(activity: Any) -> None:
@@ -441,19 +442,29 @@ def _make_waiting_aware_adaptive():
                         self, "unknown_task_duration", "_unknown_task_duration"
                     )
                 )
-            if unknown is None:
-                unknown = 0.0
+            if unknown is None or unknown <= 0:
+                unknown = _duration_seconds(DEFAULT_UNKNOWN_TASK_DURATION) or 0.0
 
-            base_occupancy = activity.get("total_occupancy")
+            task_count = activity.get("task_count")
             try:
-                base_occupancy = float(base_occupancy or 0.0)
+                task_count = int(task_count or 0)
             except Exception:
-                base_occupancy = 0.0
+                task_count = 0
+            base_weight = _get_attr_value(
+                self, "seamless_base_weight", "_seamless_base_weight"
+            )
+            if base_weight is None:
+                base_weight = _ADAPTIVE_BASE_WEIGHT
+            try:
+                base_weight = float(base_weight)
+            except Exception:
+                base_weight = 1.0
             waiting_occupancy = 0.0
             waiting_unknown = 0
             waiting_with_duration = 0
             prefix_counts_from_prefixes: Dict[str, int] = {}
             prefix_durations: Dict[str, float] = {}
+            prefix_processing_counts: Dict[str, int] = {}
             task_prefixes = activity.get("task_prefixes") or {}
             try:
                 items = task_prefixes.items() if hasattr(task_prefixes, "items") else []
@@ -481,6 +492,17 @@ def _make_waiting_aware_adaptive():
             except Exception:
                 prefix_durations = {}
                 prefix_counts_from_prefixes = {}
+                prefix_processing_counts = {}
+
+            processing_prefix_counts = activity.get("processing_prefix_counts") or {}
+            if isinstance(processing_prefix_counts, Mapping):
+                prefix_processing_counts = {
+                    str(name): int(count or 0)
+                    for name, count in processing_prefix_counts.items()
+                    if int(count or 0) > 0
+                }
+            else:
+                prefix_processing_counts = {}
 
             prefix_counts: Dict[str, int] = {}
             prefix_source = None
@@ -522,6 +544,38 @@ def _make_waiting_aware_adaptive():
                 waiting_occupancy = waiting * unknown
                 waiting_unknown = waiting
 
+            base_processing_occupancy = 0.0
+            base_processing_unknown = 0
+            processing_occupancy = 0.0
+            if prefix_processing_counts:
+                for prefix_name, count in prefix_processing_counts.items():
+                    duration = prefix_durations.get(prefix_name)
+                    if duration is None or duration <= 0:
+                        duration = unknown
+                        if prefix_name.startswith("base"):
+                            base_processing_unknown += count
+                    weight = base_weight if prefix_name.startswith("base") else 1.0
+                    processing_occupancy += count * duration * weight
+                    if prefix_name.startswith("base"):
+                        base_processing_occupancy += count * duration * weight
+            else:
+                try:
+                    processing_count = int(counts.get("processing", 0) or 0)
+                except Exception:
+                    processing_count = 0
+                processing_occupancy = processing_count * unknown
+                base_processing_unknown = processing_count
+                base_processing_occupancy = processing_occupancy
+
+            base_occupancy = processing_occupancy
+            if task_count == 0:
+                base_occupancy = 0.0
+                waiting_occupancy = 0.0
+                waiting_unknown = 0
+                waiting_with_duration = 0
+                base_processing_unknown = 0
+                base_processing_occupancy = 0.0
+
             occupancy = base_occupancy + waiting_occupancy
 
             target_raw = (
@@ -553,6 +607,8 @@ def _make_waiting_aware_adaptive():
                 f"waiting_with_duration={waiting_with_duration}",
                 f"waiting_unknown={waiting_unknown}",
                 f"base_occupancy={base_occupancy}",
+                f"base_weight={base_weight}",
+                f"base_processing_unknown={base_processing_unknown}",
                 f"occupancy={occupancy}",
                 f"target_seconds={target_seconds}",
                 f"target_raw={target_raw}",
@@ -617,6 +673,11 @@ def _adapt_cluster(cluster, adaptive_settings: Mapping[str, Any] | None):
             return adaptive
     if adaptive is not None:
         setattr(cluster, "_adaptive", adaptive)
+        if _ADAPTIVE_BASE_WEIGHT is not None:
+            try:
+                setattr(adaptive, "_seamless_base_weight", _ADAPTIVE_BASE_WEIGHT)
+            except Exception:
+                pass
     return adaptive
 
 
@@ -632,6 +693,11 @@ def _ensure_waiting_aware_adaptive(
             adaptive = _adapt_cluster(cluster, adaptive_settings)
         return adaptive
     if adaptive is not None and isinstance(adaptive, adaptive_cls):
+        if _ADAPTIVE_BASE_WEIGHT is not None:
+            try:
+                setattr(adaptive, "_seamless_base_weight", _ADAPTIVE_BASE_WEIGHT)
+            except Exception:
+                pass
         return adaptive
     if adaptive is not None:
         log_print(
@@ -1054,6 +1120,10 @@ def _scheduler_activity(dask_scheduler, monitor_id: str):
         try:
             return float(value)
         except Exception:
+            pass
+        try:
+            return parse_timedelta_value(value).total_seconds()
+        except Exception:
             return None
 
     client_count = len([cid for cid in dask_scheduler.clients if cid != monitor_id])
@@ -1077,6 +1147,7 @@ def _scheduler_activity(dask_scheduler, monitor_id: str):
         task_state_counts = {}
 
     waiting_prefix_counts: Dict[str, int] = {}
+    processing_prefix_counts: Dict[str, int] = {}
     try:
         try:
             from distributed.utils import key_split as _key_split
@@ -1107,8 +1178,15 @@ def _scheduler_activity(dask_scheduler, monitor_id: str):
                     waiting_prefix_counts[prefix] = (
                         waiting_prefix_counts.get(prefix, 0) + 1
                     )
+            if getattr(ts, "state", None) == "processing":
+                prefix = _prefix_for_task(ts)
+                if prefix:
+                    processing_prefix_counts[prefix] = (
+                        processing_prefix_counts.get(prefix, 0) + 1
+                    )
     except Exception:
         waiting_prefix_counts = {}
+        processing_prefix_counts = {}
 
     task_prefixes = getattr(dask_scheduler, "task_prefixes", None)
     if callable(task_prefixes):
@@ -1153,6 +1231,7 @@ def _scheduler_activity(dask_scheduler, monitor_id: str):
         "task_count": len(active_tasks),
         "task_state_counts": task_state_counts,
         "waiting_prefix_counts": waiting_prefix_counts,
+        "processing_prefix_counts": processing_prefix_counts,
         "task_prefixes": prefix_summary,
         "total_occupancy": total_occupancy,
         "unknown_task_duration": unknown_task_duration,
@@ -1274,12 +1353,6 @@ def keep_cluster_alive(
         while True:
             now = time.monotonic()
             if adaptive_settings is not None and adaptive_log_interval is not None:
-                if last_adaptive_log is not None:
-                    log_print(
-                        "[seamless-dask-wrapper] BOO??",
-                        f"{now - last_adaptive_log:.3f}",
-                        f"{adaptive_log_interval:.3f}",
-                    )
                 if adaptive_future is not None and adaptive_future.done():
                     try:
                         adaptive_future.result()
@@ -1290,7 +1363,6 @@ def keep_cluster_alive(
                 if last_adaptive_log is None or (
                     now - last_adaptive_log >= adaptive_log_interval
                 ):
-                    log_print("[seamless-dask-wrapper] BOO!!")
                     adaptive = _ensure_waiting_aware_adaptive(
                         cluster, adaptive_settings
                     )
@@ -1476,7 +1548,6 @@ def keep_cluster_alive(
                     else:
                         dummy_futures_new.append(fut)
                 dummy_futures = dummy_futures_new
-            log_print("[seamless-dask-wrapper] BAA")
             time.sleep(INACTIVITY_CHECK_INTERVAL)
     except BaseException as exc:
         log_print("[seamless-dask-wrapper] keep_cluster_alive exception:", repr(exc))
@@ -1619,6 +1690,7 @@ def main():
             )
             minimum_jobs = int(wrapper_config.interactive)
             target_duration = parameters.get("target-duration", DEFAULT_TARGET_DURATION)
+            base_weight = 1.0
             if not wrapper_config.pure_dask:
                 scale_factor = None
                 if wrapper_config.worker_resources is not None:
@@ -1636,6 +1708,8 @@ def main():
                     target_duration = scale_target_duration(
                         target_duration, 1.0 / scale_factor
                     )
+            global _ADAPTIVE_BASE_WEIGHT
+            _ADAPTIVE_BASE_WEIGHT = base_weight
             adaptive_settings = {
                 "minimum_jobs": minimum_jobs,
                 "maximum_jobs": wrapper_config.maximum_jobs,
