@@ -1016,9 +1016,15 @@ def build_wrapper_configuration(
                 prologue += [f"#SBATCH --error={log_name}.err"]
         elif system == "oar":
             if log_handle is not None:
-                log_name = log_handle.name + "-%j"
+                log_name = log_handle.name + "-$OAR_JOB_ID"
                 prologue += [f"#OAR --stdout={log_name}.out"]
                 prologue += [f"#OAR --stderr={log_name}.err"]
+
+                # Are we running inside Conda? OAR won't propagate our env vars
+                CONDA_PREFIX = os.environ.get("CONDA_PREFIX")
+                if CONDA_PREFIX:
+                    prologue.append(format_bash_export("CONDA_PREFIX", CONDA_PREFIX))
+                    prologue.append('export PATH="$CONDA_PREFIX/bin:$PATH"')
 
         prologue += env_exports
         if system == "slurm":
