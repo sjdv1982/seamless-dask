@@ -1014,6 +1014,11 @@ def build_wrapper_configuration(
                 log_name = log_handle.name + "-%j"
                 prologue += [f"#SBATCH --output={log_name}.out"]
                 prologue += [f"#SBATCH --error={log_name}.err"]
+        elif system == "oar":
+            if log_handle is not None:
+                log_name = log_handle.name + "-%j"
+                prologue += [f"#OAR --stdout={log_name}.out"]
+                prologue += [f"#OAR --stderr={log_name}.err"]
 
         prologue += env_exports
         if system == "slurm":
