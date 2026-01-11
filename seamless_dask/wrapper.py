@@ -1008,7 +1008,7 @@ def build_wrapper_configuration(
 
     jobqueue_config: Dict[str, Dict[str, Any]] = {}
     for system in JOBQUEUE_SYSTEMS:
-        prologue = list(base_prologue)
+        prologue = list(base_prologue).copy()
         if system == "slurm":
             if log_handle is not None:
                 log_name = log_handle.name + "-%j"
@@ -1016,7 +1016,7 @@ def build_wrapper_configuration(
                 prologue += [f"#SBATCH --error={log_name}.err"]
         elif system == "oar":
             if log_handle is not None:
-                log_name = log_handle.name + "-$OAR_JOB_ID"
+                log_name = log_handle.name + "-%jobid%"
                 prologue += [f"#OAR --stdout={log_name}.out"]
                 prologue += [f"#OAR --stderr={log_name}.err"]
 
