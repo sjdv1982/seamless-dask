@@ -1029,7 +1029,7 @@ def build_wrapper_configuration(
         prologue += env_exports
         if system == "slurm":
             prologue.append("export PYTHON_CPU_COUNT=$SLURM_JOB_CPUS_PER_NODE")
-        config = dict(jobqueue_common)
+        config = dict(jobqueue_common).copy()
         config["job-script-prologue"] = prologue
         jobqueue_config[system] = config
         if system == "slurm":
