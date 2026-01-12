@@ -23,6 +23,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass
 from datetime import timedelta
 from importlib import import_module
+from copy import deepcopy
 from types import FunctionType
 from typing import (
     Any,
@@ -806,7 +807,7 @@ class WrapperConfig:
     scheduler_port: int
     dashboard_port: int
     interactive: bool
-    maximum_jobs: Optional[int]
+    maximum_jobs: int
     memory_per_core_property_name: Optional[str]
     pure_dask: bool
 
@@ -828,6 +829,7 @@ def build_wrapper_configuration(
     cores = parameters.get("cores")
     if cores is None:
         raise RuntimeError("Missing required parameter 'cores'")
+    job_cores = parameters.get("job_cores")
     memory = parameters.get("memory")
     if memory is None:
         raise RuntimeError("Missing required parameter 'memory'")
@@ -838,6 +840,8 @@ def build_wrapper_configuration(
         raise RuntimeError("Parameter 'cores' must be an integer")
     if cores <= 0:
         raise RuntimeError("Parameter 'cores' must be positive")
+    if job_cores is None:
+        job_cores = cores
 
     tmpdir = parameters.get("tmpdir", DEFAULT_TMPDIR)
     partition = parameters.get("partition")
@@ -960,7 +964,7 @@ def build_wrapper_configuration(
         "processes": worker_processes,
         "python": "python",
         "walltime": walltime,
-        "cores": cores,
+        "cores": job_cores,
         "memory": memory,
         "local-directory": tmpdir,
         "temp-directory": tmpdir,
@@ -1008,7 +1012,7 @@ def build_wrapper_configuration(
 
     jobqueue_config: Dict[str, Dict[str, Any]] = {}
     for system in JOBQUEUE_SYSTEMS:
-        prologue = list(base_prologue).copy()
+        prologue = deepcopy(list(base_prologue))
         if system == "slurm":
             if log_handle is not None:
                 log_name = log_handle.name + "-%j"
@@ -1029,7 +1033,7 @@ def build_wrapper_configuration(
         prologue += env_exports
         if system == "slurm":
             prologue.append("export PYTHON_CPU_COUNT=$SLURM_JOB_CPUS_PER_NODE")
-        config = dict(jobqueue_common).copy()
+        config = deepcopy(dict(jobqueue_common))
         config["job-script-prologue"] = prologue
         jobqueue_config[system] = config
         if system == "slurm":
