@@ -875,7 +875,7 @@ def build_wrapper_configuration(
         pure_dask = False
     worker_processes_raw = parameters.get("processes")
     if worker_processes_raw is None:
-        worker_processes = cores if pure_dask else 1
+        worker_processes = job_cores if pure_dask else 1
     else:
         try:
             worker_processes = int(worker_processes_raw)
@@ -978,7 +978,7 @@ def build_wrapper_configuration(
         "processes": worker_processes,
         "python": "python",
         "walltime": walltime,
-        "cores": job_cores,
+        "cores": cores,
         "memory": memory,
         "local-directory": tmpdir,
         "temp-directory": tmpdir,
@@ -1079,7 +1079,7 @@ def build_wrapper_configuration(
 
     return WrapperConfig(
         common=jobqueue_common,
-        cores=job_cores if pure_dask else cores,
+        cores=cores,
         worker_threads=worker_threads,
         worker_processes=worker_processes,
         worker_port_range=internal_port_range_str,
