@@ -643,10 +643,15 @@ def _make_waiting_aware_adaptive():
     return WaitingAwareAdaptive
 
 
-def _adapt_cluster(cluster, adaptive_settings: Mapping[str, Any] | None):
+def _adapt_cluster(
+    cluster,
+    adaptive_settings: Mapping[str, Any] | None,
+    *,
+    use_waiting_aware: bool = True,
+):
     if adaptive_settings is None:
         return None
-    adaptive_cls = _make_waiting_aware_adaptive()
+    adaptive_cls = _make_waiting_aware_adaptive() if use_waiting_aware else None
     if adaptive_cls is None:
         adaptive = cluster.adapt(**adaptive_settings)
         if adaptive is not None:
@@ -683,15 +688,22 @@ def _adapt_cluster(cluster, adaptive_settings: Mapping[str, Any] | None):
 
 
 def _ensure_waiting_aware_adaptive(
-    cluster, adaptive_settings: Mapping[str, Any] | None
+    cluster,
+    adaptive_settings: Mapping[str, Any] | None,
+    *,
+    use_waiting_aware: bool = True,
 ):
     if adaptive_settings is None:
         return None
-    adaptive_cls = _make_waiting_aware_adaptive()
+    adaptive_cls = _make_waiting_aware_adaptive() if use_waiting_aware else None
     adaptive = getattr(cluster, "_adaptive", None)
     if adaptive_cls is None:
         if adaptive is None:
-            adaptive = _adapt_cluster(cluster, adaptive_settings)
+            adaptive = _adapt_cluster(
+                cluster,
+                adaptive_settings,
+                use_waiting_aware=use_waiting_aware,
+            )
         return adaptive
     if adaptive is not None and isinstance(adaptive, adaptive_cls):
         if _ADAPTIVE_BASE_WEIGHT is not None:
@@ -711,7 +723,9 @@ def _ensure_waiting_aware_adaptive(
                 close()
         except Exception:
             pass
-    adaptive = _adapt_cluster(cluster, adaptive_settings)
+    adaptive = _adapt_cluster(
+        cluster, adaptive_settings, use_waiting_aware=use_waiting_aware
+    )
     adaptive = getattr(cluster, "_adaptive", adaptive)
     if adaptive is not None and not isinstance(adaptive, adaptive_cls):
         log_print(
@@ -1321,6 +1335,7 @@ def keep_cluster_alive(
     interactive: bool,
     adaptive_settings: Optional[Mapping[str, Any]] = None,
     adaptive_log_interval: Optional[float] = None,
+    use_waiting_aware_adaptive: bool = True,
 ):
     from distributed import Client
     import warnings
@@ -1364,7 +1379,11 @@ def keep_cluster_alive(
             if future is not None:
                 dummy_futures.append(future)
         if adaptive_settings is not None:
-            adaptive = _ensure_waiting_aware_adaptive(cluster, adaptive_settings)
+            adaptive = _ensure_waiting_aware_adaptive(
+                cluster,
+                adaptive_settings,
+                use_waiting_aware=use_waiting_aware_adaptive,
+            )
         while True:
             now = time.monotonic()
             if adaptive_settings is not None and adaptive_log_interval is not None:
@@ -1379,7 +1398,9 @@ def keep_cluster_alive(
                     now - last_adaptive_log >= adaptive_log_interval
                 ):
                     adaptive = _ensure_waiting_aware_adaptive(
-                        cluster, adaptive_settings
+                        cluster,
+                        adaptive_settings,
+                        use_waiting_aware=use_waiting_aware_adaptive,
                     )
                     if adaptive_future is None:
                         try:
@@ -1483,7 +1504,11 @@ def keep_cluster_alive(
                                 minimum_jobs = adaptive_settings["minimum_jobs"]
                                 if minimum_jobs:
                                     cluster.scale(minimum_jobs)
-                                _adapt_cluster(cluster, adaptive_settings)
+                                _adapt_cluster(
+                                    cluster,
+                                    adaptive_settings,
+                                    use_waiting_aware=use_waiting_aware_adaptive,
+                                )
                             except Exception:
                                 pass
                         try:
@@ -1735,7 +1760,11 @@ def main():
             adaptive_log_interval = _duration_seconds(ADAPTIVE_INTERVAL)
             if minimum_jobs:
                 cluster.scale(minimum_jobs)
-            _adapt_cluster(cluster, adaptive_settings)
+            _adapt_cluster(
+                cluster,
+                adaptive_settings,
+                use_waiting_aware=not wrapper_config.pure_dask,
+            )
         else:
             adaptive_settings = None
             adaptive_log_interval = None
@@ -1786,6 +1815,7 @@ def main():
                 interactive=wrapper_config.interactive,
                 adaptive_settings=adaptive_settings,
                 adaptive_log_interval=adaptive_log_interval,
+                use_waiting_aware_adaptive=not wrapper_config.pure_dask,
             )
         except SystemExit:
             if status_tracker is not None:
