@@ -1079,7 +1079,7 @@ def build_wrapper_configuration(
 
     return WrapperConfig(
         common=jobqueue_common,
-        cores=cores,
+        cores=job_cores if pure_dask else cores,
         worker_threads=worker_threads,
         worker_processes=worker_processes,
         worker_port_range=internal_port_range_str,
