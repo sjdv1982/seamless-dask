@@ -873,9 +873,10 @@ def build_wrapper_configuration(
         pure_dask = parse_bool(parameters.get("pure_dask"), "pure_dask")
     else:
         pure_dask = False
+
     worker_processes_raw = parameters.get("processes")
     if worker_processes_raw is None:
-        worker_processes = job_cores if pure_dask else 1
+        worker_processes = cores if pure_dask else 1
     else:
         try:
             worker_processes = int(worker_processes_raw)
@@ -883,6 +884,9 @@ def build_wrapper_configuration(
             raise RuntimeError("Parameter 'processes' must be an integer")
         if worker_processes <= 0:
             raise RuntimeError("Parameter 'processes' must be positive")
+
+    if pure_dask:
+        cores = job_cores
 
     worker_threads_raw = parameters.get("worker_threads")
     if worker_threads_raw is not None:
