@@ -225,12 +225,19 @@ class TransformationDaskMixin:
                 self._exception = None
                 return self._result_checksum
 
+        # For now, disable env_requires_remote, because I think it is a mistake.
+        #  cluster adaptive scaling should still kick in even with env_requires_remote=False,
+        #  and with env_requires_remote=True we have the risk of deadlock
+        #    (it disables solution 4. of the anti-deadlock,txt)
+        """
         try:
             from seamless_config.select import get_execution
 
             env_requires_remote = get_execution() == "remote"
         except Exception:
             env_requires_remote = False
+        """
+        env_requires_remote = False
 
         permission_granted = False
         if self._skip_permission_gate():

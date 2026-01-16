@@ -35,6 +35,7 @@ dask.config.set({"distributed.scheduler.target-duration": "10m"})
 
 _SEAMLESS_DASK_CLIENT_LOCK = threading.Lock()
 _LOGGER = logging.getLogger(__name__)
+_BASE_DASK_PRIORITY = 10
 
 
 def _scheduler_has_task_key(dask_scheduler, key: str) -> bool:
@@ -275,7 +276,9 @@ def _fat_checksum_task(checksum_hex: str) -> Tuple[str, Buffer | None, str | Non
 
 
 def _run_base(
-    payload: Dict[str, Any], input_results: Mapping[str, Tuple[Any, ...]]
+    payload: Dict[str, Any],
+    input_results: Mapping[str, Tuple[Any, ...]],
+    priority: int | None = None,
 ) -> Tuple[str | None, str | None, Buffer | None, str | None]:
     """Worker task that performs the transformation itself."""
 
@@ -285,6 +288,14 @@ def _run_base(
         set_seamless_dask_client,
     )
     import distributed
+
+    try:
+        priority_value = int(priority) if priority is not None else None
+    except Exception:
+        priority_value = None
+    if priority_value is not None and payload.get("owner_dask_priority") is None:
+        payload = dict(payload)
+        payload["owner_dask_priority"] = priority_value
 
     owner_dask_key = payload.get("owner_dask_key")
     if not isinstance(owner_dask_key, str) or not owner_dask_key:
@@ -328,6 +339,13 @@ def _run_base(
     transformation_dict = dict(payload.get("transformation_dict") or {})
     inputs = payload.get("inputs") or []
     scratch = bool(payload.get("scratch", False))
+    owner_dask_priority = payload.get("owner_dask_priority")
+    try:
+        owner_dask_priority = (
+            int(owner_dask_priority) if owner_dask_priority is not None else None
+        )
+    except Exception:
+        owner_dask_priority = None
     tf_dunder = payload.get("tf_dunder", {}) or {}
     require_value = bool(payload.get("require_value", False))
 
@@ -381,10 +399,11 @@ def _run_base(
                     _run_base,
                     dedupe_payload,
                     input_results,
+                    priority_value,
                     pure=False,
                     key=base_key,
                     resources={"S": 1},
-                    priority=10,
+                    priority=priority_value or _BASE_DASK_PRIORITY,
                     retries=3,
                 )
                 return future.result()
@@ -393,10 +412,11 @@ def _run_base(
                     _run_base,
                     dedupe_payload,
                     input_results,
+                    priority_value,
                     pure=False,
                     key=base_key,
                     resources={"S": 1},
-                    priority=10,
+                    priority=priority_value or _BASE_DASK_PRIORITY,
                     retries=3,
                 )
                 return future.result()
@@ -434,6 +454,7 @@ def _run_base(
                 tf_dunder=tf_dunder,
                 scratch=scratch,
                 owner_dask_key=owner_dask_key,
+                owner_dask_priority=owner_dask_priority,
             )
         )
         if isinstance(result_checksum, str):
@@ -586,12 +607,22 @@ class SeamlessDaskClient:
         return futures
 
     def submit_transformation(
-        self, submission: TransformationSubmission, *, need_fat: bool = False
+        self,
+        submission: TransformationSubmission,
+        *,
+        need_fat: bool = False,
+        priority_boost: int = 0,
     ) -> TransformationFutures:
         """Submit a transformation to Dask and return its futures."""
         self._prune_caches()
         tf_checksum_hex = submission.tf_checksum
         is_driver = _is_driver_submission(submission)
+        try:
+            boost = int(priority_boost)
+        except Exception:
+            boost = 0
+        base_priority = _BASE_DASK_PRIORITY + boost
+        thin_priority = _BASE_DASK_PRIORITY + 10 + boost
 
         if tf_checksum_hex and not is_driver:
             with self._cache_lock:
@@ -607,6 +638,7 @@ class SeamlessDaskClient:
             "tf_dunder": dict(submission.tf_dunder),
             "scratch": submission.scratch,
             "require_value": submission.require_value,
+            "owner_dask_priority": base_priority,
         }
         input_futures = dict(submission.input_futures)
         resource_string = None  # TODO: get from tf_dunder
@@ -628,10 +660,11 @@ class SeamlessDaskClient:
             _run_base,
             payload,
             input_futures,
+            base_priority,
             pure=False,
             key=base_key,
             resources={"S": 1},
-            priority=10,
+            priority=base_priority,
             retries=3,
         )
         thin_future = self._client.submit(
@@ -639,7 +672,7 @@ class SeamlessDaskClient:
             base_future,
             pure=False,
             key=thin_key,
-            priority=20,
+            priority=thin_priority,
         )
 
         fat_future = None
