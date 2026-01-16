@@ -98,7 +98,7 @@ class SeamlessWorkerPlugin(WorkerPlugin):
         os.environ.setdefault("SEAMLESS_DASK_WORKERS", str(self.num_workers))
 
         if self.remote_clients is not None:
-            set_remote_clients(self.remote_clients)
+            set_remote_clients(self.remote_clients, in_remote=True)
             worker_logger.info(
                 "Set remote clients inside Dask worker %s: %s",
                 worker.name,
