@@ -25,7 +25,7 @@ if TYPE_CHECKING:  # pragma: no cover - type checking only
 
 
 def _ensure_remote_clients_from_env() -> None:
-    payload = os.environ.get("SEAMLESS_DASK_REMOTE_CLIENTS")
+    payload = os.environ.get("SEAMLESS_REMOTE_CLIENTS")
     if not payload:
         return
     try:

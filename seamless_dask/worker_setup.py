@@ -105,10 +105,7 @@ class SeamlessWorkerPlugin(WorkerPlugin):
                 json.dumps(self.remote_clients, indent=4),
             )
             try:
-                os.environ.setdefault(
-                    "SEAMLESS_DASK_REMOTE_CLIENTS",
-                    json.dumps(self.remote_clients),
-                )
+                os.environ["SEAMLESS_REMOTE_CLIENTS"] = json.dumps(self.remote_clients)
             except Exception:
                 worker_logger.debug(
                     "Failed to serialize remote clients for child workers",
