@@ -982,7 +982,7 @@ def build_wrapper_configuration(
         "processes": worker_processes,
         "python": "python",
         "walltime": walltime,
-        "cores": cores,
+        "cores": job_cores,
         "memory": memory,
         "local-directory": tmpdir,
         "temp-directory": tmpdir,
