@@ -3,6 +3,12 @@ Seamless guarantees that transformation checksums in the database have their buf
 available. Failure to do so triggers a CachemissError and is not part of normal operations.
 In particular, remote transformations must only return when the buffer corresponding to the result checksum has been propagated.
 
+Terminology (new contract):
+- Resolvable: the checksum buffer is in cache or can be downloaded remotely.
+- Fingertippable: resolvable OR recomputable from a known transformation (reverse mapping).
+Compute guarantees fingertippable checksums; run will fingertip if needed. require_value applies to
+the result (resolvable) and does not apply to inputs.
+
 Normal Seamless lifecycle: construct() → compute() → run(). Construction happens on the client (producing a transformation checksum). Computation can be remote, and run() simply resolves the checksum on the client.
 
 Dask difference: tasks can be submitted before construction finishes. Inputs and transformations themselves can be Dask futures. The goal is to reuse work via deterministic keys when possible, while keeping result buffers hot on workers for nearby dependents.

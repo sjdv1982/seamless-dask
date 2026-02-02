@@ -199,6 +199,17 @@ class TransformationDaskMixin:
         if result_checksum_hex:
             self._result_checksum = Checksum(result_checksum_hex)
             self._evaluated = True
+            if self._transformation_checksum is not None:
+                try:
+                    from seamless_transformer.transformation_cache import (
+                        register_transformation_result,
+                    )
+
+                    register_transformation_result(
+                        self._transformation_checksum, self._result_checksum
+                    )
+                except Exception:
+                    pass
         return self._result_checksum
 
     async def _compute_with_dask_async(self, require_value: bool) -> Checksum | None:
@@ -306,6 +317,17 @@ class TransformationDaskMixin:
         if result_checksum_hex:
             self._result_checksum = Checksum(result_checksum_hex)
             self._evaluated = True
+            if self._transformation_checksum is not None:
+                try:
+                    from seamless_transformer.transformation_cache import (
+                        register_transformation_result,
+                    )
+
+                    register_transformation_result(
+                        self._transformation_checksum, self._result_checksum
+                    )
+                except Exception:
+                    pass
         return self._result_checksum
 
     # ---- internals --------------------------------------------------------
