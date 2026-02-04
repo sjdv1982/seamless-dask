@@ -8,6 +8,8 @@ Terminology (new contract):
 - Fingertippable: resolvable OR recomputable from a known transformation (reverse mapping).
 Compute guarantees fingertippable checksums; run will fingertip if needed. require_value applies to
 the result (resolvable) and does not apply to inputs.
+Transformations may opt into input fingertipping via `allow_input_fingertip=True` (default False).
+If False, missing input buffers are treated as CacheMiss; if True, inputs may be recomputed.
 
 Normal Seamless lifecycle: construct() → compute() → run(). Construction happens on the client (producing a transformation checksum). Computation can be remote, and run() simply resolves the checksum on the client.
 
@@ -19,6 +21,7 @@ This carries the risk of a non-scratch version of a task being ignored if a scra
 Case 1: transformation without dependencies (inputs are checksums or values that become checksums). Steps:
 - Construct on the client to get the transformation checksum. Check the remote database/cache; on hit, do not submit to Dask.
 - On miss, build “fat checksum” futures per input checksum. These run on workers, pull `(checksum, buffer, exc)` from hashserver/buffer cache, and use predictable keys `fat-checksum-{checksum.hex()}`. Dask is eager: creating the future starts execution. A weak/strong cache keeps these futures alive; strong entries expire ~10s after completion (refreshed on access once done). Default-task-duration: “fast”.
+  If `allow_input_fingertip=True`, use “fat finger checksum” tasks instead. These first try normal resolution and fall back to fingertipping the checksum on the worker.
 - It is now possible to build three futures, keyed deterministically with the transformation checksum (e.g., `base-{tf_checksum}`, `fat-{tf_checksum}`, `thin-{tf_checksum}`); if already running, Dask will reuse them. However, since Dask is eager, we must build them only if needed.
 We will need the thin future if we are running `.compute()` directly from the client. We will need the fat future if we will be running a downstream transformation that has the transformation as a dependency.
 The three futures do the following: 
@@ -31,6 +34,7 @@ Case 2: transformation with dependencies (some inputs are Transformation instanc
 - construct() semantics unchanged, but compute() no longer auto-calls construct().
 - When compute() runs: if any dependency already has an exception, set “Dependency has an exception.” Prefer dependencies that already have their (base, fat, thin) triple alive in Dask; otherwise, if a dependency has completed, replace it with its result checksum. If all deps become concrete, fall back to Case 1. If a dep is unknown to Dask and not completed, rebuild its triple.
 - Build a transformation dict with fat checksum futures for concrete inputs and fat Transformation futures (from their triples) for dependent transforms. Submit three futures analogous to Case 1:
+  If `allow_input_fingertip=True`, use fat finger checksum futures for concrete inputs and fat finger futures for dependencies. A fat finger future runs like a fat future but falls back to fingertipping the result checksum when its buffer is missing.
   - Base future (worker): performs construction once dep checksums are known, then redirects to a deterministic key `K2 = base-{tf_checksum}` (or `base_{code_checksum}-{tf_checksum}`) to avoid duplicate compute. Enter `worker_client(secede=True)` (or a multi-thread worker) before blocking on other futures. Steps:
     - If the base task was submitted without a checksum, submit a new base task under key `K2` and `await` it; if the scheduler already has `K2`, this submission latches onto it, so you just return its tuple (no local run/write).
     - The deterministic base task re-checks cache and on hit returns `(tf_checksum, result_checksum, None, None)`. On miss, it runs the transformation, writes checksum+buffer, and returns `(tf_checksum, result_checksum, result_buffer, None)` (or `(tf_checksum, None, None, exc)` on error). This order prevents double execution/double writes from near-simultaneous submissions.

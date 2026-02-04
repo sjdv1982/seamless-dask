@@ -437,6 +437,7 @@ class TransformationDaskMixin:
             pretransformation.build_partial_transformation(upstream_dependencies)
         )
         meta = getattr(self, "_meta", {}) or {}
+        allow_input_fingertip = bool(meta.get("allow_input_fingertip", False))
         if meta:
             existing_meta = transformation_dict.get("__meta__")
             if isinstance(existing_meta, dict):
@@ -468,7 +469,7 @@ class TransformationDaskMixin:
                     msg = f"Dependency '{pinname}' has an exception."
                     raise RuntimeError(msg)
                 dep_futures = dependency._ensure_dask_futures(  # type: ignore[attr-defined]
-                    client, require_value=require_value, need_fat=True
+                    client, require_value=require_value, need_fat=False
                 )
                 inputs[pinname] = TransformationInputSpec(
                     name=pinname,
@@ -477,7 +478,12 @@ class TransformationDaskMixin:
                     checksum=None,
                     kind="transformation",
                 )
-                input_futures[pinname] = dep_futures.fat
+                if allow_input_fingertip:
+                    input_futures[pinname] = client.ensure_fat_finger_future(
+                        dep_futures
+                    )
+                else:
+                    input_futures[pinname] = client.ensure_fat_future(dep_futures)
                 continue
 
                 # noqa: B007 (false positive)
@@ -492,7 +498,12 @@ class TransformationDaskMixin:
                 checksum=checksum_hex,
                 kind="checksum",
             )
-            input_futures[pinname] = client.get_fat_checksum_future(checksum_hex)
+            if allow_input_fingertip:
+                input_futures[pinname] = client.get_fat_finger_checksum_future(
+                    checksum_hex
+                )
+            else:
+                input_futures[pinname] = client.get_fat_checksum_future(checksum_hex)
 
         return TransformationSubmission(
             transformation_dict=transformation_dict,
@@ -503,6 +514,7 @@ class TransformationDaskMixin:
             scratch=getattr(self, "_scratch", False),
             meta=getattr(self, "_meta", {}) or {},
             require_value=require_value,
+            allow_input_fingertip=allow_input_fingertip,
         )
 
     def _ensure_dask_futures(

@@ -220,6 +220,14 @@ async def _resolve_buffer_async(checksum: Checksum) -> Buffer | None:
     return None
 
 
+async def _fingertip_buffer_async(checksum: Checksum) -> Buffer | None:
+    buffer_obj = await checksum.fingertip()
+    if isinstance(buffer_obj, Buffer):
+        buffer_obj.tempref(scratch=True)
+        return buffer_obj
+    return None
+
+
 async def _fetch_cached_result_async(
     tf_checksum: Checksum, require_value: bool
 ) -> Checksum | None:
@@ -246,15 +254,16 @@ async def _fetch_cached_result_async(
 
 
 async def _promise_and_write_result_async(
-    tf_checksum: Checksum, result_checksum: Checksum
+    tf_checksum: Checksum, result_checksum: Checksum, *, write_buffer: bool
 ) -> None:
-    """Promise the result checksum and persist it to the remote database."""
+    """Persist a transformation result, optionally writing the buffer remotely."""
     try:
         from seamless_remote import buffer_remote, database_remote
     except Exception:
         return
     try:
-        await buffer_remote.promise(result_checksum)
+        if write_buffer:
+            await buffer_remote.promise(result_checksum)
         await database_remote.set_transformation_result(tf_checksum, result_checksum)
     except Exception:
         # Best-effort; failures are swallowed to avoid task crashes.
@@ -266,6 +275,22 @@ def _fat_checksum_task(checksum_hex: str) -> Tuple[str, Buffer | None, str | Non
     try:
         checksum = Checksum(checksum_hex)
         buffer_obj = _run_on_worker_loop(lambda: _resolve_buffer_async(checksum))
+        return (
+            checksum.hex(),
+            buffer_obj if isinstance(buffer_obj, Buffer) else None,
+            None,
+        )
+    except Exception:
+        return checksum_hex, None, traceback.format_exc()
+
+
+def _fat_finger_checksum_task(
+    checksum_hex: str,
+) -> Tuple[str, Buffer | None, str | None]:
+    """Resolve or fingertip a checksum into a buffer on a worker."""
+    try:
+        checksum = Checksum(checksum_hex)
+        buffer_obj = _run_on_worker_loop(lambda: _fingertip_buffer_async(checksum))
         return (
             checksum.hex(),
             buffer_obj if isinstance(buffer_obj, Buffer) else None,
@@ -484,7 +509,7 @@ def _run_base(
             tf_checksum_obj = Checksum(tf_checksum_hex)
             _run_on_worker_loop(
                 lambda: _promise_and_write_result_async(
-                    tf_checksum_obj, result_checksum
+                    tf_checksum_obj, result_checksum, write_buffer=not scratch
                 )
             )
         except Exception:
@@ -507,6 +532,23 @@ def _run_fat(
     if result_checksum_hex is None:
         return None, None, "Result checksum unavailable"
     return _fat_checksum_task(result_checksum_hex)
+
+
+def _run_fat_finger(
+    base_result: Tuple[str | None, str | None, Buffer | None, str | None],
+) -> Tuple[str | None, Buffer | None, str | None]:
+    """Worker task that allows fingering inputs when buffers are missing."""
+    tf_checksum_hex, result_checksum_hex, result_buffer, exc = base_result
+    if exc:
+        return result_checksum_hex, result_buffer, exc
+    if result_buffer is not None:
+        return result_checksum_hex, result_buffer, None
+    if result_checksum_hex is None:
+        return None, None, "Result checksum unavailable"
+    checksum_hex, buffer_obj, err = _fat_checksum_task(result_checksum_hex)
+    if buffer_obj is not None and err is None:
+        return checksum_hex, buffer_obj, None
+    return _fat_finger_checksum_task(result_checksum_hex)
 
 
 def _run_thin(
@@ -533,6 +575,7 @@ class SeamlessDaskClient:
         self._client = client
         self._fat_future_ttl = fat_future_ttl
         self._fat_checksum_cache: dict[str, tuple[Future, float | None]] = {}
+        self._fat_finger_checksum_cache: dict[str, tuple[Future, float | None]] = {}
         self._transformation_cache: dict[
             str, tuple[TransformationFutures, float | None]
         ] = {}
@@ -588,6 +631,29 @@ class SeamlessDaskClient:
             priority=-1,
         )
         self._cache_fat_checksum_future(checksum_hex, future)
+        return future
+
+    def get_fat_finger_checksum_future(self, checksum: Checksum | str) -> Future:
+        """Return (or build) a fat-finger-checksum future for the checksum."""
+        self._prune_caches()
+        checksum_hex = (
+            checksum.hex() if isinstance(checksum, Checksum) else str(checksum)
+        )
+        self._ensure_promised(checksum_hex)
+        with self._cache_lock:
+            cached = self._fat_finger_checksum_cache.get(checksum_hex)
+        if cached is not None and not cached[0].cancelled():
+            self._touch_fat_finger_checksum_cache(checksum_hex, cached[0])
+            return cached[0]
+
+        future = self._client.submit(
+            _fat_finger_checksum_task,
+            checksum_hex,
+            pure=False,
+            key="fat_finger_checksum-" + checksum_hex,
+            priority=-1,
+        )
+        self._cache_fat_finger_checksum_future(checksum_hex, future)
         return future
 
     def get_transformation_futures(
@@ -725,6 +791,26 @@ class SeamlessDaskClient:
             self._store_transformation(tf_hex, futures)
         return futures.fat
 
+    def ensure_fat_finger_future(self, futures: TransformationFutures) -> Future:
+        """Create or return the fat-finger future for a transformation."""
+        if futures.fat is not None and not futures.fat.cancelled():
+            return futures.fat
+        tf_hex = futures.tf_checksum
+        resource_string = None  # TODO: extract from tf_dunder
+        fat_key = self._build_key("fat-finger", resource_string, tf_hex)
+        futures.fat = self._client.submit(
+            _run_fat_finger,
+            futures.base,
+            pure=False,
+            key=fat_key,
+            priority=-1,
+        )
+        if futures.result_checksum:
+            self._cache_fat_finger_checksum_future(futures.result_checksum, futures.fat)
+        if tf_hex:
+            self._store_transformation(tf_hex, futures)
+        return futures.fat
+
     # --- internals ------------------------------------------------------
     def _register_worker_plugin(
         self, worker_count: int, remote_clients: dict | None
@@ -844,6 +930,17 @@ class SeamlessDaskClient:
                 return
             self._fat_checksum_cache[checksum_hex] = (future, self._expiry())
 
+    def _touch_fat_finger_checksum_cache(
+        self, checksum_hex: str, future: Future
+    ) -> None:
+        if not future.done():
+            return
+        with self._cache_lock:
+            cached = self._fat_finger_checksum_cache.get(checksum_hex)
+            if cached is None or cached[0] is not future:
+                return
+            self._fat_finger_checksum_cache[checksum_hex] = (future, self._expiry())
+
     def _touch_transformation_cache(
         self, tf_checksum_hex: str, futures: TransformationFutures
     ) -> None:
@@ -866,6 +963,20 @@ class SeamlessDaskClient:
                     )
                 )
         self._touch_fat_checksum_cache(checksum_hex, future)
+
+    def _cache_fat_finger_checksum_future(
+        self, checksum_hex: str, future: Future
+    ) -> None:
+        with self._cache_lock:
+            cached = self._fat_finger_checksum_cache.get(checksum_hex)
+            if cached is None or cached[0] is not future:
+                self._fat_finger_checksum_cache[checksum_hex] = (future, None)
+                future.add_done_callback(
+                    lambda fut, checksum_hex=checksum_hex: self._touch_fat_finger_checksum_cache(
+                        checksum_hex, fut
+                    )
+                )
+        self._touch_fat_finger_checksum_cache(checksum_hex, future)
 
     def _cache_transformation_futures(
         self, tf_checksum_hex: str, futures: TransformationFutures
@@ -899,6 +1010,9 @@ class SeamlessDaskClient:
                 cached = self._fat_checksum_cache.get(futures.result_checksum)
                 if cached is not None and cached[0] is futures.fat:
                     self._fat_checksum_cache.pop(futures.result_checksum, None)
+                cached = self._fat_finger_checksum_cache.get(futures.result_checksum)
+                if cached is not None and cached[0] is futures.fat:
+                    self._fat_finger_checksum_cache.pop(futures.result_checksum, None)
 
         for future in (futures.base, futures.thin, futures.fat):
             if future is None:
@@ -924,6 +1038,12 @@ class SeamlessDaskClient:
                 if expiry is None or expiry >= now or not future.done():
                     continue
                 self._fat_checksum_cache.pop(key, None)
+                fat_release.append(future)
+            for key in list(self._fat_finger_checksum_cache.keys()):
+                future, expiry = self._fat_finger_checksum_cache[key]
+                if expiry is None or expiry >= now or not future.done():
+                    continue
+                self._fat_finger_checksum_cache.pop(key, None)
                 fat_release.append(future)
             for key in list(self._transformation_cache.keys()):
                 futures, expiry = self._transformation_cache[key]
@@ -974,7 +1094,13 @@ class SeamlessDaskClient:
         if result_checksum_hex:
             futures.result_checksum = result_checksum_hex
             if futures.fat is not None:
-                self._cache_fat_checksum_future(result_checksum_hex, futures.fat)
+                fat_key = getattr(futures.fat, "key", "") or ""
+                if fat_key.startswith("fat-finger-"):
+                    self._cache_fat_finger_checksum_future(
+                        result_checksum_hex, futures.fat
+                    )
+                else:
+                    self._cache_fat_checksum_future(result_checksum_hex, futures.fat)
 
 
 __all__ = ["SeamlessDaskClient", "_fat_checksum_task"]

@@ -31,6 +31,7 @@ class TransformationSubmission:
     scratch: bool
     meta: MutableMapping[str, Any] = field(default_factory=dict)
     require_value: bool = False
+    allow_input_fingertip: bool = False
 
 
 @dataclass
