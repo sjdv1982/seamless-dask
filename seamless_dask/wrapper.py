@@ -369,6 +369,7 @@ _WAITING_AWARE_ADAPTIVE: Any | None = None
 _SCHEDULER_ACTIVITY_LOCK = threading.Lock()
 _LAST_SCHEDULER_ACTIVITY: Dict[str, Any] | None = None
 _ADAPTIVE_BASE_WEIGHT: float | None = None
+_ADAPTIVE_EXCLUSIVE: bool = False
 
 
 def _record_scheduler_activity(activity: Any) -> None:
@@ -408,13 +409,6 @@ def _make_waiting_aware_adaptive():
             except Exception:
                 base_target_int = 0
 
-            target_duration = _get_attr_value(
-                self, "target_duration", "_target_duration"
-            )
-            target_seconds = _duration_seconds(target_duration)
-            if not target_seconds or target_seconds <= 0:
-                return base_target_int
-
             activity = _get_cached_activity()
             if activity is None:
                 return base_target_int
@@ -422,6 +416,46 @@ def _make_waiting_aware_adaptive():
             counts = activity.get("task_state_counts") or {}
             if not hasattr(counts, "get"):
                 counts = {}
+
+            if _ADAPTIVE_EXCLUSIVE:
+                # Exclusive mode: 1 worker per task (waiting + processing).
+                waiting_ex = 0
+                for state in ("waiting", "queued", "no-worker"):
+                    try:
+                        waiting_ex += int(counts.get(state, 0) or 0)
+                    except Exception:
+                        pass
+                try:
+                    processing_ex = int(counts.get("processing", 0) or 0)
+                except Exception:
+                    processing_ex = 0
+                target_ex = waiting_ex + processing_ex
+                minimum = _get_attr_value(self, "minimum", "_minimum")
+                maximum = _get_attr_value(self, "maximum", "_maximum")
+                if minimum is not None:
+                    try:
+                        target_ex = max(target_ex, int(minimum))
+                    except Exception:
+                        pass
+                if maximum is not None:
+                    try:
+                        target_ex = min(target_ex, int(maximum))
+                    except Exception:
+                        pass
+                log_print(
+                    "[seamless-dask-wrapper] Adaptive (exclusive):",
+                    f"waiting={waiting_ex}",
+                    f"processing={processing_ex}",
+                    f"target={target_ex}",
+                )
+                return target_ex
+
+            target_duration = _get_attr_value(
+                self, "target_duration", "_target_duration"
+            )
+            target_seconds = _duration_seconds(target_duration)
+            if not target_seconds or target_seconds <= 0:
+                return base_target_int
             waiting = 0
             waiting_counts: Dict[str, int] = {}
             for state in ("waiting", "queued", "no-worker"):
@@ -824,6 +858,7 @@ class WrapperConfig:
     maximum_jobs: int
     memory_per_core_property_name: Optional[str]
     pure_dask: bool
+    exclusive: bool
 
 
 def build_wrapper_configuration(
@@ -840,28 +875,40 @@ def build_wrapper_configuration(
     walltime = parameters.get("walltime")
     if walltime is None:
         raise RuntimeError("Missing required parameter 'walltime'")
+    exclusive = parse_bool(parameters.get("exclusive", False), "exclusive")
     cores = parameters.get("cores")
-    if cores is None:
-        raise RuntimeError("Missing required parameter 'cores'")
     job_cores = parameters.get("job_cores")
+    if exclusive and job_cores is not None:
+        raise RuntimeError("Parameter 'job_cores' must not be set in exclusive mode")
     memory = parameters.get("memory")
     if memory is None:
         raise RuntimeError("Missing required parameter 'memory'")
 
-    try:
-        cores = int(cores)
-    except Exception:
-        raise RuntimeError("Parameter 'cores' must be an integer")
-    if cores <= 0:
-        raise RuntimeError("Parameter 'cores' must be positive")
-    if job_cores is None:
-        job_cores = cores
+    if cores is None:
+        if not exclusive:
+            raise RuntimeError("Missing required parameter 'cores'")
+        # Exclusive whole-node mode: Dask sees 1 core internally;
+        # the actual CPU count is discovered at runtime by the task.
+        cores = 1
+        job_cores = None  # not passed to jobqueue; scheduler's --exclusive handles it
+    else:
+        try:
+            cores = int(cores)
+        except Exception:
+            raise RuntimeError("Parameter 'cores' must be an integer")
+        if cores <= 0:
+            raise RuntimeError("Parameter 'cores' must be positive")
+        if exclusive:
+            job_cores = cores  # case 1: fixed cores per task
+        elif job_cores is None:
+            job_cores = cores
 
     tmpdir = parameters.get("tmpdir", DEFAULT_TMPDIR)
     partition = parameters.get("partition")
     job_extra_directives = ensure_list(
         parameters.get("job_extra_directives"), "job_extra_directives"
     )
+    resource_spec = parameters.get("resource_spec")
     project = parameters.get("project")
     memory_per_core_property_name = parameters.get("memory_per_core_property_name")
     user_job_script_prologue = ensure_list(
@@ -874,52 +921,58 @@ def build_wrapper_configuration(
     else:
         pure_dask = False
 
-    worker_processes_raw = parameters.get("processes")
-    if worker_processes_raw is None:
-        worker_processes = cores if pure_dask else 1
+    if exclusive:
+        # Exclusive mode: exactly 1 Dask worker process, 1 thread.
+        # The task itself manages parallelism (multiprocessing, OpenMP, etc.).
+        worker_processes = 1
+        worker_threads = 1
     else:
-        try:
-            worker_processes = int(worker_processes_raw)
-        except Exception:
-            raise RuntimeError("Parameter 'processes' must be an integer")
-        if worker_processes <= 0:
-            raise RuntimeError("Parameter 'processes' must be positive")
-
-    if pure_dask:
-        cores = job_cores
-
-    worker_threads_raw = parameters.get("worker_threads")
-    if worker_threads_raw is not None:
-        try:
-            worker_threads = int(worker_threads_raw)
-        except Exception:
-            raise RuntimeError("Parameter 'worker_threads' must be an integer")
-        if worker_threads <= 0:
-            raise RuntimeError("Parameter 'worker_threads' must be positive")
-    else:
-        if pure_dask:
-            worker_threads = 2
+        worker_processes_raw = parameters.get("processes")
+        if worker_processes_raw is None:
+            worker_processes = cores if pure_dask else 1
         else:
-            transformation_throttle = parameters.get(
-                "transformation_throttle", DEFAULT_TRANSFORMATION_THROTTLE
-            )
             try:
-                transformation_throttle = int(transformation_throttle)
+                worker_processes = int(worker_processes_raw)
             except Exception:
-                raise RuntimeError(
-                    "Parameter 'transformation_throttle' must be an integer"
-                )
-            if transformation_throttle <= 0:
-                raise RuntimeError(
-                    "Parameter 'transformation_throttle' must be positive"
-                )
+                raise RuntimeError("Parameter 'processes' must be an integer")
+            if worker_processes <= 0:
+                raise RuntimeError("Parameter 'processes' must be positive")
 
-            worker_threads = cores * transformation_throttle
-            env_exports.append(
-                format_bash_export(
-                    "SEAMLESS_WORKER_TRANSFORMATION_THROTTLE", transformation_throttle
+        if pure_dask:
+            cores = job_cores
+
+        worker_threads_raw = parameters.get("worker_threads")
+        if worker_threads_raw is not None:
+            try:
+                worker_threads = int(worker_threads_raw)
+            except Exception:
+                raise RuntimeError("Parameter 'worker_threads' must be an integer")
+            if worker_threads <= 0:
+                raise RuntimeError("Parameter 'worker_threads' must be positive")
+        else:
+            if pure_dask:
+                worker_threads = 2
+            else:
+                transformation_throttle = parameters.get(
+                    "transformation_throttle", DEFAULT_TRANSFORMATION_THROTTLE
                 )
-            )
+                try:
+                    transformation_throttle = int(transformation_throttle)
+                except Exception:
+                    raise RuntimeError(
+                        "Parameter 'transformation_throttle' must be an integer"
+                    )
+                if transformation_throttle <= 0:
+                    raise RuntimeError(
+                        "Parameter 'transformation_throttle' must be positive"
+                    )
+
+                worker_threads = cores * transformation_throttle
+                env_exports.append(
+                    format_bash_export(
+                        "SEAMLESS_WORKER_TRANSFORMATION_THROTTLE", transformation_throttle
+                    )
+                )
 
     unknown_task_duration = parameters.get(
         "unknown-task-duration", DEFAULT_UNKNOWN_TASK_DURATION
@@ -954,6 +1007,12 @@ def build_wrapper_configuration(
     dask_resources = parameters.get("dask-resources")
     if dask_resources is not None and not isinstance(dask_resources, Mapping):
         raise RuntimeError("Parameter 'dask-resources' must be a mapping if defined")
+    if exclusive:
+        if dask_resources is None:
+            dask_resources = {"S": "1.0"}
+        elif "S" not in dask_resources:
+            dask_resources = dict(dask_resources)
+            dask_resources["S"] = "1.0"
 
     extra_dask_config = parameters.get("extra_dask_config", {})
     if extra_dask_config is None:
@@ -1060,6 +1119,8 @@ def build_wrapper_configuration(
                 config["worker-extra-args"] = []
             worker_extra_args = config["worker-extra-args"]
             worker_extra_args += ["--name", worker_name]
+        elif system == "oar" and resource_spec is not None:
+            config["resource-spec"] = resource_spec
 
     if "interactive" in parameters:
         interactive = parse_bool(parameters.get("interactive"), "interactive")
@@ -1100,6 +1161,7 @@ def build_wrapper_configuration(
         maximum_jobs=maximum_jobs,
         memory_per_core_property_name=memory_per_core_property_name,
         pure_dask=pure_dask,
+        exclusive=exclusive,
     )
 
 
@@ -1735,7 +1797,9 @@ def main():
             minimum_jobs = int(wrapper_config.interactive)
             target_duration = parameters.get("target-duration", DEFAULT_TARGET_DURATION)
             base_weight = 1.0
-            if not wrapper_config.pure_dask:
+            global _ADAPTIVE_BASE_WEIGHT, _ADAPTIVE_EXCLUSIVE
+            _ADAPTIVE_EXCLUSIVE = wrapper_config.exclusive
+            if not wrapper_config.exclusive and not wrapper_config.pure_dask:
                 scale_factor = None
                 if wrapper_config.worker_resources is not None:
                     try:
@@ -1752,7 +1816,6 @@ def main():
                     target_duration = scale_target_duration(
                         target_duration, 1.0 / scale_factor
                     )
-            global _ADAPTIVE_BASE_WEIGHT
             _ADAPTIVE_BASE_WEIGHT = base_weight
             adaptive_settings = {
                 "minimum_jobs": minimum_jobs,
