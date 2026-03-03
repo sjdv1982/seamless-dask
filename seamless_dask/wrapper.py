@@ -975,10 +975,10 @@ def build_wrapper_configuration(
         raise RuntimeError("Parameter 'dask-resources' must be a mapping if defined")
     if exclusive:
         if dask_resources is None:
-            dask_resources = {"S": "1.0"}
+            dask_resources = {"S": 1.0}
         elif "S" not in dask_resources:
             dask_resources = dict(dask_resources)
-            dask_resources["S"] = "1.0"
+            dask_resources["S"] = 1.0
 
     extra_dask_config = parameters.get("extra_dask_config", {})
     if extra_dask_config is None:
