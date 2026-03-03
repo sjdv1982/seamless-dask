@@ -890,7 +890,7 @@ def build_wrapper_configuration(
         # Exclusive whole-node mode: Dask sees 1 core internally;
         # the actual CPU count is discovered at runtime by the task.
         cores = 1
-        job_cores = None  # not passed to jobqueue; scheduler's --exclusive handles it
+        job_cores = 1  # dask_jobqueue requires cores; --exclusive grants the full node
     else:
         try:
             cores = int(cores)
