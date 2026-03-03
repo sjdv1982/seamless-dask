@@ -369,7 +369,6 @@ _WAITING_AWARE_ADAPTIVE: Any | None = None
 _SCHEDULER_ACTIVITY_LOCK = threading.Lock()
 _LAST_SCHEDULER_ACTIVITY: Dict[str, Any] | None = None
 _ADAPTIVE_BASE_WEIGHT: float | None = None
-_ADAPTIVE_EXCLUSIVE: bool = False
 
 
 def _record_scheduler_activity(activity: Any) -> None:
@@ -416,39 +415,6 @@ def _make_waiting_aware_adaptive():
             counts = activity.get("task_state_counts") or {}
             if not hasattr(counts, "get"):
                 counts = {}
-
-            if _ADAPTIVE_EXCLUSIVE:
-                # Exclusive mode: 1 worker per task (waiting + processing).
-                waiting_ex = 0
-                for state in ("waiting", "queued", "no-worker"):
-                    try:
-                        waiting_ex += int(counts.get(state, 0) or 0)
-                    except Exception:
-                        pass
-                try:
-                    processing_ex = int(counts.get("processing", 0) or 0)
-                except Exception:
-                    processing_ex = 0
-                target_ex = waiting_ex + processing_ex
-                minimum = _get_attr_value(self, "minimum", "_minimum")
-                maximum = _get_attr_value(self, "maximum", "_maximum")
-                if minimum is not None:
-                    try:
-                        target_ex = max(target_ex, int(minimum))
-                    except Exception:
-                        pass
-                if maximum is not None:
-                    try:
-                        target_ex = min(target_ex, int(maximum))
-                    except Exception:
-                        pass
-                log_print(
-                    "[seamless-dask-wrapper] Adaptive (exclusive):",
-                    f"waiting={waiting_ex}",
-                    f"processing={processing_ex}",
-                    f"target={target_ex}",
-                )
-                return target_ex
 
             target_duration = _get_attr_value(
                 self, "target_duration", "_target_duration"
@@ -1320,6 +1286,15 @@ def _scheduler_activity(dask_scheduler, monitor_id: str):
     unknown_task_duration = _to_seconds(
         getattr(dask_scheduler, "unknown_task_duration", None)
     )
+
+    # Count tasks that need a worker — used by exclusive mode for direct scaling.
+    exclusive_target = sum(
+        1
+        for ts in dask_scheduler.tasks.values()
+        if getattr(ts, "state", None)
+        in ("waiting", "queued", "no-worker", "processing")
+    )
+
     return {
         "client_count": client_count,
         "worker_count": worker_count,
@@ -1330,6 +1305,7 @@ def _scheduler_activity(dask_scheduler, monitor_id: str):
         "task_prefixes": prefix_summary,
         "total_occupancy": total_occupancy,
         "unknown_task_duration": unknown_task_duration,
+        "exclusive_target": exclusive_target,
     }
 
 
@@ -1399,6 +1375,7 @@ def keep_cluster_alive(
     is_local: bool,
     target_workers: int,
     interactive: bool,
+    exclusive: bool = False,
     adaptive_settings: Optional[Mapping[str, Any]] = None,
     adaptive_log_interval: Optional[float] = None,
     use_waiting_aware_adaptive: bool = True,
@@ -1517,6 +1494,14 @@ def keep_cluster_alive(
                 activity_started_at = None
                 activity_last_update = now
                 _record_scheduler_activity(activity)
+                if exclusive and not is_local:
+                    ex_target = int(activity.get("exclusive_target", 0) or 0)
+                    ex_target = max(ex_target, int(interactive))
+                    ex_target = min(ex_target, target_workers)
+                    try:
+                        cluster.scale(ex_target)
+                    except Exception:
+                        pass
             elif activity_future is not None and activity_started_at is not None:
                 elapsed = now - activity_started_at
                 if elapsed >= SCHEDULER_ACTIVITY_TIMEOUT:
@@ -1793,45 +1778,53 @@ def main():
                 "adapt cluster:",
                 int(wrapper_config.interactive),
                 wrapper_config.maximum_jobs,
+                f"exclusive={wrapper_config.exclusive}",
             )
             minimum_jobs = int(wrapper_config.interactive)
-            target_duration = parameters.get("target-duration", DEFAULT_TARGET_DURATION)
-            base_weight = 1.0
-            global _ADAPTIVE_BASE_WEIGHT, _ADAPTIVE_EXCLUSIVE
-            _ADAPTIVE_EXCLUSIVE = wrapper_config.exclusive
-            if not wrapper_config.exclusive and not wrapper_config.pure_dask:
-                scale_factor = None
-                if wrapper_config.worker_resources is not None:
-                    try:
-                        scale_factor = float(
-                            wrapper_config.worker_resources.get("S")  # type: ignore[arg-type]
-                        )
-                    except Exception:
-                        scale_factor = None
-                    if scale_factor is not None and scale_factor <= 0:
-                        scale_factor = None
-                if scale_factor is None and wrapper_config.cores > 0:
-                    scale_factor = float(wrapper_config.cores)
-                if scale_factor:
-                    target_duration = scale_target_duration(
-                        target_duration, 1.0 / scale_factor
-                    )
-            _ADAPTIVE_BASE_WEIGHT = base_weight
-            adaptive_settings = {
-                "minimum_jobs": minimum_jobs,
-                "maximum_jobs": wrapper_config.maximum_jobs,
-                "target_duration": target_duration,
-                "wait_count": ADAPTIVE_WAIT_COUNT,
-                "interval": ADAPTIVE_INTERVAL,
-            }
-            adaptive_log_interval = _duration_seconds(ADAPTIVE_INTERVAL)
             if minimum_jobs:
                 cluster.scale(minimum_jobs)
-            _adapt_cluster(
-                cluster,
-                adaptive_settings,
-                use_waiting_aware=not wrapper_config.pure_dask,
-            )
+            if wrapper_config.exclusive:
+                # Exclusive mode: scaling is handled directly in keep_cluster_alive
+                # (N tasks = N workers). No adaptive class needed.
+                adaptive_settings = None
+                adaptive_log_interval = None
+            else:
+                target_duration = parameters.get(
+                    "target-duration", DEFAULT_TARGET_DURATION
+                )
+                base_weight = 1.0
+                global _ADAPTIVE_BASE_WEIGHT
+                if not wrapper_config.pure_dask:
+                    scale_factor = None
+                    if wrapper_config.worker_resources is not None:
+                        try:
+                            scale_factor = float(
+                                wrapper_config.worker_resources.get("S")  # type: ignore[arg-type]
+                            )
+                        except Exception:
+                            scale_factor = None
+                        if scale_factor is not None and scale_factor <= 0:
+                            scale_factor = None
+                    if scale_factor is None and wrapper_config.cores > 0:
+                        scale_factor = float(wrapper_config.cores)
+                    if scale_factor:
+                        target_duration = scale_target_duration(
+                            target_duration, 1.0 / scale_factor
+                        )
+                _ADAPTIVE_BASE_WEIGHT = base_weight
+                adaptive_settings = {
+                    "minimum_jobs": minimum_jobs,
+                    "maximum_jobs": wrapper_config.maximum_jobs,
+                    "target_duration": target_duration,
+                    "wait_count": ADAPTIVE_WAIT_COUNT,
+                    "interval": ADAPTIVE_INTERVAL,
+                }
+                adaptive_log_interval = _duration_seconds(ADAPTIVE_INTERVAL)
+                _adapt_cluster(
+                    cluster,
+                    adaptive_settings,
+                    use_waiting_aware=not wrapper_config.pure_dask,
+                )
         else:
             adaptive_settings = None
             adaptive_log_interval = None
@@ -1880,6 +1873,7 @@ def main():
                 is_local=isinstance(cluster, LocalCluster),
                 target_workers=wrapper_config.maximum_jobs,
                 interactive=wrapper_config.interactive,
+                exclusive=wrapper_config.exclusive,
                 adaptive_settings=adaptive_settings,
                 adaptive_log_interval=adaptive_log_interval,
                 use_waiting_aware_adaptive=not wrapper_config.pure_dask,
