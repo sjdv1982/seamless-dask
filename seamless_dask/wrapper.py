@@ -1287,13 +1287,17 @@ def _scheduler_activity(dask_scheduler, monitor_id: str):
         getattr(dask_scheduler, "unknown_task_duration", None)
     )
 
-    # Count tasks that need a worker — used by exclusive mode for direct scaling.
-    exclusive_target = sum(
-        1
-        for ts in dask_scheduler.tasks.values()
-        if getattr(ts, "state", None)
-        in ("waiting", "queued", "no-worker", "processing")
-    )
+    # Count "base" tasks (actual transformations) that need a worker.
+    # Used by exclusive mode for direct scaling (1 worker per task).
+    # Excludes helper tasks (thin, fat, fat-finger, dummy, etc.).
+    exclusive_target = 0
+    for ts in dask_scheduler.tasks.values():
+        state = getattr(ts, "state", None)
+        if state not in ("waiting", "queued", "no-worker", "processing"):
+            continue
+        key = getattr(ts, "key", None)
+        if key is not None and str(key).startswith("base"):
+            exclusive_target += 1
 
     return {
         "client_count": client_count,
