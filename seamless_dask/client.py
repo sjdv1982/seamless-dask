@@ -596,11 +596,12 @@ class SeamlessDaskClient:
         )
 
         self._client.submit(_noop_42)
-        print("Wait for workers to connect...")
-        for _ in range(20):
-            if self._client.scheduler_info().get("workers"):
-                break
-            time.sleep(1)
+        if self._interactive:
+            print("Wait for workers to connect...")
+            for _ in range(20):
+                if self._client.scheduler_info().get("workers"):
+                    break
+                time.sleep(1)
 
         self._warn_if_no_workers()
         self._start_prune_thread()
