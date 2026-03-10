@@ -882,6 +882,9 @@ def build_wrapper_configuration(
     )
 
     env_exports: List[str] = []
+    env_exports.append(
+        format_bash_export("SEAMLESS_DASK_QUEUE_EXCLUSIVE", "1" if exclusive else "0")
+    )
     if "pure_dask" in parameters:
         pure_dask = parse_bool(parameters.get("pure_dask"), "pure_dask")
     else:

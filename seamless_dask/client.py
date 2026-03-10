@@ -36,6 +36,31 @@ dask.config.set({"distributed.scheduler.target-duration": "10m"})
 _SEAMLESS_DASK_CLIENT_LOCK = threading.Lock()
 _LOGGER = logging.getLogger(__name__)
 _BASE_DASK_PRIORITY = 10
+_ENSURE_RESULT_UPLOAD_ENV = "SEAMLESS_DASK_ENSURE_RESULT_UPLOAD"
+_QUEUE_EXCLUSIVE_ENV = "SEAMLESS_DASK_QUEUE_EXCLUSIVE"
+
+
+def _parse_bool_env(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off", ""}:
+        return False
+    return default
+
+
+def _should_ensure_result_upload() -> bool:
+    # Manual override has priority when explicitly set.
+    if _ENSURE_RESULT_UPLOAD_ENV in os.environ:
+        return _parse_bool_env(_ENSURE_RESULT_UPLOAD_ENV, default=False)
+    # Default policy: enforce on exclusive-queue workers only.
+    return _parse_bool_env(_QUEUE_EXCLUSIVE_ENV, default=False)
+
+
+_ENSURE_RESULT_UPLOAD = _should_ensure_result_upload()
 
 
 def _scheduler_has_task_key(dask_scheduler, key: str) -> bool:
@@ -256,14 +281,60 @@ async def _fetch_cached_result_async(
 async def _promise_and_write_result_async(
     tf_checksum: Checksum, result_checksum: Checksum, *, write_buffer: bool
 ) -> None:
-    """Persist a transformation result, optionally writing the buffer remotely."""
+    """Persist a transformation result after ensuring buffer availability."""
     try:
         from seamless_remote import buffer_remote, database_remote
     except Exception:
         return
+
+    async def _ensure_uploaded() -> bool:
+        # First wait for any in-flight background writer task for this checksum.
+        try:
+            from seamless.caching import buffer_writer
+        except Exception:
+            buffer_writer = None
+        if buffer_writer is not None:
+            try:
+                existing = await buffer_writer.await_existing_task(result_checksum)
+            except Exception:
+                existing = None
+            if existing is not None:
+                return bool(existing)
+
+        # Fallback: do a direct upload from local cache/content if available.
+        buffer_obj: Buffer | None = None
+        try:
+            from seamless.caching.buffer_cache import get_buffer_cache
+
+            buffer_obj = get_buffer_cache().get(result_checksum)
+        except Exception:
+            buffer_obj = None
+        if not isinstance(buffer_obj, Buffer):
+            try:
+                resolved = await result_checksum.resolution()
+            except Exception:
+                resolved = None
+            if isinstance(resolved, Buffer):
+                buffer_obj = resolved
+        if not isinstance(buffer_obj, Buffer):
+            return False
+        try:
+            wrote = await buffer_remote.write_buffer(result_checksum, buffer_obj)
+        except Exception:
+            return False
+        return bool(wrote)
+
     try:
         if write_buffer:
             await buffer_remote.promise(result_checksum)
+            if _ENSURE_RESULT_UPLOAD:
+                uploaded = await _ensure_uploaded()
+                if not uploaded:
+                    _LOGGER.warning(
+                        "[seamless-dask] result buffer upload failed checksum=%s",
+                        result_checksum.hex(),
+                    )
+                    return
         await database_remote.set_transformation_result(tf_checksum, result_checksum)
     except Exception:
         # Best-effort; failures are swallowed to avoid task crashes.
