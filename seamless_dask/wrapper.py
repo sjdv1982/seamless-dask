@@ -1078,6 +1078,15 @@ def build_wrapper_configuration(
             prologue.append("export PYTHON_CPU_COUNT=$SLURM_JOB_CPUS_PER_NODE")
             if exclusive:
                 prologue.append("export SLURM_CPUS_PER_TASK=$SLURM_JOB_CPUS_PER_NODE")
+                # The nanny sets OMP/MKL/OPENBLAS_NUM_THREADS=nthreads (1) in the
+                # worker subprocess.  Override via distributed.nanny.environ so the
+                # task can use all node CPUs.
+                prologue.append(
+                    'export DASK_DISTRIBUTED__NANNY__ENVIRON='
+                    '"{\\"OMP_NUM_THREADS\\":\\"${SLURM_JOB_CPUS_PER_NODE}\\",'
+                    '\\"MKL_NUM_THREADS\\":\\"${SLURM_JOB_CPUS_PER_NODE}\\",'
+                    '\\"OPENBLAS_NUM_THREADS\\":\\"${SLURM_JOB_CPUS_PER_NODE}\\"}"'
+                )
         config = deepcopy(dict(jobqueue_common))
         config["job-script-prologue"] = prologue
         jobqueue_config[system] = config
