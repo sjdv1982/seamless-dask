@@ -135,6 +135,28 @@ def _base_prefix_for_transformation(transformation_dict: Mapping[str, Any]) -> s
     return base_prefix
 
 
+def _output_celltype_from_transformation(
+    transformation_dict: Mapping[str, Any] | None,
+) -> str | None:
+    if not isinstance(transformation_dict, Mapping):
+        return None
+    output = transformation_dict.get("__output__")
+    if not isinstance(output, (list, tuple)) or len(output) < 2:
+        return None
+    try:
+        if len(output) == 3:
+            _output_name, output_celltype, _subcelltype = output
+        else:
+            _output_name, output_celltype, _subcelltype, hash_pattern = output[:4]
+            if hash_pattern == {"*": "#"}:
+                output_celltype = "deepcell"
+            elif hash_pattern == {"*": "##"}:
+                output_celltype = "deepfolder"
+    except Exception:
+        return None
+    return output_celltype if isinstance(output_celltype, str) else None
+
+
 def _parse_cache_prune_interval() -> float:
     raw = os.environ.get("SEAMLESS_DASK_CACHE_PRUNE_INTERVAL", "10")
     try:
@@ -279,7 +301,12 @@ async def _fetch_cached_result_async(
 
 
 async def _promise_and_write_result_async(
-    tf_checksum: Checksum, result_checksum: Checksum, *, write_buffer: bool
+    tf_checksum: Checksum,
+    result_checksum: Checksum,
+    *,
+    write_buffer: bool,
+    output_celltype: str | None = None,
+    result_buffer: Buffer | None = None,
 ) -> None:
     """Persist a transformation result after ensuring buffer availability."""
     try:
@@ -287,7 +314,9 @@ async def _promise_and_write_result_async(
     except Exception:
         return
 
-    async def _ensure_uploaded() -> bool:
+    async def _ensure_uploaded(
+        checksum: Checksum, *, preferred_buffer: Buffer | None = None
+    ) -> bool:
         # First wait for any in-flight background writer task for this checksum.
         try:
             from seamless.caching import buffer_writer
@@ -295,23 +324,24 @@ async def _promise_and_write_result_async(
             buffer_writer = None
         if buffer_writer is not None:
             try:
-                existing = await buffer_writer.await_existing_task(result_checksum)
+                existing = await buffer_writer.await_existing_task(checksum)
             except Exception:
                 existing = None
             if existing is not None:
                 return bool(existing)
 
         # Fallback: do a direct upload from local cache/content if available.
-        buffer_obj: Buffer | None = None
-        try:
-            from seamless.caching.buffer_cache import get_buffer_cache
-
-            buffer_obj = get_buffer_cache().get(result_checksum)
-        except Exception:
-            buffer_obj = None
+        buffer_obj: Buffer | None = preferred_buffer
         if not isinstance(buffer_obj, Buffer):
             try:
-                resolved = await result_checksum.resolution()
+                from seamless.caching.buffer_cache import get_buffer_cache
+
+                buffer_obj = get_buffer_cache().get(checksum)
+            except Exception:
+                buffer_obj = None
+        if not isinstance(buffer_obj, Buffer):
+            try:
+                resolved = await checksum.resolution()
             except Exception:
                 resolved = None
             if isinstance(resolved, Buffer):
@@ -319,22 +349,77 @@ async def _promise_and_write_result_async(
         if not isinstance(buffer_obj, Buffer):
             return False
         try:
-            wrote = await buffer_remote.write_buffer(result_checksum, buffer_obj)
+            wrote = await buffer_remote.write_buffer(checksum, buffer_obj)
         except Exception:
             return False
         return bool(wrote)
+
+    def _collect_deep_member_checksums(buffer_obj: Buffer) -> list[Checksum]:
+        try:
+            structure = buffer_obj.get_value("plain")
+        except Exception:
+            return []
+        seen: dict[str, Checksum] = {}
+
+        def _walk(value: Any) -> None:
+            if isinstance(value, dict):
+                for child in value.values():
+                    _walk(child)
+                return
+            if isinstance(value, list):
+                for child in value:
+                    _walk(child)
+                return
+            if not isinstance(value, str):
+                return
+            try:
+                checksum = Checksum(value)
+            except Exception:
+                return
+            if checksum:
+                seen[checksum.hex()] = checksum
+
+        _walk(structure)
+        return list(seen.values())
 
     try:
         if write_buffer:
             await buffer_remote.promise(result_checksum)
             if _ENSURE_RESULT_UPLOAD:
-                uploaded = await _ensure_uploaded()
+                root_buffer = result_buffer
+                uploaded = await _ensure_uploaded(
+                    result_checksum, preferred_buffer=root_buffer
+                )
                 if not uploaded:
                     _LOGGER.warning(
                         "[seamless-dask] result buffer upload failed checksum=%s",
                         result_checksum.hex(),
                     )
                     return
+                if output_celltype in {"deepcell", "deepfolder"}:
+                    if not isinstance(root_buffer, Buffer):
+                        try:
+                            resolved = await result_checksum.resolution()
+                        except Exception:
+                            resolved = None
+                        root_buffer = resolved if isinstance(resolved, Buffer) else None
+                    if isinstance(root_buffer, Buffer):
+                        member_checksums = _collect_deep_member_checksums(root_buffer)
+                        for member_checksum in member_checksums:
+                            if member_checksum == result_checksum:
+                                continue
+                            try:
+                                await buffer_remote.promise(member_checksum)
+                            except Exception:
+                                pass
+                            uploaded = await _ensure_uploaded(member_checksum)
+                            if not uploaded:
+                                _LOGGER.warning(
+                                    "[seamless-dask] deep member upload failed root=%s member=%s",
+                                    result_checksum.hex(),
+                                    member_checksum.hex(),
+                                )
+                                return
         await database_remote.set_transformation_result(tf_checksum, result_checksum)
     except Exception:
         # Best-effort; failures are swallowed to avoid task crashes.
@@ -578,9 +663,14 @@ def _run_base(
 
         try:
             tf_checksum_obj = Checksum(tf_checksum_hex)
+            output_celltype = _output_celltype_from_transformation(transformation_dict)
             _run_on_worker_loop(
                 lambda: _promise_and_write_result_async(
-                    tf_checksum_obj, result_checksum, write_buffer=not scratch
+                    tf_checksum_obj,
+                    result_checksum,
+                    write_buffer=not scratch,
+                    output_celltype=output_celltype,
+                    result_buffer=result_buffer,
                 )
             )
         except Exception:
