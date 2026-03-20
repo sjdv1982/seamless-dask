@@ -4,15 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "seamless-dask"
-version = "0.0.0"
+version = "0.1.0"
 description = "Dask integration layer for Seamless distributed transformations"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 license = "MIT"
 authors = [{name = "Sjoerd de Vries"}]
 dependencies = [
     "dask",
     "distributed",
+    "dask_jobqueue",
+    "bokeh>=3.1.0",
     "seamless-core",
     "seamless-config",
     "seamless-remote",
