@@ -15,7 +15,7 @@ dependencies:
       - frozendict
       - dask_jobqueue
       - -e .
-      - -e ./seamless-base
+      - -e ./seamless-core
       - -e ./seamless-transformer
       - -e ./seamless-config
       - -e ./seamless-remote

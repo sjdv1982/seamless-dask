@@ -1,6 +1,6 @@
-[submodule "seamless-base"]
-	path = seamless-base
-	url = https://github.com/sjdv1982/seamless-base
+[submodule "seamless-core"]
+	path = seamless-core
+	url = https://github.com/sjdv1982/seamless-core
 [submodule "seamless-transformer"]
 	path = seamless-transformer
 	url = https://github.com/sjdv1982/seamless-transformer

@@ -839,8 +839,6 @@ def build_wrapper_configuration(
         raise RuntimeError("Status file 'parameters' must be a JSON object")
 
     walltime = parameters.get("walltime")
-    if walltime is None:
-        raise RuntimeError("Missing required parameter 'walltime'")
     exclusive = parse_bool(parameters.get("exclusive", False), "exclusive")
     cores = parameters.get("cores")
     job_cores = parameters.get("job_cores")
@@ -939,7 +937,8 @@ def build_wrapper_configuration(
                 worker_threads = cores * transformation_throttle
                 env_exports.append(
                     format_bash_export(
-                        "SEAMLESS_WORKER_TRANSFORMATION_THROTTLE", transformation_throttle
+                        "SEAMLESS_WORKER_TRANSFORMATION_THROTTLE",
+                        transformation_throttle,
                     )
                 )
 
@@ -1085,7 +1084,7 @@ def build_wrapper_configuration(
                 # worker subprocess.  Override via distributed.nanny.environ so the
                 # task can use all node CPUs.
                 prologue.append(
-                    'export DASK_DISTRIBUTED__NANNY__ENVIRON='
+                    "export DASK_DISTRIBUTED__NANNY__ENVIRON="
                     '"{\\"OMP_NUM_THREADS\\":\\"${SLURM_JOB_CPUS_PER_NODE}\\",'
                     '\\"MKL_NUM_THREADS\\":\\"${SLURM_JOB_CPUS_PER_NODE}\\",'
                     '\\"OPENBLAS_NUM_THREADS\\":\\"${SLURM_JOB_CPUS_PER_NODE}\\"}"'
