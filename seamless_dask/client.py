@@ -10,6 +10,7 @@ import uuid
 import asyncio
 import sys
 import threading
+from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, Mapping, Optional, Tuple, Callable, Coroutine
 
 import dask.config
@@ -61,6 +62,12 @@ def _should_ensure_result_upload() -> bool:
 
 
 _ENSURE_RESULT_UPLOAD = _should_ensure_result_upload()
+
+
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace(
+        "+00:00", "Z"
+    )
 
 
 def _scheduler_has_task_key(dask_scheduler, key: str) -> bool:
@@ -307,12 +314,26 @@ async def _promise_and_write_result_async(
     write_buffer: bool,
     output_celltype: str | None = None,
     result_buffer: Buffer | None = None,
+    transformation_dict: Mapping[str, Any] | None = None,
+    tf_dunder: Mapping[str, Any] | None = None,
+    scratch: bool = False,
+    execution: str = "remote",
+    started_at: str | None = None,
+    finished_at: str | None = None,
+    wall_time_seconds: float | None = None,
+    cpu_user_seconds: float | None = None,
+    cpu_system_seconds: float | None = None,
 ) -> None:
     """Persist a transformation result after ensuring buffer availability."""
     try:
         from seamless_remote import buffer_remote, database_remote
     except Exception:
         return
+    try:
+        from seamless_config.select import get_record
+    except Exception:
+        def get_record():
+            return False
 
     async def _ensure_uploaded(
         checksum: Checksum, *, preferred_buffer: Buffer | None = None
@@ -421,6 +442,30 @@ async def _promise_and_write_result_async(
                                 )
                                 return
         await database_remote.set_transformation_result(tf_checksum, result_checksum)
+        if get_record():
+            try:
+                from seamless_transformer.transformation_cache import (
+                    build_execution_record,
+                )
+
+                record = build_execution_record(
+                    dict(transformation_dict or {}),
+                    tf_checksum=tf_checksum,
+                    result_checksum=result_checksum,
+                    tf_dunder=dict(tf_dunder or {}),
+                    execution=execution,
+                    started_at=started_at or _utcnow_iso(),
+                    finished_at=finished_at or _utcnow_iso(),
+                    wall_time_seconds=wall_time_seconds or 0.0,
+                    cpu_user_seconds=cpu_user_seconds or 0.0,
+                    cpu_system_seconds=cpu_system_seconds or 0.0,
+                )
+                record["execution_envelope"]["scratch"] = bool(scratch)
+                await database_remote.set_execution_record(
+                    tf_checksum, result_checksum, record
+                )
+            except Exception:
+                return
     except Exception:
         # Best-effort; failures are swallowed to avoid task crashes.
         return
@@ -529,6 +574,9 @@ def _run_base(
         owner_dask_priority = None
     tf_dunder = payload.get("tf_dunder", {}) or {}
     require_value = bool(payload.get("require_value", False))
+    started_at = _utcnow_iso()
+    wall_start = time.perf_counter()
+    cpu_start = os.times()
 
     try:
         for raw_spec in inputs:
@@ -664,6 +712,11 @@ def _run_base(
         try:
             tf_checksum_obj = Checksum(tf_checksum_hex)
             output_celltype = _output_celltype_from_transformation(transformation_dict)
+            finished_at = _utcnow_iso()
+            wall_time_seconds = round(time.perf_counter() - wall_start, 6)
+            cpu_end = os.times()
+            cpu_user_seconds = round(cpu_end.user - cpu_start.user, 6)
+            cpu_system_seconds = round(cpu_end.system - cpu_start.system, 6)
             _run_on_worker_loop(
                 lambda: _promise_and_write_result_async(
                     tf_checksum_obj,
@@ -671,6 +724,15 @@ def _run_base(
                     write_buffer=not scratch,
                     output_celltype=output_celltype,
                     result_buffer=result_buffer,
+                    transformation_dict=transformation_dict,
+                    tf_dunder=tf_dunder,
+                    scratch=scratch,
+                    execution="remote",
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    wall_time_seconds=wall_time_seconds,
+                    cpu_user_seconds=cpu_user_seconds,
+                    cpu_system_seconds=cpu_system_seconds,
                 )
             )
         except Exception:

@@ -77,24 +77,55 @@ class TransformationDaskMixin:
 
     def _remote_storage_error(self) -> str | None:
         try:
-            from seamless_config.select import get_execution
+            from seamless_config.select import get_execution, get_record
         except Exception:
             return None
-        if get_execution() != "remote":
+        execution = get_execution()
+        record_mode = bool(get_record())
+        if execution != "remote" and not record_mode:
             return None
         try:
             from seamless_remote import buffer_remote, database_remote
         except Exception:
-            return "Remote execution requires hashserver and database server"
-        if (
-            not buffer_remote.has_write_server()
-            or not database_remote.has_write_server()
+            if execution == "remote":
+                return "Remote execution requires hashserver and database server"
+            if record_mode:
+                return "Record mode requires an active database write server"
+            return None
+        try:
+            buffer_write_server = bool(
+                buffer_remote is not None and buffer_remote.has_write_server()
+            )
+        except Exception:
+            buffer_write_server = False
+        try:
+            database_write_server = bool(
+                database_remote is not None and database_remote.has_write_server()
+            )
+        except Exception:
+            database_write_server = False
+        if execution == "remote" and (
+            not buffer_write_server or not database_write_server
         ):
             _ensure_remote_clients_from_env()
-        if not buffer_remote.has_write_server():
+            try:
+                buffer_write_server = bool(
+                    buffer_remote is not None and buffer_remote.has_write_server()
+                )
+            except Exception:
+                buffer_write_server = False
+            try:
+                database_write_server = bool(
+                    database_remote is not None and database_remote.has_write_server()
+                )
+            except Exception:
+                database_write_server = False
+        if execution == "remote" and not buffer_write_server:
             return "Remote execution requires an active hashserver"
-        if not database_remote.has_write_server():
+        if execution == "remote" and not database_write_server:
             return "Remote execution requires an active database server"
+        if record_mode and not database_write_server:
+            return "Record mode requires an active database write server"
         return None
 
     def _compute_with_dask(self, require_value: bool) -> Checksum | None:
