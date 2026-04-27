@@ -264,6 +264,7 @@ def test_compiled_dask_record_writes_compilation_context(monkeypatch):
     tf_checksum = _make_checksum({"kind": "dask-compiled-record-test"})
     result_checksum = _make_checksum(17, "mixed")
     compilation_context = "f" * 64
+    compilation_time_seconds = 3.25
     validation_snapshot = "5" * 64
     job_contract_violations = ["ld_preload_outside_conda_prefix"]
     captured_snapshot_kwargs = {}
@@ -311,6 +312,13 @@ def test_compiled_dask_record_writes_compilation_context(monkeypatch):
             },
         ),
     )
+    monkeypatch.setattr(
+        transformation_cache,
+        "collect_compilation_runtime_metadata",
+        lambda *args, **kwargs: asyncio.sleep(
+            0, result={"compilation_time_seconds": compilation_time_seconds}
+        ),
+    )
 
     asyncio.run(
         dask_client._promise_and_write_result_async(
@@ -333,6 +341,7 @@ def test_compiled_dask_record_writes_compilation_context(monkeypatch):
     assert record["job_contract_violations"] == job_contract_violations
     assert record["contract_violations"] == job_contract_violations
     assert record["validation_snapshot"] == validation_snapshot
+    assert record["compilation_time_seconds"] == compilation_time_seconds
     assert captured_snapshot_kwargs["job_contract_violations"] == job_contract_violations
     assert captured_snapshot_kwargs["job_validation_diagnostics"] == {
         "compiled": True,

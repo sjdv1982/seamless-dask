@@ -449,6 +449,7 @@ async def _promise_and_write_result_async(
                     build_compilation_context_checksum,
                     build_execution_record,
                     build_validation_snapshot_checksum,
+                    collect_compilation_runtime_metadata,
                     collect_job_validation,
                     compute_record_io_bytes,
                     load_bucket_contract_violations,
@@ -503,6 +504,12 @@ async def _promise_and_write_result_async(
                     record_runtime_metadata = {
                         "memory_peak_bytes": _memory_peak_bytes()
                     }
+                    record_runtime_metadata.update(
+                        await collect_compilation_runtime_metadata(
+                            dict(transformation_dict or {}),
+                            dict(tf_dunder or {}),
+                        )
+                    )
                     record = build_execution_record(
                         dict(transformation_dict or {}),
                         tf_checksum=tf_checksum,
