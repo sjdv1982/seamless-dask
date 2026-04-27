@@ -202,6 +202,9 @@ def test_promise_and_write_result_writes_execution_record(monkeypatch):
         "queue_node.contract",
     ]
     assert record["freshness"] == probe_context
+    assert record["input_total_bytes"] == 0
+    assert isinstance(record["output_total_bytes"], int)
+    assert record["output_total_bytes"] > 0
     assert record["execution_envelope"]["scratch"] is False
 
 
@@ -294,3 +297,6 @@ def test_compiled_dask_record_writes_compilation_context(monkeypatch):
 
     record = fake_database_remote.execution_records[0][2]
     assert record["compilation_context"] == compilation_context
+    assert record["input_total_bytes"] == 0
+    assert isinstance(record["output_total_bytes"], int)
+    assert record["output_total_bytes"] > 0
