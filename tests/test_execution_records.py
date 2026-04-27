@@ -157,6 +157,9 @@ def test_promise_and_write_result_writes_execution_record(monkeypatch):
     monkeypatch.setattr(transformation_cache, "get_node", lambda: None)
     monkeypatch.setattr(transformation_cache, "_memory_peak_bytes", lambda: 987654)
     monkeypatch.setattr(
+        transformation_cache, "_process_create_time_epoch", lambda: 2468.0
+    )
+    monkeypatch.setattr(
         probe_index,
         "ensure_record_bucket_preconditions",
         lambda *args, **kwargs: asyncio.sleep(0, result=probe_context),
@@ -213,6 +216,7 @@ def test_promise_and_write_result_writes_execution_record(monkeypatch):
     assert record["validation_snapshot"] == validation_snapshot
     assert record["memory_peak_bytes"] == 987654
     assert record["gpu_memory_peak_bytes"] == 333222111
+    assert record["process_create_time_epoch"] == 2468.0
     assert record["input_total_bytes"] == 0
     assert isinstance(record["output_total_bytes"], int)
     assert record["output_total_bytes"] > 0
@@ -267,6 +271,7 @@ def test_compiled_dask_record_writes_compilation_context(monkeypatch):
     result_checksum = _make_checksum(17, "mixed")
     compilation_context = "f" * 64
     compilation_time_seconds = 3.25
+    process_create_time_epoch = 1357.0
     validation_snapshot = "5" * 64
     job_contract_violations = ["ld_preload_outside_conda_prefix"]
     captured_snapshot_kwargs = {}
@@ -321,6 +326,11 @@ def test_compiled_dask_record_writes_compilation_context(monkeypatch):
             0, result={"compilation_time_seconds": compilation_time_seconds}
         ),
     )
+    monkeypatch.setattr(
+        transformation_cache,
+        "_process_create_time_epoch",
+        lambda: process_create_time_epoch,
+    )
 
     asyncio.run(
         dask_client._promise_and_write_result_async(
@@ -344,11 +354,15 @@ def test_compiled_dask_record_writes_compilation_context(monkeypatch):
     assert record["contract_violations"] == job_contract_violations
     assert record["validation_snapshot"] == validation_snapshot
     assert record["compilation_time_seconds"] == compilation_time_seconds
+    assert record["process_create_time_epoch"] == process_create_time_epoch
     assert captured_snapshot_kwargs["job_contract_violations"] == job_contract_violations
     assert captured_snapshot_kwargs["job_validation_diagnostics"] == {
         "compiled": True,
         "origin": "dask-worker",
     }
+    assert captured_snapshot_kwargs["runtime_metadata"]["process_create_time_epoch"] == (
+        process_create_time_epoch
+    )
     assert record["input_total_bytes"] == 0
     assert isinstance(record["output_total_bytes"], int)
     assert record["output_total_bytes"] > 0

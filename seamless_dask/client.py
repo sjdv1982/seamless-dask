@@ -447,6 +447,7 @@ async def _promise_and_write_result_async(
             try:
                 from seamless_transformer.transformation_cache import (
                     _memory_peak_bytes,
+                    _process_create_time_epoch,
                     build_compilation_context_checksum,
                     build_execution_record,
                     build_validation_snapshot_checksum,
@@ -492,18 +493,9 @@ async def _promise_and_write_result_async(
                             dict(transformation_dict or {}), result_checksum
                         )
                     )
-                    validation_snapshot = await build_validation_snapshot_checksum(
-                        dict(transformation_dict or {}),
-                        dict(tf_dunder or {}),
-                        execution=execution,
-                        probe_context=probe_context,
-                        compilation_context=compilation_context,
-                        bucket_contract_violations=bucket_contract_violations,
-                        job_contract_violations=job_contract_violations,
-                        job_validation_diagnostics=job_validation["diagnostics"],
-                    )
                     record_runtime_metadata = {
-                        "memory_peak_bytes": _memory_peak_bytes()
+                        "memory_peak_bytes": _memory_peak_bytes(),
+                        "process_create_time_epoch": _process_create_time_epoch(),
                     }
                     if gpu_memory_peak_bytes is not None:
                         record_runtime_metadata["gpu_memory_peak_bytes"] = (
@@ -514,6 +506,17 @@ async def _promise_and_write_result_async(
                             dict(transformation_dict or {}),
                             dict(tf_dunder or {}),
                         )
+                    )
+                    validation_snapshot = await build_validation_snapshot_checksum(
+                        dict(transformation_dict or {}),
+                        dict(tf_dunder or {}),
+                        execution=execution,
+                        probe_context=probe_context,
+                        compilation_context=compilation_context,
+                        bucket_contract_violations=bucket_contract_violations,
+                        job_contract_violations=job_contract_violations,
+                        job_validation_diagnostics=job_validation["diagnostics"],
+                        runtime_metadata=record_runtime_metadata,
                     )
                     record = build_execution_record(
                         dict(transformation_dict or {}),
