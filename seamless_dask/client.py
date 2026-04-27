@@ -483,6 +483,7 @@ async def _promise_and_write_result_async(
                             dict(transformation_dict or {}),
                             dict(tf_dunder or {}),
                             compilation_context=compilation_context,
+                            probe_context=probe_context,
                         )
                     )
                     job_contract_violations = job_validation[
