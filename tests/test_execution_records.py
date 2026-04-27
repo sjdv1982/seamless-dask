@@ -73,21 +73,51 @@ def test_promise_and_write_result_writes_execution_record(monkeypatch):
     fake_buffer_remote = _FakeBufferRemote()
     tf_checksum = _make_checksum({"kind": "dask-record-test"})
     result_checksum = _make_checksum(7, "mixed")
+    node_checksum = _make_checksum(
+        {
+            "bucket_kind": "node",
+            "contract_violations": ["node.contract"],
+        }
+    )
+    environment_checksum = _make_checksum(
+        {
+            "bucket_kind": "environment",
+            "contract_violations": ["environment.contract"],
+        }
+    )
+    node_env_checksum = _make_checksum(
+        {
+            "bucket_kind": "node_env",
+            "contract_violations": ["node_env.contract"],
+        }
+    )
+    queue_checksum = _make_checksum(
+        {
+            "bucket_kind": "queue",
+            "contract_violations": ["queue.contract"],
+        }
+    )
+    queue_node_checksum = _make_checksum(
+        {
+            "bucket_kind": "queue_node",
+            "contract_violations": ["queue_node.contract"],
+        }
+    )
     probe_context = {
         "required_bucket_labels": {
             "node": "worker-1",
             "environment": "conda:/envs/seamless1",
-            "node_env": "a" * 64 + ":" + "b" * 64,
-            "queue": "demo/gpu/daskserver",
-            "queue_node": "d" * 64 + ":worker-1",
-        },
-        "required_bucket_checksums": {
-            "node": "a" * 64,
-            "environment": "b" * 64,
-            "node_env": "c" * 64,
-            "queue": "d" * 64,
-            "queue_node": "e" * 64,
-        },
+                "node_env": node_checksum.hex() + ":" + environment_checksum.hex(),
+                "queue": "demo/gpu/daskserver",
+                "queue_node": queue_checksum.hex() + ":worker-1",
+            },
+            "required_bucket_checksums": {
+                "node": node_checksum.hex(),
+                "environment": environment_checksum.hex(),
+                "node_env": node_env_checksum.hex(),
+                "queue": queue_checksum.hex(),
+                "queue_node": queue_node_checksum.hex(),
+            },
         "live_tokens": {
             "node": {"hostname": "worker-1", "boot_id": "boot-1"},
             "environment": {"sys_prefix": "/envs/seamless1"},
@@ -159,11 +189,18 @@ def test_promise_and_write_result_writes_execution_record(monkeypatch):
     assert record["result_checksum"] == result_checksum.hex()
     assert record["execution_mode"] == "remote"
     assert record["remote_target"] == "daskserver"
-    assert record["node"] == "a" * 64
-    assert record["environment"] == "b" * 64
-    assert record["node_env"] == "c" * 64
-    assert record["queue"] == "d" * 64
-    assert record["queue_node"] == "e" * 64
+    assert record["node"] == node_checksum.hex()
+    assert record["environment"] == environment_checksum.hex()
+    assert record["node_env"] == node_env_checksum.hex()
+    assert record["queue"] == queue_checksum.hex()
+    assert record["queue_node"] == queue_node_checksum.hex()
+    assert record["bucket_contract_violations"] == [
+        "environment.contract",
+        "node.contract",
+        "node_env.contract",
+        "queue.contract",
+        "queue_node.contract",
+    ]
     assert record["freshness"] == probe_context
     assert record["execution_envelope"]["scratch"] is False
 

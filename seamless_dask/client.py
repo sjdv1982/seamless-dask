@@ -446,6 +446,7 @@ async def _promise_and_write_result_async(
             try:
                 from seamless_transformer.transformation_cache import (
                     build_execution_record,
+                    load_bucket_contract_violations,
                 )
                 from seamless_transformer.probe_index import (
                     ensure_record_bucket_preconditions,
@@ -461,6 +462,9 @@ async def _promise_and_write_result_async(
                         dict(tf_dunder or {}),
                         execution=execution,
                     )
+                    bucket_contract_violations = (
+                        await load_bucket_contract_violations(probe_context)
+                    )
                     record = build_execution_record(
                         dict(transformation_dict or {}),
                         tf_checksum=tf_checksum,
@@ -473,6 +477,7 @@ async def _promise_and_write_result_async(
                         cpu_user_seconds=cpu_user_seconds or 0.0,
                         cpu_system_seconds=cpu_system_seconds or 0.0,
                         probe_context=probe_context,
+                        bucket_contract_violations=bucket_contract_violations,
                     )
                     record["execution_envelope"]["scratch"] = bool(scratch)
                     await database_remote.set_execution_record(
