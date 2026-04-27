@@ -184,6 +184,7 @@ def test_promise_and_write_result_writes_execution_record(monkeypatch):
             wall_time_seconds=1.0,
             cpu_user_seconds=0.4,
             cpu_system_seconds=0.1,
+            gpu_memory_peak_bytes=333222111,
         )
     )
 
@@ -211,6 +212,7 @@ def test_promise_and_write_result_writes_execution_record(monkeypatch):
     assert record["freshness"] == probe_context
     assert record["validation_snapshot"] == validation_snapshot
     assert record["memory_peak_bytes"] == 987654
+    assert record["gpu_memory_peak_bytes"] == 333222111
     assert record["input_total_bytes"] == 0
     assert isinstance(record["output_total_bytes"], int)
     assert record["output_total_bytes"] > 0

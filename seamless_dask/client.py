@@ -323,6 +323,7 @@ async def _promise_and_write_result_async(
     wall_time_seconds: float | None = None,
     cpu_user_seconds: float | None = None,
     cpu_system_seconds: float | None = None,
+    gpu_memory_peak_bytes: int | None = None,
 ) -> None:
     """Persist a transformation result after ensuring buffer availability."""
     try:
@@ -504,6 +505,10 @@ async def _promise_and_write_result_async(
                     record_runtime_metadata = {
                         "memory_peak_bytes": _memory_peak_bytes()
                     }
+                    if gpu_memory_peak_bytes is not None:
+                        record_runtime_metadata["gpu_memory_peak_bytes"] = (
+                            gpu_memory_peak_bytes
+                        )
                     record_runtime_metadata.update(
                         await collect_compilation_runtime_metadata(
                             dict(transformation_dict or {}),
@@ -647,6 +652,7 @@ def _run_base(
     started_at = _utcnow_iso()
     wall_start = time.perf_counter()
     cpu_start = os.times()
+    gpu_memory_peak_bytes = None
 
     try:
         for raw_spec in inputs:
@@ -746,16 +752,25 @@ def _run_base(
             else:
                 return tf_checksum_hex, result_checksum_hex, None, None
 
-        result_checksum = _run_on_worker_loop(
-            lambda: transformer_worker.dispatch_to_workers(
-                transformation_dict,
-                tf_checksum=tf_checksum,
-                tf_dunder=tf_dunder,
-                scratch=scratch,
-                owner_dask_key=owner_dask_key,
-                owner_dask_priority=owner_dask_priority,
-            )
+        from seamless_transformer.transformation_cache import (
+            start_gpu_memory_sampler,
+            stop_gpu_memory_sampler,
         )
+
+        gpu_sampler = start_gpu_memory_sampler()
+        try:
+            result_checksum = _run_on_worker_loop(
+                lambda: transformer_worker.dispatch_to_workers(
+                    transformation_dict,
+                    tf_checksum=tf_checksum,
+                    tf_dunder=tf_dunder,
+                    scratch=scratch,
+                    owner_dask_key=owner_dask_key,
+                    owner_dask_priority=owner_dask_priority,
+                )
+            )
+        finally:
+            gpu_memory_peak_bytes = stop_gpu_memory_sampler(gpu_sampler)
         if isinstance(result_checksum, str):
             return tf_checksum_hex, None, None, result_checksum
         result_checksum = Checksum(result_checksum)
@@ -803,6 +818,7 @@ def _run_base(
                     wall_time_seconds=wall_time_seconds,
                     cpu_user_seconds=cpu_user_seconds,
                     cpu_system_seconds=cpu_system_seconds,
+                    gpu_memory_peak_bytes=gpu_memory_peak_bytes,
                 )
             )
         except Exception:
