@@ -445,6 +445,7 @@ async def _promise_and_write_result_async(
         if get_record():
             try:
                 from seamless_transformer.transformation_cache import (
+                    _memory_peak_bytes,
                     build_compilation_context_checksum,
                     build_execution_record,
                     build_validation_snapshot_checksum,
@@ -499,6 +500,9 @@ async def _promise_and_write_result_async(
                         job_contract_violations=job_contract_violations,
                         job_validation_diagnostics=job_validation["diagnostics"],
                     )
+                    record_runtime_metadata = {
+                        "memory_peak_bytes": _memory_peak_bytes()
+                    }
                     record = build_execution_record(
                         dict(transformation_dict or {}),
                         tf_checksum=tf_checksum,
@@ -515,6 +519,7 @@ async def _promise_and_write_result_async(
                         job_contract_violations=job_contract_violations,
                         compilation_context=compilation_context,
                         validation_snapshot=validation_snapshot,
+                        runtime_metadata=record_runtime_metadata,
                     )
                     record["input_total_bytes"] = input_total_bytes
                     record["output_total_bytes"] = output_total_bytes

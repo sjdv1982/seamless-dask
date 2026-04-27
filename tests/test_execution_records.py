@@ -155,6 +155,7 @@ def test_promise_and_write_result_writes_execution_record(monkeypatch):
     monkeypatch.setattr(transformation_cache, "get_selected_cluster", lambda: None)
     monkeypatch.setattr(transformation_cache, "get_queue", lambda cluster=None: None)
     monkeypatch.setattr(transformation_cache, "get_node", lambda: None)
+    monkeypatch.setattr(transformation_cache, "_memory_peak_bytes", lambda: 987654)
     monkeypatch.setattr(
         probe_index,
         "ensure_record_bucket_preconditions",
@@ -209,6 +210,7 @@ def test_promise_and_write_result_writes_execution_record(monkeypatch):
     ]
     assert record["freshness"] == probe_context
     assert record["validation_snapshot"] == validation_snapshot
+    assert record["memory_peak_bytes"] == 987654
     assert record["input_total_bytes"] == 0
     assert isinstance(record["output_total_bytes"], int)
     assert record["output_total_bytes"] > 0
