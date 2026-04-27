@@ -166,3 +166,44 @@ def test_promise_and_write_result_writes_execution_record(monkeypatch):
     assert record["queue_node"] == "e" * 64
     assert record["freshness"] == probe_context
     assert record["execution_envelope"]["scratch"] is False
+
+
+def test_probe_jobs_skip_execution_record_write(monkeypatch):
+    fake_database_remote = _FakeDatabaseRemote()
+    fake_buffer_remote = _FakeBufferRemote()
+    tf_checksum = _make_checksum({"kind": "dask-probe-skip"})
+    result_checksum = _make_checksum(11, "mixed")
+
+    async def _unexpected_probe_context(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("record probe should skip execution-record preflight")
+
+    monkeypatch.setattr(select, "get_record", lambda: True)
+    monkeypatch.setattr(seamless_remote, "database_remote", fake_database_remote)
+    monkeypatch.setattr(seamless_remote, "buffer_remote", fake_buffer_remote)
+    monkeypatch.setattr(dask_client, "_ENSURE_RESULT_UPLOAD", False)
+    monkeypatch.setattr(
+        probe_index,
+        "ensure_record_bucket_preconditions",
+        _unexpected_probe_context,
+    )
+
+    asyncio.run(
+        dask_client._promise_and_write_result_async(
+            tf_checksum,
+            result_checksum,
+            write_buffer=False,
+            transformation_dict={
+                "__language__": "python",
+                "__output__": ("result", "mixed", None),
+            },
+            tf_dunder={"__record_probe__": {"mode": "capture"}},
+            scratch=False,
+            execution="remote",
+        )
+    )
+
+    assert fake_database_remote.transformation_results == [
+        (tf_checksum.hex(), result_checksum.hex())
+    ]
+    assert fake_database_remote.execution_records == []

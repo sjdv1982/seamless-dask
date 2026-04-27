@@ -449,30 +449,35 @@ async def _promise_and_write_result_async(
                 )
                 from seamless_transformer.probe_index import (
                     ensure_record_bucket_preconditions,
+                    is_record_probe,
                 )
 
-                probe_context = await ensure_record_bucket_preconditions(
+                if not is_record_probe(
                     dict(transformation_dict or {}),
                     dict(tf_dunder or {}),
-                    execution=execution,
-                )
-                record = build_execution_record(
-                    dict(transformation_dict or {}),
-                    tf_checksum=tf_checksum,
-                    result_checksum=result_checksum,
-                    tf_dunder=dict(tf_dunder or {}),
-                    execution=execution,
-                    started_at=started_at or _utcnow_iso(),
-                    finished_at=finished_at or _utcnow_iso(),
-                    wall_time_seconds=wall_time_seconds or 0.0,
-                    cpu_user_seconds=cpu_user_seconds or 0.0,
-                    cpu_system_seconds=cpu_system_seconds or 0.0,
-                    probe_context=probe_context,
-                )
-                record["execution_envelope"]["scratch"] = bool(scratch)
-                await database_remote.set_execution_record(
-                    tf_checksum, result_checksum, record
-                )
+                ):
+                    probe_context = await ensure_record_bucket_preconditions(
+                        dict(transformation_dict or {}),
+                        dict(tf_dunder or {}),
+                        execution=execution,
+                    )
+                    record = build_execution_record(
+                        dict(transformation_dict or {}),
+                        tf_checksum=tf_checksum,
+                        result_checksum=result_checksum,
+                        tf_dunder=dict(tf_dunder or {}),
+                        execution=execution,
+                        started_at=started_at or _utcnow_iso(),
+                        finished_at=finished_at or _utcnow_iso(),
+                        wall_time_seconds=wall_time_seconds or 0.0,
+                        cpu_user_seconds=cpu_user_seconds or 0.0,
+                        cpu_system_seconds=cpu_system_seconds or 0.0,
+                        probe_context=probe_context,
+                    )
+                    record["execution_envelope"]["scratch"] = bool(scratch)
+                    await database_remote.set_execution_record(
+                        tf_checksum, result_checksum, record
+                    )
             except Exception:
                 return
     except Exception:
