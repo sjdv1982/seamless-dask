@@ -448,8 +448,10 @@ async def _promise_and_write_result_async(
                     build_compilation_context_checksum,
                     build_execution_record,
                     build_validation_snapshot_checksum,
+                    collect_job_validation,
                     compute_record_io_bytes,
                     load_bucket_contract_violations,
+                    _normalize_job_validation_payload,
                 )
                 from seamless_transformer.probe_index import (
                     ensure_record_bucket_preconditions,
@@ -472,6 +474,16 @@ async def _promise_and_write_result_async(
                         dict(transformation_dict or {}),
                         dict(tf_dunder or {}),
                     )
+                    job_validation = _normalize_job_validation_payload(
+                        await collect_job_validation(
+                            dict(transformation_dict or {}),
+                            dict(tf_dunder or {}),
+                            compilation_context=compilation_context,
+                        )
+                    )
+                    job_contract_violations = job_validation[
+                        "job_contract_violations"
+                    ]
                     input_total_bytes, output_total_bytes = (
                         await compute_record_io_bytes(
                             dict(transformation_dict or {}), result_checksum
@@ -484,7 +496,8 @@ async def _promise_and_write_result_async(
                         probe_context=probe_context,
                         compilation_context=compilation_context,
                         bucket_contract_violations=bucket_contract_violations,
-                        job_contract_violations=[],
+                        job_contract_violations=job_contract_violations,
+                        job_validation_diagnostics=job_validation["diagnostics"],
                     )
                     record = build_execution_record(
                         dict(transformation_dict or {}),
@@ -499,6 +512,7 @@ async def _promise_and_write_result_async(
                         cpu_system_seconds=cpu_system_seconds or 0.0,
                         probe_context=probe_context,
                         bucket_contract_violations=bucket_contract_violations,
+                        job_contract_violations=job_contract_violations,
                         compilation_context=compilation_context,
                         validation_snapshot=validation_snapshot,
                     )

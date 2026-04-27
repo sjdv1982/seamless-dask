@@ -263,6 +263,8 @@ def test_compiled_dask_record_writes_compilation_context(monkeypatch):
     result_checksum = _make_checksum(17, "mixed")
     compilation_context = "f" * 64
     validation_snapshot = "5" * 64
+    job_contract_violations = ["ld_preload_outside_conda_prefix"]
+    captured_snapshot_kwargs = {}
 
     monkeypatch.setattr(select, "get_record", lambda: True)
     monkeypatch.setattr(seamless_remote, "database_remote", fake_database_remote)
@@ -286,10 +288,26 @@ def test_compiled_dask_record_writes_compilation_context(monkeypatch):
         "build_compilation_context_checksum",
         lambda *args, **kwargs: asyncio.sleep(0, result=compilation_context),
     )
+    async def _fake_validation_snapshot(*args, **kwargs):
+        del args
+        captured_snapshot_kwargs.update(kwargs)
+        return validation_snapshot
+
     monkeypatch.setattr(
         transformation_cache,
         "build_validation_snapshot_checksum",
-        lambda *args, **kwargs: asyncio.sleep(0, result=validation_snapshot),
+        _fake_validation_snapshot,
+    )
+    monkeypatch.setattr(
+        transformation_cache,
+        "collect_job_validation",
+        lambda *args, **kwargs: asyncio.sleep(
+            0,
+            result={
+                "job_contract_violations": job_contract_violations,
+                "diagnostics": {"compiled": True, "origin": "dask-worker"},
+            },
+        ),
     )
 
     asyncio.run(
@@ -310,7 +328,14 @@ def test_compiled_dask_record_writes_compilation_context(monkeypatch):
 
     record = fake_database_remote.execution_records[0][2]
     assert record["compilation_context"] == compilation_context
+    assert record["job_contract_violations"] == job_contract_violations
+    assert record["contract_violations"] == job_contract_violations
     assert record["validation_snapshot"] == validation_snapshot
+    assert captured_snapshot_kwargs["job_contract_violations"] == job_contract_violations
+    assert captured_snapshot_kwargs["job_validation_diagnostics"] == {
+        "compiled": True,
+        "origin": "dask-worker",
+    }
     assert record["input_total_bytes"] == 0
     assert isinstance(record["output_total_bytes"], int)
     assert record["output_total_bytes"] > 0
