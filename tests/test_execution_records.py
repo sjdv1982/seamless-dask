@@ -145,6 +145,7 @@ def test_promise_and_write_result_writes_execution_record(monkeypatch):
             },
         },
     }
+    validation_snapshot = "6" * 64
 
     monkeypatch.setattr(select, "get_record", lambda: True)
     monkeypatch.setattr(seamless_remote, "database_remote", fake_database_remote)
@@ -158,6 +159,11 @@ def test_promise_and_write_result_writes_execution_record(monkeypatch):
         probe_index,
         "ensure_record_bucket_preconditions",
         lambda *args, **kwargs: asyncio.sleep(0, result=probe_context),
+    )
+    monkeypatch.setattr(
+        transformation_cache,
+        "build_validation_snapshot_checksum",
+        lambda *args, **kwargs: asyncio.sleep(0, result=validation_snapshot),
     )
 
     asyncio.run(
@@ -202,6 +208,7 @@ def test_promise_and_write_result_writes_execution_record(monkeypatch):
         "queue_node.contract",
     ]
     assert record["freshness"] == probe_context
+    assert record["validation_snapshot"] == validation_snapshot
     assert record["input_total_bytes"] == 0
     assert isinstance(record["output_total_bytes"], int)
     assert record["output_total_bytes"] > 0
@@ -255,6 +262,7 @@ def test_compiled_dask_record_writes_compilation_context(monkeypatch):
     tf_checksum = _make_checksum({"kind": "dask-compiled-record-test"})
     result_checksum = _make_checksum(17, "mixed")
     compilation_context = "f" * 64
+    validation_snapshot = "5" * 64
 
     monkeypatch.setattr(select, "get_record", lambda: True)
     monkeypatch.setattr(seamless_remote, "database_remote", fake_database_remote)
@@ -278,6 +286,11 @@ def test_compiled_dask_record_writes_compilation_context(monkeypatch):
         "build_compilation_context_checksum",
         lambda *args, **kwargs: asyncio.sleep(0, result=compilation_context),
     )
+    monkeypatch.setattr(
+        transformation_cache,
+        "build_validation_snapshot_checksum",
+        lambda *args, **kwargs: asyncio.sleep(0, result=validation_snapshot),
+    )
 
     asyncio.run(
         dask_client._promise_and_write_result_async(
@@ -297,6 +310,7 @@ def test_compiled_dask_record_writes_compilation_context(monkeypatch):
 
     record = fake_database_remote.execution_records[0][2]
     assert record["compilation_context"] == compilation_context
+    assert record["validation_snapshot"] == validation_snapshot
     assert record["input_total_bytes"] == 0
     assert isinstance(record["output_total_bytes"], int)
     assert record["output_total_bytes"] > 0
