@@ -7,6 +7,7 @@ import seamless_dask.client as dask_client
 from seamless_dask.transformation_mixin import TransformationDaskMixin
 import seamless_remote
 import seamless_transformer.probe_index as probe_index
+import seamless_transformer.record_assembly as record_assembly
 import seamless_transformer.transformation_cache as transformation_cache
 
 
@@ -155,6 +156,10 @@ def test_promise_and_write_result_writes_execution_record(monkeypatch):
     monkeypatch.setattr(transformation_cache, "get_selected_cluster", lambda: None)
     monkeypatch.setattr(transformation_cache, "get_queue", lambda cluster=None: None)
     monkeypatch.setattr(transformation_cache, "get_node", lambda: None)
+    monkeypatch.setattr(record_assembly, "get_remote", lambda: "daskserver")
+    monkeypatch.setattr(record_assembly, "get_selected_cluster", lambda: None)
+    monkeypatch.setattr(record_assembly, "get_queue", lambda cluster=None: None)
+    monkeypatch.setattr(record_assembly, "get_node", lambda: None)
     monkeypatch.setattr(transformation_cache, "_memory_peak_bytes", lambda: 987654)
     monkeypatch.setattr(
         transformation_cache, "_process_create_time_epoch", lambda: 2468.0
