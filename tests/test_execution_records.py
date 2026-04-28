@@ -10,6 +10,7 @@ from seamless_dask.transformation_mixin import TransformationDaskMixin
 import seamless_remote
 import seamless_transformer.probe_index as probe_index
 import seamless_transformer.record_assembly as record_assembly
+import seamless_transformer.record_runtime as record_runtime
 import seamless_transformer.transformation_cache as transformation_cache
 
 
@@ -71,7 +72,7 @@ def test_record_mode_requires_database_write_server(monkeypatch):
     dummy = _DummyMixin()
 
     monkeypatch.setattr(select, "get_execution", lambda: "process")
-    monkeypatch.setattr(select, "get_record", lambda: True)
+    monkeypatch.setattr(record_runtime, "get_record_mode", lambda: True)
     monkeypatch.setattr(seamless_remote, "buffer_remote", _FakeBufferRemote())
     monkeypatch.setattr(seamless_remote, "database_remote", None)
 
@@ -160,7 +161,7 @@ def test_promise_and_write_result_writes_execution_record(monkeypatch):
     }
     validation_snapshot = "6" * 64
 
-    monkeypatch.setattr(select, "get_record", lambda: True)
+    monkeypatch.setattr(dask_client, "get_record_mode", lambda: True)
     monkeypatch.setattr(seamless_remote, "database_remote", fake_database_remote)
     monkeypatch.setattr(seamless_remote, "buffer_remote", fake_buffer_remote)
     monkeypatch.setattr(dask_client, "_ENSURE_RESULT_UPLOAD", False)
@@ -250,7 +251,7 @@ def test_probe_jobs_skip_execution_record_write(monkeypatch):
         del args, kwargs
         raise AssertionError("record probe should skip execution-record preflight")
 
-    monkeypatch.setattr(select, "get_record", lambda: True)
+    monkeypatch.setattr(dask_client, "get_record_mode", lambda: True)
     monkeypatch.setattr(seamless_remote, "database_remote", fake_database_remote)
     monkeypatch.setattr(seamless_remote, "buffer_remote", fake_buffer_remote)
     monkeypatch.setattr(dask_client, "_ENSURE_RESULT_UPLOAD", False)
@@ -293,7 +294,7 @@ def test_compiled_dask_record_writes_compilation_context(monkeypatch):
     job_contract_violations = ["ld_preload_outside_conda_prefix"]
     captured_snapshot_kwargs = {}
 
-    monkeypatch.setattr(select, "get_record", lambda: True)
+    monkeypatch.setattr(dask_client, "get_record_mode", lambda: True)
     monkeypatch.setattr(seamless_remote, "database_remote", fake_database_remote)
     monkeypatch.setattr(seamless_remote, "buffer_remote", fake_buffer_remote)
     monkeypatch.setattr(dask_client, "_ENSURE_RESULT_UPLOAD", False)
@@ -393,7 +394,7 @@ def test_strict_record_write_failure_propagates(monkeypatch):
     tf_checksum = _make_checksum({"kind": "dask-strict-record-failure"})
     result_checksum = _make_checksum(19, "mixed")
 
-    monkeypatch.setattr(select, "get_record", lambda: True)
+    monkeypatch.setattr(dask_client, "get_record_mode", lambda: True)
     monkeypatch.setattr(seamless_remote, "database_remote", fake_database_remote)
     monkeypatch.setattr(seamless_remote, "buffer_remote", fake_buffer_remote)
     monkeypatch.setattr(dask_client, "_ENSURE_RESULT_UPLOAD", False)
@@ -490,16 +491,18 @@ def test_minimal_record_write_storage_failure_logs_and_continues(
     tf_checksum = _make_checksum({"kind": "dask-minimal-record-warning"})
     result_checksum = _make_checksum(23, "mixed")
 
-    monkeypatch.setattr(select, "get_record", lambda: False)
+    monkeypatch.setattr(dask_client, "get_record_mode", lambda: False)
     monkeypatch.setattr(seamless_remote, "database_remote", fake_database_remote)
     monkeypatch.setattr(seamless_remote, "buffer_remote", fake_buffer_remote)
     monkeypatch.setattr(dask_client, "_ENSURE_RESULT_UPLOAD", False)
+    async def _unexpected_probe_context(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("record: false should not probe")
+
     monkeypatch.setattr(
         probe_index,
         "ensure_record_bucket_preconditions",
-        lambda *args, **kwargs: asyncio.sleep(
-            0, result=AssertionError("record: false should not probe")
-        ),
+        _unexpected_probe_context,
     )
 
     with caplog.at_level("WARNING"):

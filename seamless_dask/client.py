@@ -18,6 +18,7 @@ from distributed import Client, Future
 from distributed.worker import get_worker
 
 from seamless import Buffer, Checksum, CacheMissError
+from seamless_transformer.record_runtime import get_record_mode
 from seamless_transformer.record_utils import _utcnow_iso
 from seamless_transformer import worker as transformer_worker
 from seamless_transformer.transformation_utils import tf_get_buffer
@@ -323,12 +324,6 @@ async def _promise_and_write_result_async(
         from seamless_remote import buffer_remote, database_remote
     except Exception:
         return
-    try:
-        from seamless_config.select import get_record
-    except Exception:
-        def get_record():
-            return False
-
     def _is_best_effort_record_exception(exc: BaseException) -> bool:
         return isinstance(
             exc,
@@ -467,7 +462,7 @@ async def _promise_and_write_result_async(
         is_record_probe,
     )
 
-    record_mode = bool(get_record())
+    record_mode = get_record_mode()
     transformation_payload = dict(transformation_dict or {})
     tf_dunder_payload = dict(tf_dunder or {})
     if is_record_probe(transformation_payload, tf_dunder_payload):

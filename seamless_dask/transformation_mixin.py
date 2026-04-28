@@ -77,11 +77,12 @@ class TransformationDaskMixin:
 
     def _remote_storage_error(self) -> str | None:
         try:
-            from seamless_config.select import get_execution, get_record
+            from seamless_config.select import get_execution
+            from seamless_transformer.record_runtime import get_record_mode
         except Exception:
             return None
         execution = get_execution()
-        record_mode = bool(get_record())
+        record_mode = get_record_mode()
         if execution != "remote" and not record_mode:
             return None
         try:
