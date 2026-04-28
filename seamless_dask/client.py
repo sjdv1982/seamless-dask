@@ -13,6 +13,7 @@ import threading
 from typing import Any, Dict, Iterable, Mapping, Optional, Tuple, Callable, Coroutine
 
 import dask.config
+from aiohttp import ClientConnectionError
 from distributed import Client, Future
 from distributed.worker import get_worker
 
@@ -316,7 +317,7 @@ async def _promise_and_write_result_async(
     cpu_user_seconds: float | None = None,
     cpu_system_seconds: float | None = None,
     gpu_memory_peak_bytes: int | None = None,
-) -> None:
+    ) -> None:
     """Persist a transformation result after ensuring buffer availability."""
     try:
         from seamless_remote import buffer_remote, database_remote
@@ -327,6 +328,18 @@ async def _promise_and_write_result_async(
     except Exception:
         def get_record():
             return False
+
+    def _is_best_effort_record_exception(exc: BaseException) -> bool:
+        return isinstance(
+            exc,
+            (
+                OSError,
+                ConnectionError,
+                TimeoutError,
+                asyncio.TimeoutError,
+                ClientConnectionError,
+            ),
+        )
 
     async def _ensure_uploaded(
         checksum: Checksum, *, preferred_buffer: Buffer | None = None
@@ -396,149 +409,166 @@ async def _promise_and_write_result_async(
         _walk(structure)
         return list(seen.values())
 
-    try:
-        if write_buffer:
-            await buffer_remote.promise(result_checksum)
-            if _ENSURE_RESULT_UPLOAD:
-                root_buffer = result_buffer
-                uploaded = await _ensure_uploaded(
-                    result_checksum, preferred_buffer=root_buffer
+    if write_buffer:
+        await buffer_remote.promise(result_checksum)
+        if _ENSURE_RESULT_UPLOAD:
+            root_buffer = result_buffer
+            uploaded = await _ensure_uploaded(
+                result_checksum, preferred_buffer=root_buffer
+            )
+            if not uploaded:
+                _LOGGER.warning(
+                    "[seamless-dask] result buffer upload failed checksum=%s",
+                    result_checksum.hex(),
                 )
-                if not uploaded:
-                    _LOGGER.warning(
-                        "[seamless-dask] result buffer upload failed checksum=%s",
-                        result_checksum.hex(),
-                    )
-                    return
-                if output_celltype in {"deepcell", "deepfolder"}:
-                    if not isinstance(root_buffer, Buffer):
-                        try:
-                            resolved = await result_checksum.resolution()
-                        except Exception:
-                            resolved = None
-                        root_buffer = resolved if isinstance(resolved, Buffer) else None
-                    if isinstance(root_buffer, Buffer):
-                        member_checksums = _collect_deep_member_checksums(root_buffer)
-                        for member_checksum in member_checksums:
-                            if member_checksum == result_checksum:
-                                continue
-                            try:
-                                await buffer_remote.promise(member_checksum)
-                            except Exception:
-                                pass
-                            uploaded = await _ensure_uploaded(member_checksum)
-                            if not uploaded:
-                                _LOGGER.warning(
-                                    "[seamless-dask] deep member upload failed root=%s member=%s",
-                                    result_checksum.hex(),
-                                    member_checksum.hex(),
-                                )
-                                return
-        await database_remote.set_transformation_result(tf_checksum, result_checksum)
-        if get_record():
-            try:
-                from seamless_transformer.transformation_cache import (
-                    _memory_peak_bytes,
-                    _process_create_time_epoch,
-                    build_compilation_context_checksum,
-                    build_execution_record,
-                    build_validation_snapshot_checksum,
-                    collect_compilation_runtime_metadata,
-                    collect_job_validation,
-                    compute_record_io_bytes,
-                    load_bucket_contract_violations,
-                    _normalize_job_validation_payload,
-                )
-                from seamless_transformer.probe_index import (
-                    ensure_record_bucket_preconditions,
-                    is_record_probe,
-                )
-
-                if not is_record_probe(
-                    dict(transformation_dict or {}),
-                    dict(tf_dunder or {}),
-                ):
-                    probe_context = await ensure_record_bucket_preconditions(
-                        dict(transformation_dict or {}),
-                        dict(tf_dunder or {}),
-                        execution=execution,
-                    )
-                    bucket_contract_violations = (
-                        await load_bucket_contract_violations(probe_context)
-                    )
-                    compilation_context = await build_compilation_context_checksum(
-                        dict(transformation_dict or {}),
-                        dict(tf_dunder or {}),
-                    )
-                    job_validation = _normalize_job_validation_payload(
-                        await collect_job_validation(
-                            dict(transformation_dict or {}),
-                            dict(tf_dunder or {}),
-                            compilation_context=compilation_context,
-                            probe_context=probe_context,
-                        )
-                    )
-                    job_contract_violations = job_validation[
-                        "job_contract_violations"
-                    ]
-                    input_total_bytes, output_total_bytes = (
-                        await compute_record_io_bytes(
-                            dict(transformation_dict or {}), result_checksum
-                        )
-                    )
-                    record_runtime_metadata = {
-                        "memory_peak_bytes": _memory_peak_bytes(),
-                        "process_create_time_epoch": _process_create_time_epoch(),
-                    }
-                    if gpu_memory_peak_bytes is not None:
-                        record_runtime_metadata["gpu_memory_peak_bytes"] = (
-                            gpu_memory_peak_bytes
-                        )
-                    record_runtime_metadata.update(
-                        await collect_compilation_runtime_metadata(
-                            dict(transformation_dict or {}),
-                            dict(tf_dunder or {}),
-                        )
-                    )
-                    validation_snapshot = await build_validation_snapshot_checksum(
-                        dict(transformation_dict or {}),
-                        dict(tf_dunder or {}),
-                        execution=execution,
-                        probe_context=probe_context,
-                        compilation_context=compilation_context,
-                        bucket_contract_violations=bucket_contract_violations,
-                        job_contract_violations=job_contract_violations,
-                        job_validation_diagnostics=job_validation["diagnostics"],
-                        runtime_metadata=record_runtime_metadata,
-                    )
-                    record = build_execution_record(
-                        dict(transformation_dict or {}),
-                        tf_checksum=tf_checksum,
-                        result_checksum=result_checksum,
-                        tf_dunder=dict(tf_dunder or {}),
-                        execution=execution,
-                        started_at=started_at or _utcnow_iso(),
-                        finished_at=finished_at or _utcnow_iso(),
-                        wall_time_seconds=wall_time_seconds or 0.0,
-                        cpu_user_seconds=cpu_user_seconds or 0.0,
-                        cpu_system_seconds=cpu_system_seconds or 0.0,
-                        probe_context=probe_context,
-                        bucket_contract_violations=bucket_contract_violations,
-                        job_contract_violations=job_contract_violations,
-                        compilation_context=compilation_context,
-                        validation_snapshot=validation_snapshot,
-                        runtime_metadata=record_runtime_metadata,
-                    )
-                    record["input_total_bytes"] = input_total_bytes
-                    record["output_total_bytes"] = output_total_bytes
-                    record["execution_envelope"]["scratch"] = bool(scratch)
-                    await database_remote.set_execution_record(
-                        tf_checksum, result_checksum, record
-                    )
-            except Exception:
                 return
-    except Exception:
-        # Best-effort; failures are swallowed to avoid task crashes.
+            if output_celltype in {"deepcell", "deepfolder"}:
+                if not isinstance(root_buffer, Buffer):
+                    try:
+                        resolved = await result_checksum.resolution()
+                    except Exception:
+                        resolved = None
+                    root_buffer = resolved if isinstance(resolved, Buffer) else None
+                if isinstance(root_buffer, Buffer):
+                    member_checksums = _collect_deep_member_checksums(root_buffer)
+                    for member_checksum in member_checksums:
+                        if member_checksum == result_checksum:
+                            continue
+                        try:
+                            await buffer_remote.promise(member_checksum)
+                        except Exception:
+                            pass
+                        uploaded = await _ensure_uploaded(member_checksum)
+                        if not uploaded:
+                            _LOGGER.warning(
+                                "[seamless-dask] deep member upload failed root=%s member=%s",
+                                result_checksum.hex(),
+                                member_checksum.hex(),
+                            )
+                            return
+    await database_remote.set_transformation_result(tf_checksum, result_checksum)
+
+    from seamless_transformer.transformation_cache import (
+        _memory_peak_bytes,
+        _process_create_time_epoch,
+        build_compilation_context_checksum,
+        build_execution_record,
+        build_minimal_execution_record,
+        build_validation_snapshot_checksum,
+        collect_compilation_runtime_metadata,
+        collect_job_validation,
+        compute_record_io_bytes,
+        load_bucket_contract_violations,
+        _normalize_job_validation_payload,
+    )
+    from seamless_transformer.probe_index import (
+        RecordBucketError,
+        ensure_record_bucket_preconditions,
+        is_record_probe,
+    )
+
+    record_mode = bool(get_record())
+    transformation_payload = dict(transformation_dict or {})
+    tf_dunder_payload = dict(tf_dunder or {})
+    if is_record_probe(transformation_payload, tf_dunder_payload):
+        return
+
+    record_runtime_metadata = {
+        "memory_peak_bytes": _memory_peak_bytes(),
+    }
+    if gpu_memory_peak_bytes is not None:
+        record_runtime_metadata["gpu_memory_peak_bytes"] = gpu_memory_peak_bytes
+
+    if record_mode:
+        probe_context = await ensure_record_bucket_preconditions(
+            transformation_payload,
+            tf_dunder_payload,
+            execution=execution,
+        )
+        bucket_contract_violations = await load_bucket_contract_violations(
+            probe_context
+        )
+        compilation_context = await build_compilation_context_checksum(
+            transformation_payload,
+            tf_dunder_payload,
+        )
+        job_validation = _normalize_job_validation_payload(
+            await collect_job_validation(
+                transformation_payload,
+                tf_dunder_payload,
+                compilation_context=compilation_context,
+                probe_context=probe_context,
+            )
+        )
+        job_contract_violations = job_validation["job_contract_violations"]
+        input_total_bytes, output_total_bytes = await compute_record_io_bytes(
+            transformation_payload, result_checksum
+        )
+        record_runtime_metadata["process_create_time_epoch"] = (
+            _process_create_time_epoch()
+        )
+        record_runtime_metadata.update(
+            await collect_compilation_runtime_metadata(
+                transformation_payload,
+                tf_dunder_payload,
+            )
+        )
+        validation_snapshot = await build_validation_snapshot_checksum(
+            transformation_payload,
+            tf_dunder_payload,
+            execution=execution,
+            probe_context=probe_context,
+            compilation_context=compilation_context,
+            bucket_contract_violations=bucket_contract_violations,
+            job_contract_violations=job_contract_violations,
+            job_validation_diagnostics=job_validation["diagnostics"],
+            runtime_metadata=record_runtime_metadata,
+        )
+        record = build_execution_record(
+            transformation_payload,
+            tf_checksum=tf_checksum,
+            result_checksum=result_checksum,
+            tf_dunder=tf_dunder_payload,
+            execution=execution,
+            started_at=started_at or _utcnow_iso(),
+            finished_at=finished_at or _utcnow_iso(),
+            wall_time_seconds=wall_time_seconds or 0.0,
+            cpu_user_seconds=cpu_user_seconds or 0.0,
+            cpu_system_seconds=cpu_system_seconds or 0.0,
+            probe_context=probe_context,
+            bucket_contract_violations=bucket_contract_violations,
+            job_contract_violations=job_contract_violations,
+            compilation_context=compilation_context,
+            validation_snapshot=validation_snapshot,
+            runtime_metadata=record_runtime_metadata,
+        )
+        record["input_total_bytes"] = input_total_bytes
+        record["output_total_bytes"] = output_total_bytes
+        record["execution_envelope"]["scratch"] = bool(scratch)
+        await database_remote.set_execution_record(tf_checksum, result_checksum, record)
+        return
+
+    record = build_minimal_execution_record(
+        tf_checksum=tf_checksum,
+        result_checksum=result_checksum,
+        execution=execution,
+        wall_time_seconds=wall_time_seconds or 0.0,
+        cpu_user_seconds=cpu_user_seconds or 0.0,
+        cpu_system_seconds=cpu_system_seconds or 0.0,
+        runtime_metadata=record_runtime_metadata,
+    )
+    try:
+        await database_remote.set_execution_record(tf_checksum, result_checksum, record)
+    except RecordBucketError:
+        raise
+    except Exception as exc:
+        if not _is_best_effort_record_exception(exc):
+            raise
+        _LOGGER.warning(
+            "[seamless-dask] best-effort minimal execution-record write failed checksum=%s error=%s",
+            tf_checksum.hex(),
+            exc,
+        )
         return
 
 
@@ -790,35 +820,32 @@ def _run_base(
                 "Result value unavailable",
             )
 
-        try:
-            tf_checksum_obj = Checksum(tf_checksum_hex)
-            output_celltype = _output_celltype_from_transformation(transformation_dict)
-            finished_at = _utcnow_iso()
-            wall_time_seconds = round(time.perf_counter() - wall_start, 6)
-            cpu_end = os.times()
-            cpu_user_seconds = round(cpu_end.user - cpu_start.user, 6)
-            cpu_system_seconds = round(cpu_end.system - cpu_start.system, 6)
-            _run_on_worker_loop(
-                lambda: _promise_and_write_result_async(
-                    tf_checksum_obj,
-                    result_checksum,
-                    write_buffer=not scratch,
-                    output_celltype=output_celltype,
-                    result_buffer=result_buffer,
-                    transformation_dict=transformation_dict,
-                    tf_dunder=tf_dunder,
-                    scratch=scratch,
-                    execution="remote",
-                    started_at=started_at,
-                    finished_at=finished_at,
-                    wall_time_seconds=wall_time_seconds,
-                    cpu_user_seconds=cpu_user_seconds,
-                    cpu_system_seconds=cpu_system_seconds,
-                    gpu_memory_peak_bytes=gpu_memory_peak_bytes,
-                )
+        tf_checksum_obj = Checksum(tf_checksum_hex)
+        output_celltype = _output_celltype_from_transformation(transformation_dict)
+        finished_at = _utcnow_iso()
+        wall_time_seconds = round(time.perf_counter() - wall_start, 6)
+        cpu_end = os.times()
+        cpu_user_seconds = round(cpu_end.user - cpu_start.user, 6)
+        cpu_system_seconds = round(cpu_end.system - cpu_start.system, 6)
+        _run_on_worker_loop(
+            lambda: _promise_and_write_result_async(
+                tf_checksum_obj,
+                result_checksum,
+                write_buffer=not scratch,
+                output_celltype=output_celltype,
+                result_buffer=result_buffer,
+                transformation_dict=transformation_dict,
+                tf_dunder=tf_dunder,
+                scratch=scratch,
+                execution="remote",
+                started_at=started_at,
+                finished_at=finished_at,
+                wall_time_seconds=wall_time_seconds,
+                cpu_user_seconds=cpu_user_seconds,
+                cpu_system_seconds=cpu_system_seconds,
+                gpu_memory_peak_bytes=gpu_memory_peak_bytes,
             )
-        except Exception:
-            pass
+        )
 
         return tf_checksum_hex, result_checksum_hex, result_buffer, None
     except Exception:

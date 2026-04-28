@@ -1,5 +1,7 @@
 import asyncio
 
+import pytest
+
 from seamless import Buffer, Checksum
 
 import seamless_config.select as select
@@ -41,6 +43,16 @@ class _FakeDatabaseRemote:
 
     def has_write_server(self):
         return self.write_server
+
+
+class _RaisingExecutionRecordDatabaseRemote(_FakeDatabaseRemote):
+    def __init__(self, exc):
+        super().__init__()
+        self.exc = exc
+
+    async def set_execution_record(self, tf_checksum, result_checksum, record):
+        del tf_checksum, result_checksum, record
+        raise self.exc
 
 
 class _DummyMixin(TransformationDaskMixin):
@@ -371,3 +383,142 @@ def test_compiled_dask_record_writes_compilation_context(monkeypatch):
     assert record["input_total_bytes"] == 0
     assert isinstance(record["output_total_bytes"], int)
     assert record["output_total_bytes"] > 0
+
+
+def test_strict_record_write_failure_propagates(monkeypatch):
+    fake_database_remote = _RaisingExecutionRecordDatabaseRemote(
+        ValueError("broken execution record")
+    )
+    fake_buffer_remote = _FakeBufferRemote()
+    tf_checksum = _make_checksum({"kind": "dask-strict-record-failure"})
+    result_checksum = _make_checksum(19, "mixed")
+
+    monkeypatch.setattr(select, "get_record", lambda: True)
+    monkeypatch.setattr(seamless_remote, "database_remote", fake_database_remote)
+    monkeypatch.setattr(seamless_remote, "buffer_remote", fake_buffer_remote)
+    monkeypatch.setattr(dask_client, "_ENSURE_RESULT_UPLOAD", False)
+    monkeypatch.setattr(
+        probe_index,
+        "ensure_record_bucket_preconditions",
+        lambda *args, **kwargs: asyncio.sleep(
+            0,
+            result={
+                "required_bucket_labels": {},
+                "required_bucket_checksums": {},
+                "live_tokens": {},
+                "bucket_tokens": {},
+            },
+        ),
+    )
+
+    with pytest.raises(ValueError, match="broken execution record"):
+        asyncio.run(
+            dask_client._promise_and_write_result_async(
+                tf_checksum,
+                result_checksum,
+                write_buffer=False,
+                transformation_dict={
+                    "__language__": "python",
+                    "__output__": ("result", "mixed", None),
+                },
+                tf_dunder={},
+                scratch=False,
+                execution="remote",
+            )
+        )
+
+
+def test_run_base_surfaces_record_persistence_failure(monkeypatch):
+    tf_checksum = _make_checksum({"kind": "dask-run-base-record-failure"})
+    result_checksum = _make_checksum(21, "mixed")
+    calls = {"count": 0}
+
+    def _fake_run_on_worker_loop(coro_factory):
+        del coro_factory
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return None
+        if calls["count"] == 2:
+            return result_checksum
+        if calls["count"] == 3:
+            return None
+        raise probe_index.RecordBucketError("missing bucket probe")
+
+    monkeypatch.setattr(dask_client, "_run_on_worker_loop", _fake_run_on_worker_loop)
+    monkeypatch.setattr(
+        transformation_cache, "start_gpu_memory_sampler", lambda pid=None: object()
+    )
+    monkeypatch.setattr(
+        transformation_cache, "stop_gpu_memory_sampler", lambda sampler: None
+    )
+    monkeypatch.setattr(
+        dask_client.transformer_worker,
+        "dispatch_to_workers",
+        lambda *args, **kwargs: asyncio.sleep(0, result=result_checksum),
+    )
+    import seamless_dask.transformer_client as transformer_client
+
+    monkeypatch.setattr(transformer_client, "get_seamless_dask_client", lambda: object())
+
+    result = dask_client._run_base(
+        {
+            "tf_checksum": tf_checksum.hex(),
+            "transformation_dict": {
+                "__language__": "python",
+                "__output__": ("result", "mixed", None),
+            },
+            "inputs": [],
+            "tf_dunder": {},
+            "scratch": False,
+            "require_value": False,
+        },
+        {},
+    )
+
+    assert result[0] == tf_checksum.hex()
+    assert result[1] is None
+    assert "missing bucket probe" in result[3]
+
+
+def test_minimal_record_write_storage_failure_logs_and_continues(
+    monkeypatch, caplog
+):
+    fake_database_remote = _RaisingExecutionRecordDatabaseRemote(
+        OSError("database temporarily unavailable")
+    )
+    fake_buffer_remote = _FakeBufferRemote()
+    tf_checksum = _make_checksum({"kind": "dask-minimal-record-warning"})
+    result_checksum = _make_checksum(23, "mixed")
+
+    monkeypatch.setattr(select, "get_record", lambda: False)
+    monkeypatch.setattr(seamless_remote, "database_remote", fake_database_remote)
+    monkeypatch.setattr(seamless_remote, "buffer_remote", fake_buffer_remote)
+    monkeypatch.setattr(dask_client, "_ENSURE_RESULT_UPLOAD", False)
+    monkeypatch.setattr(
+        probe_index,
+        "ensure_record_bucket_preconditions",
+        lambda *args, **kwargs: asyncio.sleep(
+            0, result=AssertionError("record: false should not probe")
+        ),
+    )
+
+    with caplog.at_level("WARNING"):
+        asyncio.run(
+            dask_client._promise_and_write_result_async(
+                tf_checksum,
+                result_checksum,
+                write_buffer=False,
+                transformation_dict={
+                    "__language__": "python",
+                    "__output__": ("result", "mixed", None),
+                },
+                tf_dunder={},
+                scratch=False,
+                execution="remote",
+            )
+        )
+
+    assert fake_database_remote.transformation_results == [
+        (tf_checksum.hex(), result_checksum.hex())
+    ]
+    assert "best-effort minimal execution-record write failed" in caplog.text
