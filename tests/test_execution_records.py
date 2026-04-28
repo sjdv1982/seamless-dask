@@ -282,6 +282,76 @@ def test_probe_jobs_skip_execution_record_write(monkeypatch):
     assert fake_database_remote.execution_records == []
 
 
+def test_promise_and_write_result_writes_minimal_record_when_record_mode_false(
+    monkeypatch,
+):
+    fake_database_remote = _FakeDatabaseRemote()
+    fake_buffer_remote = _FakeBufferRemote()
+    tf_checksum = _make_checksum({"kind": "dask-minimal-record-test"})
+    result_checksum = _make_checksum(13, "mixed")
+
+    async def _unexpected_probe_context(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("record: false should not probe execution-record buckets")
+
+    monkeypatch.setattr(dask_client, "get_record_mode", lambda: False)
+    monkeypatch.setattr(seamless_remote, "database_remote", fake_database_remote)
+    monkeypatch.setattr(seamless_remote, "buffer_remote", fake_buffer_remote)
+    monkeypatch.setattr(dask_client, "_ENSURE_RESULT_UPLOAD", False)
+    monkeypatch.setattr(
+        probe_index,
+        "ensure_record_bucket_preconditions",
+        _unexpected_probe_context,
+    )
+    monkeypatch.setattr(transformation_cache, "_memory_peak_bytes", lambda: 456789)
+    monkeypatch.setattr(record_assembly, "get_remote", lambda: "daskserver")
+    monkeypatch.setattr(record_assembly, "get_selected_cluster", lambda: None)
+    monkeypatch.setattr(record_assembly, "get_queue", lambda cluster=None: None)
+    monkeypatch.setattr(record_assembly, "get_node", lambda: None)
+
+    asyncio.run(
+        dask_client._promise_and_write_result_async(
+            tf_checksum,
+            result_checksum,
+            write_buffer=False,
+            transformation_dict={
+                "__language__": "python",
+                "__output__": ("result", "mixed", None),
+            },
+            tf_dunder={},
+            scratch=False,
+            execution="remote",
+            wall_time_seconds=1.25,
+            cpu_user_seconds=0.5,
+            cpu_system_seconds=0.2,
+            gpu_memory_peak_bytes=654321,
+        )
+    )
+
+    assert fake_database_remote.transformation_results == [
+        (tf_checksum.hex(), result_checksum.hex())
+    ]
+    assert len(fake_database_remote.execution_records) == 1
+    record = fake_database_remote.execution_records[0][2]
+    assert set(record) == {
+        "schema_version",
+        "tf_checksum",
+        "result_checksum",
+        "seamless_version",
+        "execution_mode",
+        "remote_target",
+        "wall_time_seconds",
+        "cpu_time_user_seconds",
+        "cpu_time_system_seconds",
+        "memory_peak_bytes",
+        "gpu_memory_peak_bytes",
+    }
+    assert record["execution_mode"] == "remote"
+    assert record["remote_target"] == "daskserver"
+    assert record["memory_peak_bytes"] == 456789
+    assert record["gpu_memory_peak_bytes"] == 654321
+
+
 def test_compiled_dask_record_writes_compilation_context(monkeypatch):
     fake_database_remote = _FakeDatabaseRemote()
     fake_buffer_remote = _FakeBufferRemote()
