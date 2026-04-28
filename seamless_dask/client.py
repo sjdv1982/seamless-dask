@@ -10,7 +10,6 @@ import uuid
 import asyncio
 import sys
 import threading
-from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, Mapping, Optional, Tuple, Callable, Coroutine
 
 import dask.config
@@ -18,6 +17,7 @@ from distributed import Client, Future
 from distributed.worker import get_worker
 
 from seamless import Buffer, Checksum, CacheMissError
+from seamless_transformer.record_utils import _utcnow_iso
 from seamless_transformer import worker as transformer_worker
 from seamless_transformer.transformation_utils import tf_get_buffer
 
@@ -62,14 +62,6 @@ def _should_ensure_result_upload() -> bool:
 
 
 _ENSURE_RESULT_UPLOAD = _should_ensure_result_upload()
-
-
-def _utcnow_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace(
-        "+00:00", "Z"
-    )
-
-
 def _scheduler_has_task_key(dask_scheduler, key: str) -> bool:
     try:
         return key in getattr(dask_scheduler, "tasks", {})
