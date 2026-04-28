@@ -145,14 +145,8 @@ def _output_celltype_from_transformation(
     if not isinstance(output, (list, tuple)) or len(output) < 2:
         return None
     try:
-        if len(output) == 3:
-            _output_name, output_celltype, _subcelltype = output
-        else:
-            _output_name, output_celltype, _subcelltype, hash_pattern = output[:4]
-            if hash_pattern == {"*": "#"}:
-                output_celltype = "deepcell"
-            elif hash_pattern == {"*": "##"}:
-                output_celltype = "deepfolder"
+        assert len(output) == 3, f"Expected 3-tuple __output__, got {len(output)}-tuple"
+        _output_name, output_celltype, _subcelltype = output
     except Exception:
         return None
     return output_celltype if isinstance(output_celltype, str) else None
