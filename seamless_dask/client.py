@@ -41,6 +41,7 @@ _LOGGER = logging.getLogger(__name__)
 _BASE_DASK_PRIORITY = 10
 _ENSURE_RESULT_UPLOAD_ENV = "SEAMLESS_DASK_ENSURE_RESULT_UPLOAD"
 _QUEUE_EXCLUSIVE_ENV = "SEAMLESS_DASK_QUEUE_EXCLUSIVE"
+_STARTUP_RECORD_MODE_ENV = "SEAMLESS_DASK_RECORD_MODE"
 
 
 def _parse_bool_env(name: str, default: bool = False) -> bool:
@@ -64,6 +65,22 @@ def _should_ensure_result_upload() -> bool:
 
 
 _ENSURE_RESULT_UPLOAD = _should_ensure_result_upload()
+
+
+def _startup_record_mode() -> bool:
+    return _parse_bool_env(_STARTUP_RECORD_MODE_ENV, default=False)
+
+
+def _record_mode_mismatch_error(request_record_mode: bool) -> str:
+    startup_record_mode = _startup_record_mode()
+    return (
+        "Dask server record mode mismatch: "
+        f"client requested record={request_record_mode}, "
+        f"but daskserver started with record={startup_record_mode}. "
+        "Restart the daskserver after changing record mode."
+    )
+
+
 def _scheduler_has_task_key(dask_scheduler, key: str) -> bool:
     try:
         return key in getattr(dask_scheduler, "tasks", {})
@@ -613,6 +630,13 @@ def _run_base(
         payload = dict(payload)
         payload["owner_dask_priority"] = priority_value
 
+    tf_checksum_hex = payload.get("tf_checksum")
+    request_record_mode = bool(payload.get("record", False))
+    if request_record_mode != _startup_record_mode():
+        return tf_checksum_hex, None, None, _record_mode_mismatch_error(
+            request_record_mode
+        )
+
     owner_dask_key = payload.get("owner_dask_key")
     if not isinstance(owner_dask_key, str) or not owner_dask_key:
         try:
@@ -650,7 +674,6 @@ def _run_base(
                 client = SeamlessDaskClient(dask_client)
                 set_seamless_dask_client(client)
 
-    tf_checksum_hex = payload.get("tf_checksum")
     tf_checksum_missing = tf_checksum_hex is None
     transformation_dict = dict(payload.get("transformation_dict") or {})
     inputs = payload.get("inputs") or []
@@ -1027,6 +1050,7 @@ class SeamlessDaskClient:
             "scratch": submission.scratch,
             "require_value": submission.require_value,
             "owner_dask_priority": base_priority,
+            "record": get_record_mode(),
         }
         input_futures = dict(submission.input_futures)
         resource_string = None  # TODO: get from tf_dunder

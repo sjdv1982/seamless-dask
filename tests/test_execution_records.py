@@ -1,4 +1,5 @@
 import asyncio
+import threading
 
 import pytest
 
@@ -6,7 +7,9 @@ from seamless import Buffer, Checksum
 
 import seamless_config.select as select
 import seamless_dask.client as dask_client
+from seamless_dask.wrapper import build_wrapper_configuration
 from seamless_dask.transformation_mixin import TransformationDaskMixin
+from seamless_dask.types import TransformationSubmission
 import seamless_remote
 import seamless_transformer.probe_index as probe_index
 import seamless_transformer.record_assembly as record_assembly
@@ -60,6 +63,15 @@ class _DummyMixin(TransformationDaskMixin):
     pass
 
 
+class _FakePreTransformation:
+    def __init__(self, transformation_dict):
+        self.transformation_dict = dict(transformation_dict)
+
+    def build_partial_transformation(self, upstream_dependencies):
+        assert upstream_dependencies == {}
+        return dict(self.transformation_dict), {}
+
+
 def _make_checksum(value, celltype="plain") -> Checksum:
     buf = Buffer(value, celltype)
     checksum = buf.get_checksum()
@@ -80,6 +92,166 @@ def test_record_mode_requires_database_write_server(monkeypatch):
         dummy._remote_storage_error()
         == "Record mode requires an active database write server"
     )
+
+
+def test_dask_record_mode_missing_probe_blocks_before_submit(monkeypatch):
+    dummy = _DummyMixin()
+    dummy._pretransformation = _FakePreTransformation(
+        {"__language__": "python", "__output__": ("result", "mixed", None)}
+    )
+    dummy._upstream_dependencies = {}
+    dummy._meta = {}
+    dummy._tf_dunder = {}
+    dummy._scratch = False
+    dummy._constructed = False
+    dummy._transformation_checksum = None
+    dummy._result_checksum = None
+    dummy._evaluated = False
+    dummy._exception = None
+    dummy._dask_futures = None
+
+    def _unexpected_submit(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("Dask submit should not happen before record probes exist")
+
+    monkeypatch.setattr(dummy, "_dask_client", lambda: object())
+    monkeypatch.setattr(dummy, "_remote_storage_error", lambda: None)
+    monkeypatch.setattr(dummy, "_compute_tf_checksum_no_deps", lambda: None)
+    monkeypatch.setattr(dummy, "_skip_permission_gate", lambda: True)
+    monkeypatch.setattr(dummy, "_ensure_dask_futures", _unexpected_submit)
+    monkeypatch.setattr(record_runtime, "get_record_mode", lambda: True)
+    monkeypatch.setattr(
+        probe_index,
+        "ensure_record_bucket_preconditions_sync",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            probe_index.RecordBucketError("missing bucket probe")
+        ),
+    )
+
+    with pytest.raises(probe_index.RecordBucketError, match="missing bucket probe"):
+        dummy._compute_with_dask(require_value=False)
+
+
+def test_dask_record_mode_cache_hit_bypasses_probe_preflight(monkeypatch):
+    dummy = _DummyMixin()
+    cached_checksum = _make_checksum(12, "mixed")
+    dummy._pretransformation = _FakePreTransformation(
+        {"__language__": "python", "__output__": ("result", "mixed", None)}
+    )
+    dummy._upstream_dependencies = {}
+    dummy._meta = {}
+    dummy._tf_dunder = {}
+    dummy._scratch = False
+    dummy._constructed = False
+    dummy._transformation_checksum = None
+    dummy._result_checksum = None
+    dummy._evaluated = False
+    dummy._exception = None
+    dummy._dask_futures = None
+
+    def _unexpected_probe(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("cache hits should not require record probes")
+
+    monkeypatch.setattr(dummy, "_dask_client", lambda: object())
+    monkeypatch.setattr(dummy, "_remote_storage_error", lambda: None)
+    monkeypatch.setattr(dummy, "_compute_tf_checksum_no_deps", lambda: "1" * 64)
+    monkeypatch.setattr(
+        dummy,
+        "_try_database_cache_sync",
+        lambda *args, **kwargs: cached_checksum,
+    )
+    monkeypatch.setattr(record_runtime, "get_record_mode", lambda: True)
+    monkeypatch.setattr(
+        probe_index,
+        "ensure_record_bucket_preconditions_sync",
+        _unexpected_probe,
+    )
+
+    assert dummy._compute_with_dask(require_value=False) == cached_checksum
+
+
+def test_submit_transformation_sends_record_mode(monkeypatch):
+    submitted = []
+
+    class _FakeFuture:
+        def cancelled(self):
+            return False
+
+        def add_done_callback(self, callback):
+            del callback
+
+    class _FakeDistributedClient:
+        def submit(self, func, *args, **kwargs):
+            submitted.append((func, args, kwargs))
+            return _FakeFuture()
+
+    client = dask_client.SeamlessDaskClient.__new__(dask_client.SeamlessDaskClient)
+    client._client = _FakeDistributedClient()
+    client._cache_lock = threading.RLock()
+    client._transformation_cache = {}
+    client._prune_caches = lambda: None
+    client._touch_transformation_cache = lambda *args, **kwargs: None
+
+    monkeypatch.setattr(dask_client, "get_record_mode", lambda: True)
+
+    client.submit_transformation(
+        TransformationSubmission(
+            transformation_dict={
+                "__language__": "python",
+                "__output__": ("result", "mixed", None),
+            },
+            inputs={},
+            input_futures={},
+            tf_checksum="1" * 64,
+            tf_dunder={},
+            scratch=False,
+        )
+    )
+
+    base_payload = submitted[0][1][0]
+    assert base_payload["record"] is True
+
+
+def test_run_base_rejects_record_mode_mismatch(monkeypatch):
+    tf_checksum = _make_checksum({"kind": "dask-record-mismatch"})
+
+    monkeypatch.setenv("SEAMLESS_DASK_RECORD_MODE", "1")
+    result = dask_client._run_base(
+        {
+            "tf_checksum": tf_checksum.hex(),
+            "transformation_dict": {
+                "__language__": "python",
+                "__output__": ("result", "mixed", None),
+            },
+            "inputs": [],
+            "tf_dunder": {},
+            "scratch": False,
+            "require_value": False,
+            "record": False,
+        },
+        {},
+    )
+
+    assert result[0] == tf_checksum.hex()
+    assert result[1] is None
+    assert "Dask server record mode mismatch" in result[3]
+
+
+def test_wrapper_configuration_exports_startup_record_mode():
+    config = build_wrapper_configuration(
+        host="127.0.0.1",
+        port_range=(20000, 29999),
+        parameters={
+            "walltime": "00:20:00",
+            "cores": 1,
+            "memory": "1GiB",
+            "record": True,
+        },
+    )
+
+    assert config.record is True
+    assert "export SEAMLESS_DASK_RECORD_MODE=1" in config.env_exports
 
 
 def test_promise_and_write_result_writes_execution_record(monkeypatch):

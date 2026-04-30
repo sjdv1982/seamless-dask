@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional, TYPE_CHECKING
 
 from seamless import Checksum, CacheMissError
 from seamless_transformer.transformation_utils import tf_get_buffer
+from seamless_transformer import probe_index, record_runtime
 
 from .permissions import release_permission, request_permission
 from .types import (
@@ -68,6 +69,54 @@ class TransformationDaskMixin:
     """Shared Dask helpers for seamless-transformer Transformation."""
 
     _dask_futures: TransformationFutures | None = None
+
+    def _record_bucket_preflight_transformation(
+        self,
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        if not record_runtime.get_record_mode():
+            return None
+        pretransformation = getattr(self, "_pretransformation", None)
+        if pretransformation is None:
+            return None
+        upstream_dependencies = getattr(self, "_upstream_dependencies", {}) or {}
+        transformation_dict, _dependencies = (
+            pretransformation.build_partial_transformation(upstream_dependencies)
+        )
+        meta = getattr(self, "_meta", {}) or {}
+        if meta:
+            existing_meta = transformation_dict.get("__meta__")
+            if isinstance(existing_meta, dict):
+                merged_meta = dict(existing_meta)
+                merged_meta.update(meta)
+            else:
+                merged_meta = dict(meta)
+            transformation_dict["__meta__"] = merged_meta
+        tf_dunder = getattr(self, "_tf_dunder", {}) or {}
+        if probe_index.is_record_probe(transformation_dict, tf_dunder):
+            return None
+        return transformation_dict, tf_dunder
+
+    def _ensure_record_bucket_preflight_sync(self) -> None:
+        payload = self._record_bucket_preflight_transformation()
+        if payload is None:
+            return
+        transformation_dict, tf_dunder = payload
+        probe_index.ensure_record_bucket_preconditions_sync(
+            transformation_dict,
+            tf_dunder,
+            execution="remote",
+        )
+
+    async def _ensure_record_bucket_preflight_async(self) -> None:
+        payload = self._record_bucket_preflight_transformation()
+        if payload is None:
+            return
+        transformation_dict, tf_dunder = payload
+        await probe_index.ensure_record_bucket_preconditions(
+            transformation_dict,
+            tf_dunder,
+            execution="remote",
+        )
 
     # ---- public helpers used by Transformation ----------------------------
     def _dask_client(self) -> Optional["SeamlessDaskClient"]:
@@ -192,6 +241,8 @@ class TransformationDaskMixin:
                 self._exception = None
                 return self._result_checksum
 
+        self._ensure_record_bucket_preflight_sync()
+
         submission = self._build_dask_submission(
             client, require_value=require_value, need_fat=False
         )
@@ -307,6 +358,8 @@ class TransformationDaskMixin:
                 self._evaluated = True
                 self._exception = None
                 return self._result_checksum
+
+        await self._ensure_record_bucket_preflight_async()
 
         submission = self._build_dask_submission(
             client, require_value=require_value, need_fat=False
