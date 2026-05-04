@@ -825,6 +825,7 @@ class WrapperConfig:
     memory_per_core_property_name: Optional[str]
     pure_dask: bool
     exclusive: bool
+    record: bool
 
 
 def build_wrapper_configuration(
@@ -882,6 +883,10 @@ def build_wrapper_configuration(
     env_exports: List[str] = []
     env_exports.append(
         format_bash_export("SEAMLESS_DASK_QUEUE_EXCLUSIVE", "1" if exclusive else "0")
+    )
+    record = parse_bool(parameters.get("record", False), "record")
+    env_exports.append(
+        format_bash_export("SEAMLESS_DASK_RECORD_MODE", "1" if record else "0")
     )
     if "pure_dask" in parameters:
         pure_dask = parse_bool(parameters.get("pure_dask"), "pure_dask")
@@ -1141,6 +1146,7 @@ def build_wrapper_configuration(
         memory_per_core_property_name=memory_per_core_property_name,
         pure_dask=pure_dask,
         exclusive=exclusive,
+        record=record,
     )
 
 
@@ -1733,6 +1739,9 @@ def main():
         else:
             log_print(f"worker_threads: {wrapper_config.worker_threads}")
         log_print(f"pure_dask: {wrapper_config.pure_dask}")
+        os.environ["SEAMLESS_DASK_RECORD_MODE"] = (
+            "1" if wrapper_config.record else "0"
+        )
 
         import dask
 
