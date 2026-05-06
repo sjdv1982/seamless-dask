@@ -254,6 +254,25 @@ def test_wrapper_configuration_exports_startup_record_mode():
     assert "export SEAMLESS_DASK_RECORD_MODE=1" in config.env_exports
 
 
+def test_wrapper_configuration_uses_job_cores_for_jobqueue_request():
+    config = build_wrapper_configuration(
+        host="127.0.0.1",
+        port_range=(20000, 29999),
+        parameters={
+            "walltime": "00:30:00",
+            "cores": 24,
+            "job_cores": 18,
+            "memory": "96GiB",
+            "memory_per_core_property_name": "memcore",
+            "record": False,
+        },
+    )
+
+    assert config.cores == 24
+    assert config.jobqueue_config["oar"]["cores"] == 18
+    assert config.jobqueue_config["oar"]["memory-per-core-property-name"] == "memcore"
+
+
 def test_promise_and_write_result_writes_execution_record(monkeypatch):
     fake_database_remote = _FakeDatabaseRemote()
     fake_buffer_remote = _FakeBufferRemote()
