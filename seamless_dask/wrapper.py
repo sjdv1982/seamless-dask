@@ -1513,6 +1513,24 @@ def keep_cluster_alive(
                 except BaseException as exc:
                     log_exception("scheduler activity failed", exc)
                     activity = {}
+                    dummy_futures = []
+                    try:
+                        monitor_client.close()
+                    except Exception:
+                        pass
+                    try:
+                        monitor_client = Client(
+                            cluster,
+                            set_as_default=False,
+                            name="seamless-dask-wrapper-monitor",
+                        )
+                        log_print(
+                            "[seamless-dask-wrapper] recreated scheduler monitor client"
+                        )
+                    except Exception as reconnect_exc:
+                        log_exception(
+                            "scheduler monitor client recreate failed", reconnect_exc
+                        )
                 activity_future = None
                 activity_started_at = None
                 activity_last_update = now
@@ -1629,20 +1647,30 @@ def keep_cluster_alive(
                     if is_local:
                         try:
                             current = getattr(cluster, "workers", None)
-                            worker_count = len(current) if current is not None else 0
-                            if worker_count == 0:
+                            cluster_worker_count = (
+                                len(current) if current is not None else 0
+                            )
+                            scheduler_worker_count = int(
+                                activity.get("worker_count", -1) or 0
+                            )
+                            if (
+                                cluster_worker_count == 0
+                                or scheduler_worker_count == 0
+                            ):
                                 try:
                                     warnings.warn(
-                                        "[seamless-dask-wrapper] LocalCluster reports 0 workers; attempting restart/scale",
+                                        "[seamless-dask-wrapper] LocalCluster has no scheduler workers; forcing rescale",
                                         RuntimeWarning,
                                     )
-                                    restart = getattr(cluster, "restart", None)
-                                    if callable(restart):
-                                        restart()
-                                    else:
-                                        scale = getattr(cluster, "scale", None)
-                                        if callable(scale):
-                                            scale(max(target_workers, 1))
+                                    log_print(
+                                        "[seamless-dask-wrapper] LocalCluster worker recovery:",
+                                        f"scheduler_workers={scheduler_worker_count}",
+                                        f"cluster_workers={cluster_worker_count}",
+                                    )
+                                    scale = getattr(cluster, "scale", None)
+                                    if callable(scale):
+                                        scale(0)
+                                        scale(max(target_workers, 1))
                                 except Exception:
                                     pass
                         except Exception:
