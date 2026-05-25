@@ -30,6 +30,7 @@ from .types import (
     TransformationSubmission,
 )
 from .worker_setup import SeamlessWorkerPlugin
+from .stream_throttle import SeamlessStreamThrottlePlugin
 
 # Apply the requested global Dask defaults up front.
 dask.config.set({"distributed.worker.daemon": False})
@@ -678,6 +679,7 @@ def _run_base(
     transformation_dict = dict(payload.get("transformation_dict") or {})
     inputs = payload.get("inputs") or []
     scratch = bool(payload.get("scratch", False))
+    streaming = bool(payload.get("streaming", False))
     owner_dask_priority = payload.get("owner_dask_priority")
     try:
         owner_dask_priority = (
@@ -805,6 +807,7 @@ def _run_base(
                     scratch=scratch,
                     owner_dask_key=owner_dask_key,
                     owner_dask_priority=owner_dask_priority,
+                    streaming=streaming,
                 )
             )
         finally:
@@ -930,6 +933,9 @@ class SeamlessDaskClient:
         self._is_local_cluster = bool(is_local_cluster)
         self._interactive = bool(interactive)
         self._promised_targets: dict[str, set[str]] = {}
+        self._stream_lock = threading.RLock()
+        self._active_stream_topics: set[str] = set()
+        self._stream_topic_cleanups: dict[str, Callable[[], None]] = {}
         ensure_configured(workers=worker_plugin_workers)
         self._register_worker_plugin(worker_plugin_workers, remote_clients)
         _LOGGER.info(
@@ -954,6 +960,140 @@ class SeamlessDaskClient:
     @property
     def client(self) -> Client:
         return self._client
+
+    def _subscribe_stream_topic(self, base_key: str) -> str:
+        topic = f"seamless-stream-{base_key}"
+        with self._stream_lock:
+            if topic in self._active_stream_topics:
+                return topic
+            self._active_stream_topics.add(topic)
+
+        prefix = f"[{base_key[:12]}] "
+        tqdm_bars: dict[str, Any] = {}
+
+        def close_tqdm_bars() -> None:
+            for bar in list(tqdm_bars.values()):
+                try:
+                    bar.close()
+                except Exception:
+                    pass
+            tqdm_bars.clear()
+
+        def handler(*args: Any) -> None:
+            event = args[-1] if args else None
+            msg = event
+            if isinstance(event, tuple) and len(event) == 2:
+                msg = event[1]
+            if not isinstance(msg, dict):
+                return
+            kind = msg.get("kind", "stream")
+            if kind in {"tqdm_open", "tqdm_update", "tqdm_close"}:
+                self._handle_tqdm_stream_chunk(prefix, tqdm_bars, msg)
+                return
+            if kind != "stream":
+                return
+            text = msg.get("text")
+            if not isinstance(text, str) or not text:
+                return
+            stream_name = msg.get("stream")
+            stream = sys.stderr if stream_name == "stderr" else sys.stdout
+            truncated = msg.get("truncated_head_bytes") or 0
+            try:
+                truncated = int(truncated)
+            except Exception:
+                truncated = 0
+            if truncated > 0:
+                text = f"<truncated {truncated} bytes>\n{text}"
+            if os.environ.get("SEAMLESS_STREAM_COLOR") == "1":
+                color = "\033[36m" if stream_name != "stderr" else "\033[35m"
+                reset = "\033[0m"
+                line_prefix = f"{color}{prefix}{reset}"
+            else:
+                line_prefix = prefix
+            rendered = line_prefix + text.replace("\n", "\n" + line_prefix)
+            if rendered.endswith(line_prefix):
+                rendered = rendered[: -len(line_prefix)]
+            stream.write(rendered)
+            stream.flush()
+
+        try:
+            self._client.subscribe_topic(topic, handler)
+        except Exception:
+            with self._stream_lock:
+                self._active_stream_topics.discard(topic)
+            raise
+        self._stream_topic_cleanups[topic] = close_tqdm_bars
+        return topic
+
+    def _unsubscribe_stream_topic(self, topic: str | None) -> None:
+        if not topic:
+            return
+        with self._stream_lock:
+            if topic not in self._active_stream_topics:
+                return
+            self._active_stream_topics.discard(topic)
+            cleanup = self._stream_topic_cleanups.pop(topic, None)
+        if cleanup is not None:
+            cleanup()
+        try:
+            self._client.unsubscribe_topic(topic)
+        except Exception:
+            pass
+
+    def _handle_tqdm_stream_chunk(
+        self, prefix: str, bars: dict[str, Any], msg: dict[str, Any]
+    ) -> None:
+        bar_id = msg.get("bar_id")
+        if not isinstance(bar_id, str):
+            return
+        kind = msg.get("kind")
+        if kind == "tqdm_open":
+            try:
+                from tqdm import tqdm
+            except Exception:
+                print(
+                    f"{prefix}{msg.get('desc') or bar_id}: "
+                    f"{msg.get('n', 0)}/{msg.get('total')}",
+                    file=sys.stderr,
+                )
+                return
+            bars[bar_id] = tqdm(
+                total=msg.get("total"),
+                desc=msg.get("desc") or prefix.strip(),
+                unit=msg.get("unit") or "it",
+                file=sys.stderr,
+                leave=True,
+            )
+            try:
+                bars[bar_id].n = int(msg.get("n", 0) or 0)
+                bars[bar_id].refresh()
+            except Exception:
+                pass
+            return
+        bar = bars.get(bar_id)
+        if kind == "tqdm_update":
+            if bar is None:
+                print(
+                    f"{prefix}{bar_id}: {msg.get('n', 0)}/{msg.get('total')}",
+                    file=sys.stderr,
+                )
+                return
+            try:
+                bar.n = int(msg.get("n", 0) or 0)
+                bar.total = msg.get("total")
+                bar.refresh()
+            except Exception:
+                pass
+            return
+        if kind == "tqdm_close":
+            if bar is not None:
+                try:
+                    bar.n = int(msg.get("n", getattr(bar, "n", 0)) or 0)
+                    bar.refresh()
+                    bar.close()
+                except Exception:
+                    pass
+                bars.pop(bar_id, None)
 
     def get_fat_checksum_future(self, checksum: Checksum | str) -> Future:
         """Return (or build) a fat-checksum future for the checksum."""
@@ -1051,6 +1191,7 @@ class SeamlessDaskClient:
             "require_value": submission.require_value,
             "owner_dask_priority": base_priority,
             "record": get_record_mode(),
+            "streaming": bool(submission.streaming),
         }
         input_futures = dict(submission.input_futures)
         resource_string = None  # TODO: get from tf_dunder
@@ -1067,6 +1208,9 @@ class SeamlessDaskClient:
                 thin_key += key_suffix
 
         payload["owner_dask_key"] = base_key
+        stream_topic = None
+        if payload["streaming"]:
+            stream_topic = self._subscribe_stream_topic(base_key)
 
         base_future = self._client.submit(
             _run_base,
@@ -1105,7 +1249,13 @@ class SeamlessDaskClient:
             fat=fat_future,
             thin=thin_future,
             tf_checksum=tf_checksum_hex,
+            stream_topic=stream_topic,
         )
+
+        if stream_topic is not None:
+            base_future.add_done_callback(
+                lambda _fut, topic=stream_topic: self._unsubscribe_stream_topic(topic)
+            )
 
         thin_future.add_done_callback(
             lambda fut, store_cache=not is_driver: self._register_transformation(
@@ -1164,6 +1314,12 @@ class SeamlessDaskClient:
         try:
             # Avoid re-registering if scheduler already has the plugin.
             already_registered = self._client.run_on_scheduler(_has_worker_plugin)
+            try:
+                self._client.register_plugin(
+                    SeamlessStreamThrottlePlugin(), name="seamless-stream-throttle"
+                )
+            except Exception:
+                pass
             if already_registered:
                 return
             plugin = SeamlessWorkerPlugin(
@@ -1346,6 +1502,7 @@ class SeamlessDaskClient:
     ) -> None:
         """Release and optionally cancel a transformation's futures and cache entries."""
 
+        self._unsubscribe_stream_topic(futures.stream_topic)
         tf_checksum_hex = futures.tf_checksum
         with self._cache_lock:
             if tf_checksum_hex:

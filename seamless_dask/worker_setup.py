@@ -82,6 +82,7 @@ class SeamlessWorkerPlugin(WorkerPlugin):
         from seamless.transformer import has_spawned, spawn
         from seamless.config import set_remote_clients
         from .permissions import configure as configure_permissions
+        from .stream_throttle import apply_worker_throttle, default_throttle
         import os
 
         threads = getattr(worker.state, "nthreads", None)
@@ -96,6 +97,7 @@ class SeamlessWorkerPlugin(WorkerPlugin):
         if scheduler_address:
             os.environ.setdefault("SEAMLESS_DASK_SCHEDULER", scheduler_address)
         os.environ.setdefault("SEAMLESS_DASK_WORKERS", str(self.num_workers))
+        apply_worker_throttle(default_throttle())
 
         if self.remote_clients is not None:
             set_remote_clients(self.remote_clients, in_remote=True)

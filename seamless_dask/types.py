@@ -32,6 +32,7 @@ class TransformationSubmission:
     meta: MutableMapping[str, Any] = field(default_factory=dict)
     require_value: bool = False
     allow_input_fingertip: bool = False
+    streaming: bool = False
 
 
 @dataclass
@@ -43,3 +44,4 @@ class TransformationFutures:
     thin: Future
     tf_checksum: Optional[str] = None
     result_checksum: Optional[str] = None
+    stream_topic: Optional[str] = None

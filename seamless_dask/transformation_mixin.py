@@ -600,6 +600,7 @@ class TransformationDaskMixin:
             meta=getattr(self, "_meta", {}) or {},
             require_value=require_value,
             allow_input_fingertip=allow_input_fingertip,
+            streaming=getattr(self, "_streaming", False),
         )
 
     def _ensure_dask_futures(

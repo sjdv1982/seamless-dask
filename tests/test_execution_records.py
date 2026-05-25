@@ -213,6 +213,67 @@ def test_submit_transformation_sends_record_mode(monkeypatch):
     assert base_payload["record"] is True
 
 
+def test_submit_transformation_streaming_is_submission_only(monkeypatch):
+    submitted = []
+    subscriptions = []
+
+    class _FakeFuture:
+        key = "base-stream"
+
+        def cancelled(self):
+            return False
+
+        def add_done_callback(self, callback):
+            del callback
+
+    class _FakeDistributedClient:
+        def submit(self, func, *args, **kwargs):
+            submitted.append((func, args, kwargs))
+            return _FakeFuture()
+
+        def subscribe_topic(self, topic, handler):
+            subscriptions.append((topic, handler))
+
+        def unsubscribe_topic(self, topic):
+            subscriptions.append(("unsubscribe", topic))
+
+    client = dask_client.SeamlessDaskClient.__new__(dask_client.SeamlessDaskClient)
+    client._client = _FakeDistributedClient()
+    client._cache_lock = threading.RLock()
+    client._stream_lock = threading.RLock()
+    client._active_stream_topics = set()
+    client._stream_topic_cleanups = {}
+    client._transformation_cache = {}
+    client._prune_caches = lambda: None
+    client._touch_transformation_cache = lambda *args, **kwargs: None
+    client._build_key = lambda prefix, resource, checksum: f"{prefix}-{checksum[:8]}"
+
+    monkeypatch.setattr(dask_client, "get_record_mode", lambda: False)
+
+    transformation_dict = {
+        "__language__": "python",
+        "__output__": ("result", "mixed", None),
+    }
+    futures = client.submit_transformation(
+        TransformationSubmission(
+            transformation_dict=transformation_dict,
+            inputs={},
+            input_futures={},
+            tf_checksum="2" * 64,
+            tf_dunder={},
+            scratch=False,
+            streaming=True,
+        )
+    )
+
+    base_payload = submitted[0][1][0]
+    assert base_payload["streaming"] is True
+    assert "streaming" not in base_payload["transformation_dict"]
+    assert "streaming" not in transformation_dict
+    assert futures.stream_topic == "seamless-stream-base-22222222"
+    assert subscriptions[0][0] == futures.stream_topic
+
+
 def test_run_base_rejects_record_mode_mismatch(monkeypatch):
     tf_checksum = _make_checksum({"kind": "dask-record-mismatch"})
 
