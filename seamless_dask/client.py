@@ -81,6 +81,15 @@ def _record_mode_mismatch_error(request_record_mode: bool) -> str:
     )
 
 
+def _normalized_dunder_envelope_checksum(submission: TransformationSubmission) -> str:
+    payload = {
+        "tf_dunder": dict(submission.tf_dunder or {}),
+        "meta": dict(submission.meta or {}),
+        "scratch": bool(submission.scratch),
+    }
+    return Buffer(payload, "plain").get_checksum().hex()
+
+
 def _scheduler_has_task_key(dask_scheduler, key: str) -> bool:
     try:
         return key in getattr(dask_scheduler, "tasks", {})
@@ -923,6 +932,7 @@ class SeamlessDaskClient:
         self._transformation_cache: dict[
             str, tuple[TransformationFutures, float | None]
         ] = {}
+        self._active_transformation_envelopes: dict[str, str] = {}
         self._cache_lock = threading.RLock()
         self._prune_stop = threading.Event()
         self._prune_interval = _parse_cache_prune_interval()
@@ -1036,11 +1046,9 @@ class SeamlessDaskClient:
         thin_priority = _BASE_DASK_PRIORITY + 10 + boost
 
         if tf_checksum_hex and not is_driver:
-            with self._cache_lock:
-                cached = self._transformation_cache.get(tf_checksum_hex)
-            if cached is not None and not cached[0].base.cancelled():
-                self._touch_transformation_cache(tf_checksum_hex, cached[0])
-                return cached[0]
+            cached_futures = self._cached_transformation_for_submission(submission)
+            if cached_futures is not None:
+                return cached_futures
 
         payload = {
             "transformation_dict": submission.transformation_dict,
@@ -1107,13 +1115,26 @@ class SeamlessDaskClient:
             tf_checksum=tf_checksum_hex,
         )
 
-        thin_future.add_done_callback(
-            lambda fut, store_cache=not is_driver: self._register_transformation(
-                tf_checksum_hex, futures, fut, store_cache=store_cache
+        envelope_checksum = _normalized_dunder_envelope_checksum(submission)
+        def _register_done(
+            fut: Future,
+            *,
+            store_cache: bool = not is_driver,
+            envelope_checksum: str = envelope_checksum,
+        ) -> None:
+            self._register_transformation(
+                tf_checksum_hex,
+                futures,
+                fut,
+                store_cache=store_cache,
+                envelope_checksum=envelope_checksum,
             )
-        )
+
+        thin_future.add_done_callback(_register_done)
         if tf_checksum_hex and not is_driver:
-            self._store_transformation(tf_checksum_hex, futures)
+            self._store_transformation(
+                tf_checksum_hex, futures, envelope_checksum=envelope_checksum
+            )
 
         return futures
 
@@ -1297,6 +1318,33 @@ class SeamlessDaskClient:
             if cached is None or cached[0] is not futures:
                 return
             self._transformation_cache[tf_checksum_hex] = (futures, self._expiry())
+            self._active_transformation_envelopes.pop(tf_checksum_hex, None)
+
+    def _cached_transformation_for_submission(
+        self, submission: TransformationSubmission
+    ) -> TransformationFutures | None:
+        tf_checksum_hex = submission.tf_checksum
+        if not tf_checksum_hex:
+            return None
+        requested_envelope = _normalized_dunder_envelope_checksum(submission)
+        with self._cache_lock:
+            cached = self._transformation_cache.get(tf_checksum_hex)
+            active_envelope = self._active_transformation_envelopes.get(tf_checksum_hex)
+        if cached is None:
+            return None
+        futures = cached[0]
+        if futures.base.cancelled():
+            return None
+        active = not self._transformation_done(futures)
+        if active and submission.strict_dunder and active_envelope != requested_envelope:
+            raise RuntimeError(
+                "Transformation "
+                f"{tf_checksum_hex} is already running with a different dunder "
+                "envelope; wait for it to finish or cancel it before strict "
+                "re-submission"
+            )
+        self._touch_transformation_cache(tf_checksum_hex, futures)
+        return futures
 
     def _cache_fat_checksum_future(self, checksum_hex: str, future: Future) -> None:
         with self._cache_lock:
@@ -1325,12 +1373,20 @@ class SeamlessDaskClient:
         self._touch_fat_finger_checksum_cache(checksum_hex, future)
 
     def _cache_transformation_futures(
-        self, tf_checksum_hex: str, futures: TransformationFutures
+        self,
+        tf_checksum_hex: str,
+        futures: TransformationFutures,
+        *,
+        envelope_checksum: str | None = None,
     ) -> None:
         with self._cache_lock:
             cached = self._transformation_cache.get(tf_checksum_hex)
             if cached is None or cached[0] is not futures:
                 self._transformation_cache[tf_checksum_hex] = (futures, None)
+            if envelope_checksum is not None:
+                self._active_transformation_envelopes[tf_checksum_hex] = (
+                    envelope_checksum
+                )
 
         def _on_done(_fut: Future) -> None:
             self._touch_transformation_cache(tf_checksum_hex, futures)
@@ -1352,6 +1408,7 @@ class SeamlessDaskClient:
                 cached = self._transformation_cache.get(tf_checksum_hex)
                 if cached is not None and cached[0] is futures:
                     self._transformation_cache.pop(tf_checksum_hex, None)
+                self._active_transformation_envelopes.pop(tf_checksum_hex, None)
             if futures.result_checksum and futures.fat is not None:
                 cached = self._fat_checksum_cache.get(futures.result_checksum)
                 if cached is not None and cached[0] is futures.fat:
@@ -1373,6 +1430,22 @@ class SeamlessDaskClient:
                 future.release()
             except Exception:
                 pass
+
+    def cancel_by_checksum(self, tf_checksum: Checksum | str) -> bool:
+        """Cancel the active transformation submission for a checksum."""
+
+        tf_checksum_hex = (
+            tf_checksum.hex() if isinstance(tf_checksum, Checksum) else str(tf_checksum)
+        )
+        with self._cache_lock:
+            cached = self._transformation_cache.get(tf_checksum_hex)
+        if cached is None:
+            return False
+        futures = cached[0]
+        if self._transformation_done(futures) or futures.base.cancelled():
+            return False
+        self.release_transformation_futures(futures, cancel=True)
+        return True
 
     def _prune_caches(self) -> None:
         now = time.monotonic()
@@ -1400,6 +1473,7 @@ class SeamlessDaskClient:
                 ):
                     continue
                 self._transformation_cache.pop(key, None)
+                self._active_transformation_envelopes.pop(key, None)
                 for future in (futures.base, futures.thin, futures.fat):
                     if future is None:
                         continue
@@ -1416,9 +1490,15 @@ class SeamlessDaskClient:
                 pass
 
     def _store_transformation(
-        self, tf_checksum_hex: str, futures: TransformationFutures
+        self,
+        tf_checksum_hex: str,
+        futures: TransformationFutures,
+        *,
+        envelope_checksum: str | None = None,
     ) -> None:
-        self._cache_transformation_futures(tf_checksum_hex, futures)
+        self._cache_transformation_futures(
+            tf_checksum_hex, futures, envelope_checksum=envelope_checksum
+        )
 
     def _register_transformation(
         self,
@@ -1427,6 +1507,7 @@ class SeamlessDaskClient:
         thin_future: Future,
         *,
         store_cache: bool = True,
+        envelope_checksum: str | None = None,
     ) -> None:
         try:
             tf_checksum_hex, result_checksum_hex, exc = thin_future.result()
@@ -1436,7 +1517,9 @@ class SeamlessDaskClient:
         if tf_checksum_hex:
             futures.tf_checksum = tf_checksum_hex
             if store_cache:
-                self._store_transformation(tf_checksum_hex, futures)
+                self._store_transformation(
+                    tf_checksum_hex, futures, envelope_checksum=envelope_checksum
+                )
         if result_checksum_hex:
             futures.result_checksum = result_checksum_hex
             if futures.fat is not None:
