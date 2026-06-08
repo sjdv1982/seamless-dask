@@ -44,3 +44,4 @@ class TransformationFutures:
     thin: Future
     tf_checksum: Optional[str] = None
     result_checksum: Optional[str] = None
+    submission_id: Optional[str] = None
