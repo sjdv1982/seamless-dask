@@ -8,6 +8,7 @@ import random
 import string
 import time
 import traceback
+from copy import deepcopy
 from typing import Any, Dict, Optional, TYPE_CHECKING
 
 from seamless import Checksum, CacheMissError
@@ -75,13 +76,10 @@ class TransformationDaskMixin:
     ) -> tuple[dict[str, Any], dict[str, Any]] | None:
         if not record_runtime.get_record_mode():
             return None
-        pretransformation = getattr(self, "_pretransformation", None)
-        if pretransformation is None:
+        template = getattr(self, "_definition_payload_template", None)
+        if template is None:
             return None
-        upstream_dependencies = getattr(self, "_upstream_dependencies", {}) or {}
-        transformation_dict, _dependencies = (
-            pretransformation.build_partial_transformation(upstream_dependencies)
-        )
+        transformation_dict = deepcopy(template)
         meta = getattr(self, "_meta", {}) or {}
         if meta:
             existing_meta = transformation_dict.get("__meta__")
@@ -513,14 +511,12 @@ class TransformationDaskMixin:
         require_value: bool,
         need_fat: bool,
     ) -> TransformationSubmission:
-        pretransformation = getattr(self, "_pretransformation", None)
-        if pretransformation is None:
-            raise RuntimeError("No pre-transformation available for Dask")
+        template = getattr(self, "_definition_payload_template", None)
+        if template is None:
+            raise RuntimeError("No frozen transformation definition available for Dask")
 
-        upstream_dependencies = getattr(self, "_upstream_dependencies", {}) or {}
-        transformation_dict, dependencies = (
-            pretransformation.build_partial_transformation(upstream_dependencies)
-        )
+        transformation_dict = deepcopy(template)
+        dependencies = getattr(self, "_upstream_dependencies", {}) or {}
         meta = getattr(self, "_meta", {}) or {}
         allow_input_fingertip = bool(meta.get("allow_input_fingertip", False))
         if meta:
@@ -618,12 +614,14 @@ class TransformationDaskMixin:
                 client, require_value=require_value, need_fat=need_fat
             )
             if submission.tf_checksum and not _submission_is_driver(submission):
-                cached = client._transformation_cache.get(submission.tf_checksum)  # type: ignore[attr-defined]
-                if cached is not None and not cached[0].base.cancelled():
+                cached_futures = client._cached_transformation_for_submission(  # type: ignore[attr-defined]
+                    submission
+                )
+                if cached_futures is not None:
                     if permission_granted:
                         release_permission()
                         permission_released = True
-                    futures = cached[0]
+                    futures = cached_futures
                     self._dask_futures = futures
                     if need_fat and futures.fat is None:
                         futures.fat = client.ensure_fat_future(
@@ -646,13 +644,11 @@ class TransformationDaskMixin:
     def _compute_tf_checksum_no_deps(self) -> str | None:
         """Return tf_checksum hex if there are no upstream dependencies; otherwise None."""
         try:
-            pretransformation = getattr(self, "_pretransformation", None)
-            if pretransformation is None:
+            template = getattr(self, "_definition_payload_template", None)
+            if template is None:
                 return None
-            upstream_dependencies = getattr(self, "_upstream_dependencies", {}) or {}
-            tf_dict, dependencies = pretransformation.build_partial_transformation(
-                upstream_dependencies
-            )
+            tf_dict = deepcopy(template)
+            dependencies = getattr(self, "_upstream_dependencies", {}) or {}
             if dependencies:
                 return None
             tf_buffer = tf_get_buffer(tf_dict)
