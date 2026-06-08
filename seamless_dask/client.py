@@ -115,6 +115,34 @@ def _dask_key_exists(dask_client: Client, key: str) -> bool:
     return False
 
 
+def _mark_cancelled_submission(dask_scheduler, submission_id: str) -> bool:
+    canceled = getattr(dask_scheduler, "seamless_cancelled_submissions", None)
+    if canceled is None:
+        canceled = set()
+        setattr(dask_scheduler, "seamless_cancelled_submissions", canceled)
+    canceled.add(str(submission_id))
+    return True
+
+
+def _scheduler_submission_cancelled(dask_scheduler, submission_id: str) -> bool:
+    canceled = getattr(dask_scheduler, "seamless_cancelled_submissions", set())
+    return str(submission_id) in canceled
+
+
+def _is_submission_cancelled(dask_client: Client, submission_id: str | None) -> bool:
+    if not submission_id:
+        return False
+    try:
+        return bool(
+            dask_client.run_on_scheduler(
+                _scheduler_submission_cancelled,
+                submission_id=str(submission_id),
+            )
+        )
+    except Exception:
+        return False
+
+
 def _resolve_driver_key(dask_client: Client, base_key: str) -> str:
     if not _dask_key_exists(dask_client, base_key):
         return base_key
@@ -640,6 +668,7 @@ def _run_base(
         payload["owner_dask_priority"] = priority_value
 
     tf_checksum_hex = payload.get("tf_checksum")
+    submission_id = payload.get("submission_id")
     request_record_mode = bool(payload.get("record", False))
     if request_record_mode != _startup_record_mode():
         return tf_checksum_hex, None, None, _record_mode_mismatch_error(
@@ -848,6 +877,13 @@ def _run_base(
         cpu_end = os.times()
         cpu_user_seconds = round(cpu_end.user - cpu_start.user, 6)
         cpu_system_seconds = round(cpu_end.system - cpu_start.system, 6)
+        if _is_submission_cancelled(client.client, submission_id):
+            return (
+                tf_checksum_hex,
+                None,
+                None,
+                "Transformation was canceled",
+            )
         _run_on_worker_loop(
             lambda: _promise_and_write_result_async(
                 tf_checksum_obj,
@@ -933,6 +969,7 @@ class SeamlessDaskClient:
             str, tuple[TransformationFutures, float | None]
         ] = {}
         self._active_transformation_envelopes: dict[str, str] = {}
+        self._released_transformation_futures: set[int] = set()
         self._cache_lock = threading.RLock()
         self._prune_stop = threading.Event()
         self._prune_interval = _parse_cache_prune_interval()
@@ -1050,6 +1087,7 @@ class SeamlessDaskClient:
             if cached_futures is not None:
                 return cached_futures
 
+        submission_id = uuid.uuid4().hex
         payload = {
             "transformation_dict": submission.transformation_dict,
             "inputs": [spec.__dict__ for spec in submission.inputs.values()],
@@ -1059,6 +1097,7 @@ class SeamlessDaskClient:
             "require_value": submission.require_value,
             "owner_dask_priority": base_priority,
             "record": get_record_mode(),
+            "submission_id": submission_id,
         }
         input_futures = dict(submission.input_futures)
         resource_string = None  # TODO: get from tf_dunder
@@ -1113,6 +1152,7 @@ class SeamlessDaskClient:
             fat=fat_future,
             thin=thin_future,
             tf_checksum=tf_checksum_hex,
+            submission_id=submission_id,
         )
 
         envelope_checksum = _normalized_dunder_envelope_checksum(submission)
@@ -1404,6 +1444,7 @@ class SeamlessDaskClient:
 
         tf_checksum_hex = futures.tf_checksum
         with self._cache_lock:
+            self._released_transformation_futures.add(id(futures))
             if tf_checksum_hex:
                 cached = self._transformation_cache.get(tf_checksum_hex)
                 if cached is not None and cached[0] is futures:
@@ -1444,6 +1485,15 @@ class SeamlessDaskClient:
         futures = cached[0]
         if self._transformation_done(futures) or futures.base.cancelled():
             return False
+        submission_id = getattr(futures, "submission_id", None)
+        if submission_id:
+            try:
+                self._client.run_on_scheduler(
+                    _mark_cancelled_submission,
+                    submission_id=str(submission_id),
+                )
+            except Exception:
+                pass
         self.release_transformation_futures(futures, cancel=True)
         return True
 
@@ -1509,6 +1559,9 @@ class SeamlessDaskClient:
         store_cache: bool = True,
         envelope_checksum: str | None = None,
     ) -> None:
+        with self._cache_lock:
+            if id(futures) in self._released_transformation_futures:
+                return
         try:
             tf_checksum_hex, result_checksum_hex, exc = thin_future.result()
         except Exception:
