@@ -363,6 +363,7 @@ class TransformationDaskMixin:
             client, require_value=require_value, need_fat=False
         )
 
+        futures = None
         try:
             futures = self._ensure_dask_futures(
                 client,
@@ -373,6 +374,19 @@ class TransformationDaskMixin:
             tf_checksum_hex, result_checksum_hex, exc = await asyncio.wrap_future(
                 asyncio.get_running_loop().run_in_executor(None, futures.thin.result)
             )
+        except asyncio.CancelledError:
+            # Local in-process cancellation (e.g. task().cancel()) lands here for the
+            # top-level Dask backend, bypassing cancel_by_checksum. Converge on the
+            # authoritative scheduler-flag mechanism so the running submission is
+            # suppressed (no result/record written), matching the other producers.
+            if permission_granted:
+                release_permission()
+            if futures is not None:
+                try:
+                    client.cancel_by_checksum(futures.tf_checksum)
+                except Exception:
+                    pass
+            raise
         except Exception:
             if permission_granted:
                 release_permission()
