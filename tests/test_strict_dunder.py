@@ -126,7 +126,7 @@ def test_dask_strict_different_dunder_rejects_only_while_active():
     assert client._cached_transformation_for_submission(strict_latcher) is futures
 
 
-def test_dask_cancel_by_checksum_releases_active_submission():
+def test_dask_cancel_by_checksum_marks_and_releases_active_submission():
     client = _client()
     active = _submission("c" * 64, meta={"local": False})
     futures = TransformationFutures(
@@ -146,7 +146,7 @@ def test_dask_cancel_by_checksum_releases_active_submission():
     assert client.cancel_by_checksum(active.tf_checksum) is False
     assert active.tf_checksum not in client._transformation_cache
     assert active.tf_checksum not in client._active_transformation_envelopes
-    assert client._client.cancelled
+    assert not client._client.cancelled
     assert _is_submission_cancelled(client._client, futures.submission_id)
 
 

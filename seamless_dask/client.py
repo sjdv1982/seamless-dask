@@ -124,9 +124,42 @@ def _mark_cancelled_submission(dask_scheduler, submission_id: str) -> bool:
     return True
 
 
+def _mark_cancelled_transformation(dask_scheduler, tf_checksum: str) -> bool:
+    canceled = getattr(dask_scheduler, "seamless_cancelled_transformations", None)
+    if canceled is None:
+        canceled = set()
+        setattr(dask_scheduler, "seamless_cancelled_transformations", canceled)
+    canceled.add(str(tf_checksum))
+    return True
+
+
+def _pop_cancelled_transformation(dask_scheduler, tf_checksum: str) -> bool:
+    canceled = getattr(dask_scheduler, "seamless_cancelled_transformations", set())
+    tf_checksum = str(tf_checksum)
+    if tf_checksum not in canceled:
+        return False
+    try:
+        canceled.remove(tf_checksum)
+    except KeyError:
+        pass
+    return True
+
+
 def _scheduler_submission_cancelled(dask_scheduler, submission_id: str) -> bool:
     canceled = getattr(dask_scheduler, "seamless_cancelled_submissions", set())
     return str(submission_id) in canceled
+
+
+def _scheduler_matching_transformation_keys(
+    dask_scheduler, tf_checksum: str
+) -> list[str]:
+    tf_checksum = str(tf_checksum)
+    matches = []
+    for key in getattr(dask_scheduler, "tasks", {}):
+        key_text = str(key)
+        if tf_checksum in key_text:
+            matches.append(key)
+    return matches
 
 
 def _is_submission_cancelled(dask_client: Client, submission_id: str | None) -> bool:
@@ -137,6 +170,20 @@ def _is_submission_cancelled(dask_client: Client, submission_id: str | None) -> 
             dask_client.run_on_scheduler(
                 _scheduler_submission_cancelled,
                 submission_id=str(submission_id),
+            )
+        )
+    except Exception:
+        return False
+
+
+def _is_transformation_cancelled(dask_client: Client, tf_checksum: str | None) -> bool:
+    if not tf_checksum:
+        return False
+    try:
+        return bool(
+            dask_client.run_on_scheduler(
+                _pop_cancelled_transformation,
+                tf_checksum=str(tf_checksum),
             )
         )
     except Exception:
@@ -762,6 +809,13 @@ def _run_base(
             tf_buffer = tf_get_buffer(transformation_dict)
             tf_buffer.tempref()
             tf_checksum_hex = tf_buffer.get_checksum().hex()
+        if _is_transformation_cancelled(client.client, tf_checksum_hex):
+            return (
+                tf_checksum_hex,
+                None,
+                None,
+                "Transformation was canceled",
+            )
         if tf_checksum_missing:
             # Redirect tasks submitted without a checksum to the deterministic key.
             base_prefix = _base_prefix_for_transformation(transformation_dict)
@@ -877,7 +931,9 @@ def _run_base(
         cpu_end = os.times()
         cpu_user_seconds = round(cpu_end.user - cpu_start.user, 6)
         cpu_system_seconds = round(cpu_end.system - cpu_start.system, 6)
-        if _is_submission_cancelled(client.client, submission_id):
+        if _is_submission_cancelled(
+            client.client, submission_id
+        ) or _is_transformation_cancelled(client.client, tf_checksum_hex):
             return (
                 tf_checksum_hex,
                 None,
@@ -1481,7 +1537,23 @@ class SeamlessDaskClient:
         with self._cache_lock:
             cached = self._transformation_cache.get(tf_checksum_hex)
         if cached is None:
-            return False
+            try:
+                keys = self._client.run_on_scheduler(
+                    _scheduler_matching_transformation_keys,
+                    tf_checksum=tf_checksum_hex,
+                )
+            except Exception:
+                keys = []
+            if not keys:
+                return False
+            try:
+                self._client.run_on_scheduler(
+                    _mark_cancelled_transformation,
+                    tf_checksum=tf_checksum_hex,
+                )
+            except Exception:
+                return False
+            return True
         futures = cached[0]
         if self._transformation_done(futures) or futures.base.cancelled():
             return False
@@ -1493,8 +1565,16 @@ class SeamlessDaskClient:
                     submission_id=str(submission_id),
                 )
             except Exception:
-                pass
-        self.release_transformation_futures(futures, cancel=True)
+                return False
+        else:
+            try:
+                self._client.run_on_scheduler(
+                    _mark_cancelled_transformation,
+                    tf_checksum=tf_checksum_hex,
+                )
+            except Exception:
+                return False
+        self.release_transformation_futures(futures, cancel=False)
         return True
 
     def _prune_caches(self) -> None:
