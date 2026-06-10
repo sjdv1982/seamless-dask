@@ -39,6 +39,15 @@ dask.config.set({"distributed.scheduler.target-duration": "10m"})
 _SEAMLESS_DASK_CLIENT_LOCK = threading.Lock()
 _LOGGER = logging.getLogger(__name__)
 _BASE_DASK_PRIORITY = 10
+# How often a running worker task polls the scheduler for a cancel flag so it can
+# terminate the inner spawn subprocess and reclaim the slot. Polling (rather than a
+# push) keeps the cancel mechanism independent of Dask's Future.cancel().
+try:
+    _CANCEL_WATCH_INTERVAL = float(
+        os.environ.get("SEAMLESS_DASK_CANCEL_WATCH_INTERVAL", "1.0")
+    )
+except (TypeError, ValueError):
+    _CANCEL_WATCH_INTERVAL = 1.0
 _ENSURE_RESULT_UPLOAD_ENV = "SEAMLESS_DASK_ENSURE_RESULT_UPLOAD"
 _QUEUE_EXCLUSIVE_ENV = "SEAMLESS_DASK_QUEUE_EXCLUSIVE"
 _STARTUP_RECORD_MODE_ENV = "SEAMLESS_DASK_RECORD_MODE"
@@ -148,6 +157,51 @@ def _pop_cancelled_transformation(dask_scheduler, tf_checksum: str) -> bool:
 def _scheduler_submission_cancelled(dask_scheduler, submission_id: str) -> bool:
     canceled = getattr(dask_scheduler, "seamless_cancelled_submissions", set())
     return str(submission_id) in canceled
+
+
+def _scheduler_consume_cancel(
+    dask_scheduler, submission_id: str | None, tf_checksum: str
+) -> bool:
+    """Worker-side cancel check used by the dispatch watcher.
+
+    Returns True if this submission or transformation has been canceled, and
+    consumes the transformation flag (the watcher terminates the work before the
+    result-suppression checkpoint that would otherwise pop it, so it must pop it
+    here to avoid auto-canceling a later re-submission of the same checksum).
+    """
+
+    hit = False
+    if submission_id is not None:
+        submissions = getattr(dask_scheduler, "seamless_cancelled_submissions", set())
+        if str(submission_id) in submissions:
+            hit = True
+    transformations = getattr(
+        dask_scheduler, "seamless_cancelled_transformations", set()
+    )
+    if str(tf_checksum) in transformations:
+        hit = True
+        try:
+            transformations.remove(str(tf_checksum))
+        except KeyError:
+            pass
+    return hit
+
+
+def _consume_cancel_flags(
+    dask_client: Client, submission_id: str | None, tf_checksum_hex: str | None
+) -> bool:
+    if not tf_checksum_hex and not submission_id:
+        return False
+    try:
+        return bool(
+            dask_client.run_on_scheduler(
+                _scheduler_consume_cancel,
+                submission_id=submission_id,
+                tf_checksum=str(tf_checksum_hex),
+            )
+        )
+    except Exception:
+        return False
 
 
 def _scheduler_matching_transformation_keys(
@@ -329,6 +383,77 @@ def _run_on_worker_loop(coro_factory: Callable[[], Coroutine[Any, Any, Any]]) ->
             pass
     # Fallback: run in a fresh loop with a fresh coroutine
     return asyncio.run(coro_factory())
+
+
+async def _dispatch_with_cancel_watch(
+    dask_client: Client,
+    submission_id: str | None,
+    tf_checksum_hex: str | None,
+    transformation_dict,
+    *,
+    tf_checksum,
+    tf_dunder,
+    scratch,
+    owner_dask_key,
+    owner_dask_priority,
+):
+    """Run the worker-side dispatch while watching for a cancel flag.
+
+    On cancel, terminate the inner seamless spawn subprocess (reusing the spawn
+    reclaim primitive) so the worker slot is freed instead of running to completion.
+    Returns the ``"Transformation was canceled"`` sentinel string (which ``_run_base``
+    surfaces as the error) rather than raising, so ``_run_on_worker_loop`` does not
+    fall back and re-dispatch the canceled work.
+    """
+
+    dispatch = asyncio.ensure_future(
+        transformer_worker.dispatch_to_workers(
+            transformation_dict,
+            tf_checksum=tf_checksum,
+            tf_dunder=tf_dunder,
+            scratch=scratch,
+            owner_dask_key=owner_dask_key,
+            owner_dask_priority=owner_dask_priority,
+        )
+    )
+    loop = asyncio.get_running_loop()
+    canceled = {"v": False}
+
+    async def _watch():
+        try:
+            while not dispatch.done():
+                hit = await loop.run_in_executor(
+                    None,
+                    _consume_cancel_flags,
+                    dask_client,
+                    submission_id,
+                    tf_checksum_hex,
+                )
+                if hit:
+                    canceled["v"] = True
+                    try:
+                        transformer_worker.cancel_by_checksum(tf_checksum)
+                    except Exception:
+                        pass
+                    return
+                await asyncio.sleep(_CANCEL_WATCH_INTERVAL)
+        except asyncio.CancelledError:
+            pass
+
+    watcher = asyncio.ensure_future(_watch())
+    try:
+        try:
+            return await dispatch
+        except BaseException:
+            if canceled["v"]:
+                return "Transformation was canceled"
+            raise
+    finally:
+        watcher.cancel()
+        try:
+            await watcher
+        except Exception:
+            pass
 
 
 def _run_coro_blocking(coro: Coroutine[Any, Any, Any]) -> Any:
@@ -890,7 +1015,10 @@ def _run_base(
         gpu_sampler = start_gpu_memory_sampler()
         try:
             result_checksum = _run_on_worker_loop(
-                lambda: transformer_worker.dispatch_to_workers(
+                lambda: _dispatch_with_cancel_watch(
+                    client.client,
+                    submission_id,
+                    tf_checksum_hex,
                     transformation_dict,
                     tf_checksum=tf_checksum,
                     tf_dunder=tf_dunder,
