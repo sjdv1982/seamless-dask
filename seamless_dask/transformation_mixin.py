@@ -661,6 +661,9 @@ class TransformationDaskMixin:
                 raise RuntimeError(f"Input '{pinname}' has no checksum")
             if isinstance(checksum_hex, Checksum):
                 checksum_hex = checksum_hex.hex()
+            from seamless.checksum.hash_type_validation import validate_deserializable_as
+
+            validate_deserializable_as(checksum_hex, celltype)
             inputs[pinname] = TransformationInputSpec(
                 name=pinname,
                 celltype=celltype,

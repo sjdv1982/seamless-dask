@@ -943,28 +943,37 @@ def _run_base(
             if input_value is None:
                 raise RuntimeError(f"Missing input for pin '{spec.name}'")
 
+            from seamless.checksum.hash_type_validation import validate_deserializable_as
+
             if spec.kind == "checksum":
-                checksum_hex, _buf, exc = input_value
+                checksum_hex, buf, exc = input_value
                 if exc:
                     return tf_checksum_hex, None, None, exc
+                validate_deserializable_as(checksum_hex, spec.celltype, buffer=buf)
                 transformation_dict[spec.name] = (
                     spec.celltype,
                     spec.subcelltype,
                     checksum_hex,
                 )
             elif spec.kind == "transformation":
-                result_checksum_hex, _buf, exc = input_value
+                result_checksum_hex, buf, exc = input_value
                 if exc:
                     return tf_checksum_hex, None, None, exc
+                validate_deserializable_as(
+                    result_checksum_hex, spec.celltype, buffer=buf
+                )
                 transformation_dict[spec.name] = (
                     spec.celltype,
                     spec.subcelltype,
                     result_checksum_hex,
                 )
             elif spec.kind == "expression":
-                result_checksum_hex, _buf, exc = input_value
+                result_checksum_hex, buf, exc = input_value
                 if exc:
                     return tf_checksum_hex, None, None, exc
+                validate_deserializable_as(
+                    result_checksum_hex, spec.celltype, buffer=buf
+                )
                 transformation_dict[spec.name] = (
                     spec.celltype,
                     spec.subcelltype,
