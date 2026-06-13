@@ -16,7 +16,7 @@ class TransformationInputSpec:
     celltype: str
     subcelltype: Optional[str]
     checksum: Optional[str]
-    kind: str = "checksum"  # "checksum" | "transformation"
+    kind: str = "checksum"  # "checksum" | "transformation" | "expression"
 
 
 @dataclass

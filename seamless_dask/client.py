@@ -817,6 +817,40 @@ def _fat_finger_checksum_task(
         return checksum_hex, None, traceback.format_exc()
 
 
+def _expression_task(
+    payload: Dict[str, Any],
+    input_value: Tuple[Any, ...],
+) -> Tuple[str | None, Buffer | None, str | None]:
+    """Evaluate an expression input from a fat input tuple."""
+    checksum_hex, buffer_obj, exc = input_value
+    if exc:
+        return checksum_hex, buffer_obj, exc
+    if checksum_hex is None:
+        return None, None, "Expression input checksum unavailable"
+    try:
+        checksum = Checksum(checksum_hex)
+        if isinstance(buffer_obj, Buffer):
+            Buffer(buffer_obj.content, checksum=checksum)
+        from seamless.checksum.expression import evaluate_expression
+
+        result_checksum = evaluate_expression(
+            checksum,
+            payload["path"],
+            payload["celltype"],
+            payload["target_celltype"],
+            validator=payload.get("validator"),
+            validator_language=payload.get("validator_language"),
+        )
+        result_buffer = result_checksum.resolve()
+        return (
+            result_checksum.hex(),
+            result_buffer if isinstance(result_buffer, Buffer) else None,
+            None,
+        )
+    except Exception:
+        return checksum_hex, None, traceback.format_exc()
+
+
 def _run_base(
     payload: Dict[str, Any],
     input_results: Mapping[str, Tuple[Any, ...]],
@@ -927,6 +961,15 @@ def _run_base(
                     spec.subcelltype,
                     result_checksum_hex,
                 )
+            elif spec.kind == "expression":
+                result_checksum_hex, _buf, exc = input_value
+                if exc:
+                    return tf_checksum_hex, None, None, exc
+                transformation_dict[spec.name] = (
+                    spec.celltype,
+                    spec.subcelltype,
+                    result_checksum_hex,
+                )
             else:  # pragma: no cover - defensive guard
                 raise ValueError(f"Unknown input kind '{spec.kind}'")
 
@@ -934,7 +977,10 @@ def _run_base(
             tf_buffer = tf_get_buffer(transformation_dict)
             tf_buffer.tempref()
             tf_checksum_hex = tf_buffer.get_checksum().hex()
-        if _is_transformation_cancelled(client.client, tf_checksum_hex):
+        dask_client = getattr(client, "client", None)
+        if dask_client is not None and _is_transformation_cancelled(
+            dask_client, tf_checksum_hex
+        ):
             return (
                 tf_checksum_hex,
                 None,
@@ -1059,9 +1105,11 @@ def _run_base(
         cpu_end = os.times()
         cpu_user_seconds = round(cpu_end.user - cpu_start.user, 6)
         cpu_system_seconds = round(cpu_end.system - cpu_start.system, 6)
-        if _is_submission_cancelled(
-            client.client, submission_id
-        ) or _is_transformation_cancelled(client.client, tf_checksum_hex):
+        dask_client = getattr(client, "client", None)
+        if dask_client is not None and (
+            _is_submission_cancelled(dask_client, submission_id)
+            or _is_transformation_cancelled(dask_client, tf_checksum_hex)
+        ):
             return (
                 tf_checksum_hex,
                 None,
@@ -1231,6 +1279,35 @@ class SeamlessDaskClient:
         )
         self._cache_fat_finger_checksum_future(checksum_hex, future)
         return future
+
+    def get_expression_future(
+        self,
+        expression,
+        input_future: Future,
+        *,
+        priority: int = -1,
+    ) -> Future:
+        """Return a fat-checksum-shaped future for an expression result."""
+        payload = {
+            "path": expression.path,
+            "celltype": expression.celltype,
+            "target_celltype": expression.target_celltype,
+            "validator": (
+                expression.validator.hex()
+                if getattr(expression, "validator", None) is not None
+                else None
+            ),
+            "validator_language": expression.validator_language,
+        }
+        key = "expression-" + uuid.uuid4().hex
+        return self._client.submit(
+            _expression_task,
+            payload,
+            input_future,
+            pure=False,
+            key=key,
+            priority=priority,
+        )
 
     def get_transformation_futures(
         self, tf_checksum: Checksum | str
@@ -1553,7 +1630,8 @@ class SeamlessDaskClient:
         requested_envelope = _normalized_dunder_envelope_checksum(submission)
         with self._cache_lock:
             cached = self._transformation_cache.get(tf_checksum_hex)
-            active_envelope = self._active_transformation_envelopes.get(tf_checksum_hex)
+            active_envelopes = getattr(self, "_active_transformation_envelopes", {})
+            active_envelope = active_envelopes.get(tf_checksum_hex)
         if cached is None:
             return None
         futures = cached[0]
@@ -1608,9 +1686,13 @@ class SeamlessDaskClient:
             if cached is None or cached[0] is not futures:
                 self._transformation_cache[tf_checksum_hex] = (futures, None)
             if envelope_checksum is not None:
-                self._active_transformation_envelopes[tf_checksum_hex] = (
-                    envelope_checksum
+                active_envelopes = getattr(
+                    self, "_active_transformation_envelopes", None
                 )
+                if active_envelopes is None:
+                    active_envelopes = {}
+                    self._active_transformation_envelopes = active_envelopes
+                active_envelopes[tf_checksum_hex] = envelope_checksum
 
         def _on_done(_fut: Future) -> None:
             self._touch_transformation_cache(tf_checksum_hex, futures)

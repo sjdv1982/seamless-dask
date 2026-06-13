@@ -26,6 +26,48 @@ if TYPE_CHECKING:  # pragma: no cover - type checking only
     from .client import SeamlessDaskClient
 
 
+def _is_expression(value: Any) -> bool:
+    try:
+        from seamless import Expression
+    except Exception:
+        return False
+    return isinstance(value, Expression)
+
+
+def _expression_input_future(
+    client: "SeamlessDaskClient",
+    expression,
+    *,
+    require_value: bool,
+    allow_input_fingertip: bool,
+):
+    input_ref = expression.input_ref
+    if _is_expression(input_ref):
+        input_future = _expression_input_future(
+            client,
+            input_ref,
+            require_value=require_value,
+            allow_input_fingertip=allow_input_fingertip,
+        )
+        return client.get_expression_future(expression, input_future)
+    if hasattr(input_ref, "_ensure_dask_futures"):
+        dep_futures = input_ref._ensure_dask_futures(
+            client, require_value=require_value, need_fat=False
+        )
+        if allow_input_fingertip:
+            input_future = client.ensure_fat_finger_future(dep_futures)
+        else:
+            input_future = client.ensure_fat_future(dep_futures)
+        return client.get_expression_future(expression, input_future)
+
+    checksum = Checksum(input_ref)
+    if allow_input_fingertip:
+        input_future = client.get_fat_finger_checksum_future(checksum)
+    else:
+        input_future = client.get_fat_checksum_future(checksum)
+    return client.get_expression_future(expression, input_future)
+
+
 def _ensure_remote_clients_from_env() -> None:
     payload = os.environ.get("SEAMLESS_REMOTE_CLIENTS")
     if not payload:
@@ -78,7 +120,15 @@ class TransformationDaskMixin:
             return None
         template = getattr(self, "_definition_payload_template", None)
         if template is None:
-            return None
+            pre_transformation = getattr(self, "_pretransformation", None)
+            if pre_transformation is None:
+                return None
+            upstream_dependencies = getattr(self, "_upstream_dependencies", {}) or {}
+            template, dependencies = pre_transformation.build_partial_transformation(
+                upstream_dependencies
+            )
+            self._definition_payload_template = deepcopy(template)
+            self._upstream_dependencies = dict(dependencies)
         transformation_dict = deepcopy(template)
         meta = getattr(self, "_meta", {}) or {}
         if meta:
@@ -527,7 +577,17 @@ class TransformationDaskMixin:
     ) -> TransformationSubmission:
         template = getattr(self, "_definition_payload_template", None)
         if template is None:
-            raise RuntimeError("No frozen transformation definition available for Dask")
+            pre_transformation = getattr(self, "_pretransformation", None)
+            if pre_transformation is None:
+                raise RuntimeError(
+                    "No frozen transformation definition available for Dask"
+                )
+            upstream_dependencies = getattr(self, "_upstream_dependencies", {}) or {}
+            template, dependencies = pre_transformation.build_partial_transformation(
+                upstream_dependencies
+            )
+            self._definition_payload_template = deepcopy(template)
+            self._upstream_dependencies = dict(dependencies)
 
         transformation_dict = deepcopy(template)
         dependencies = getattr(self, "_upstream_dependencies", {}) or {}
@@ -560,6 +620,21 @@ class TransformationDaskMixin:
             celltype, subcelltype, checksum_hex = value
             dependency = dependencies.get(pinname)
             if dependency is not None:
+                if _is_expression(dependency):
+                    inputs[pinname] = TransformationInputSpec(
+                        name=pinname,
+                        celltype=celltype,
+                        subcelltype=subcelltype,
+                        checksum=None,
+                        kind="expression",
+                    )
+                    input_futures[pinname] = _expression_input_future(
+                        client,
+                        dependency,
+                        require_value=require_value,
+                        allow_input_fingertip=allow_input_fingertip,
+                    )
+                    continue
                 if dependency.exception is not None:
                     msg = f"Dependency '{pinname}' has an exception."
                     raise RuntimeError(msg)
