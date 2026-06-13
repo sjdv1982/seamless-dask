@@ -831,15 +831,18 @@ def _expression_task(
         checksum = Checksum(checksum_hex)
         if isinstance(buffer_obj, Buffer):
             Buffer(buffer_obj.content, checksum=checksum)
-        from seamless.checksum.expression import evaluate_expression
+        from seamless.checksum.expression import evaluate_expression_remote
 
-        result_checksum = evaluate_expression(
-            checksum,
-            payload["path"],
-            payload["celltype"],
-            payload["target_celltype"],
-            validator=payload.get("validator"),
-            validator_language=payload.get("validator_language"),
+        result_checksum = _run_on_worker_loop(
+            lambda: evaluate_expression_remote(
+                checksum,
+                payload["path"],
+                payload["celltype"],
+                payload["target_celltype"],
+                validator=payload.get("validator"),
+                validator_language=payload.get("validator_language"),
+                execution="auto",
+            )
         )
         result_buffer = result_checksum.resolve()
         return (
