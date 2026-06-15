@@ -14,7 +14,7 @@ from typing import Any, Dict, Iterable, Mapping, Optional, Tuple, Callable, Coro
 
 import dask.config
 from aiohttp import ClientConnectionError
-from distributed import Client, Future
+from distributed import Client, Future, fire_and_forget
 from distributed.worker import get_worker
 
 from seamless import Buffer, Checksum, CacheMissError
@@ -1454,6 +1454,13 @@ class SeamlessDaskClient:
             submission_id=submission_id,
         )
         futures.members.add(member_id)
+        for future in (base_future, thin_future, fat_future):
+            if future is None:
+                continue
+            try:
+                fire_and_forget(future)
+            except Exception:
+                pass
 
         envelope_checksum = _normalized_dunder_envelope_checksum(submission)
         def _register_done(
@@ -1810,20 +1817,10 @@ class SeamlessDaskClient:
         if self._transformation_done(futures) or futures.base.cancelled():
             self.release_transformation_futures(futures, cancel=False)
             return True
-        submission_id = getattr(futures, "submission_id", None)
-        try:
-            if submission_id:
-                self._client.run_on_scheduler(
-                    _mark_cancelled_submission,
-                    submission_id=str(submission_id),
-                )
-            else:
-                self._client.run_on_scheduler(
-                    _mark_cancelled_transformation,
-                    tf_checksum=tf_checksum_hex,
-                )
-        except Exception:
-            pass
+        # A SeamlessDaskClient only knows about members in this Python process.
+        # Other processes may be latched onto the same scheduler keys, so soft
+        # detach must not mark the shared scheduler submission as canceled here.
+        # Hard cancel_by_checksum() remains the kill-all path.
         self.release_transformation_futures(futures, cancel=False)
         return True
 
