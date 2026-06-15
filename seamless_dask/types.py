@@ -33,6 +33,7 @@ class TransformationSubmission:
     require_value: bool = False
     allow_input_fingertip: bool = False
     strict_dunder: bool = False
+    optional_pins: frozenset[str] = field(default_factory=frozenset)
 
 
 @dataclass

@@ -12,7 +12,10 @@ from copy import deepcopy
 from typing import Any, Dict, Optional, TYPE_CHECKING
 
 from seamless import Checksum, CacheMissError
-from seamless_transformer.transformation_utils import tf_get_buffer
+from seamless_transformer.transformation_utils import (
+    normalize_optional_pins_for_construction,
+    tf_get_buffer,
+)
 from seamless_transformer import probe_index, record_runtime
 
 from .permissions import release_permission, request_permission
@@ -591,6 +594,7 @@ class TransformationDaskMixin:
 
         transformation_dict = deepcopy(template)
         dependencies = getattr(self, "_upstream_dependencies", {}) or {}
+        optional_pins = frozenset(getattr(self, "_optional_pins", ()) or ())
         meta = getattr(self, "_meta", {}) or {}
         allow_input_fingertip = bool(meta.get("allow_input_fingertip", False))
         if meta:
@@ -603,6 +607,7 @@ class TransformationDaskMixin:
             transformation_dict["__meta__"] = merged_meta
         tf_checksum_hex: str | None = None
         if not dependencies:
+            normalize_optional_pins_for_construction(transformation_dict, optional_pins)
             tf_buffer = tf_get_buffer(transformation_dict)
             tf_buffer.tempref()
             tf_checksum = tf_buffer.get_checksum()
@@ -689,6 +694,7 @@ class TransformationDaskMixin:
             require_value=require_value,
             allow_input_fingertip=allow_input_fingertip,
             strict_dunder=bool(getattr(self, "_strict_dunder", False)),
+            optional_pins=optional_pins,
         )
 
     def _ensure_dask_futures(
@@ -744,6 +750,8 @@ class TransformationDaskMixin:
             dependencies = getattr(self, "_upstream_dependencies", {}) or {}
             if dependencies:
                 return None
+            optional_pins = frozenset(getattr(self, "_optional_pins", ()) or ())
+            normalize_optional_pins_for_construction(tf_dict, optional_pins)
             tf_buffer = tf_get_buffer(tf_dict)
             tf_buffer.tempref()
             tf_checksum = tf_buffer.get_checksum()

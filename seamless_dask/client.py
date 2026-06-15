@@ -21,7 +21,11 @@ from seamless import Buffer, Checksum, CacheMissError
 from seamless_transformer.record_runtime import get_record_mode
 from seamless_transformer.record_utils import _utcnow_iso
 from seamless_transformer import worker as transformer_worker
-from seamless_transformer.transformation_utils import tf_get_buffer
+from seamless_transformer.transformation_utils import (
+    json_null_checksum,
+    normalize_optional_pins_for_construction,
+    tf_get_buffer,
+)
 
 from .permissions import ensure_configured
 from .types import (
@@ -933,6 +937,7 @@ def _run_base(
     except Exception:
         owner_dask_priority = None
     tf_dunder = payload.get("tf_dunder", {}) or {}
+    optional_pins = frozenset(payload.get("optional_pins", ()) or ())
     require_value = bool(payload.get("require_value", False))
     started_at = _utcnow_iso()
     wall_start = time.perf_counter()
@@ -952,7 +957,11 @@ def _run_base(
                 checksum_hex, buf, exc = input_value
                 if exc:
                     return tf_checksum_hex, None, None, exc
-                validate_deserializable_as(checksum_hex, spec.celltype, buffer=buf)
+                if not (
+                    spec.name in optional_pins
+                    and checksum_hex == json_null_checksum().hex()
+                ):
+                    validate_deserializable_as(checksum_hex, spec.celltype, buffer=buf)
                 transformation_dict[spec.name] = (
                     spec.celltype,
                     spec.subcelltype,
@@ -962,9 +971,13 @@ def _run_base(
                 result_checksum_hex, buf, exc = input_value
                 if exc:
                     return tf_checksum_hex, None, None, exc
-                validate_deserializable_as(
-                    result_checksum_hex, spec.celltype, buffer=buf
-                )
+                if not (
+                    spec.name in optional_pins
+                    and result_checksum_hex == json_null_checksum().hex()
+                ):
+                    validate_deserializable_as(
+                        result_checksum_hex, spec.celltype, buffer=buf
+                    )
                 transformation_dict[spec.name] = (
                     spec.celltype,
                     spec.subcelltype,
@@ -974,9 +987,13 @@ def _run_base(
                 result_checksum_hex, buf, exc = input_value
                 if exc:
                     return tf_checksum_hex, None, None, exc
-                validate_deserializable_as(
-                    result_checksum_hex, spec.celltype, buffer=buf
-                )
+                if not (
+                    spec.name in optional_pins
+                    and result_checksum_hex == json_null_checksum().hex()
+                ):
+                    validate_deserializable_as(
+                        result_checksum_hex, spec.celltype, buffer=buf
+                    )
                 transformation_dict[spec.name] = (
                     spec.celltype,
                     spec.subcelltype,
@@ -986,6 +1003,9 @@ def _run_base(
                 raise ValueError(f"Unknown input kind '{spec.kind}'")
 
         if tf_checksum_hex is None:
+            normalize_optional_pins_for_construction(
+                transformation_dict, optional_pins
+            )
             tf_buffer = tf_get_buffer(transformation_dict)
             tf_buffer.tempref()
             tf_checksum_hex = tf_buffer.get_checksum().hex()
@@ -1371,6 +1391,7 @@ class SeamlessDaskClient:
             "owner_dask_priority": base_priority,
             "record": get_record_mode(),
             "submission_id": submission_id,
+            "optional_pins": sorted(submission.optional_pins),
         }
         input_futures = dict(submission.input_futures)
         resource_string = None  # TODO: get from tf_dunder
