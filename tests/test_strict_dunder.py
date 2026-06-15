@@ -101,6 +101,76 @@ def test_dask_same_checksum_different_dunder_latches_by_default():
     assert client._cached_transformation_for_submission(latcher) is futures
 
 
+def test_dask_cached_transformation_adds_latcher_member():
+    client = _client()
+    active = _submission("1" * 64, meta={"local": False})
+    futures = TransformationFutures(
+        base=FakeFuture(done=False),
+        thin=FakeFuture(done=False),
+        fat=None,
+        tf_checksum=active.tf_checksum,
+    )
+    futures.members.add("first")
+    client._store_transformation(
+        active.tf_checksum,
+        futures,
+        envelope_checksum=_normalized_dunder_envelope_checksum(active),
+    )
+
+    latcher = _submission("1" * 64, meta={"local": True})
+
+    assert (
+        client._cached_transformation_for_submission(latcher, member_id="second")
+        is futures
+    )
+    assert futures.members == {"first", "second"}
+
+
+def test_dask_softcancel_one_member_leaves_futures_alive():
+    client = _client()
+    active = _submission("2" * 64, meta={"local": False})
+    futures = TransformationFutures(
+        base=FakeFuture(done=False),
+        thin=FakeFuture(done=False),
+        fat=None,
+        tf_checksum=active.tf_checksum,
+        submission_id="soft-token",
+    )
+    futures.members.update({"first", "second"})
+    client._store_transformation(
+        active.tf_checksum,
+        futures,
+        envelope_checksum=_normalized_dunder_envelope_checksum(active),
+    )
+
+    assert client.softcancel_by_checksum(active.tf_checksum, "first") is True
+    assert active.tf_checksum in client._transformation_cache
+    assert futures.members == {"second"}
+    assert not _is_submission_cancelled(client._client, futures.submission_id)
+
+
+def test_dask_softcancel_last_member_marks_scheduler_cancel():
+    client = _client()
+    active = _submission("3" * 64, meta={"local": False})
+    futures = TransformationFutures(
+        base=FakeFuture(done=False),
+        thin=FakeFuture(done=False),
+        fat=None,
+        tf_checksum=active.tf_checksum,
+        submission_id="last-token",
+    )
+    futures.members.add("last")
+    client._store_transformation(
+        active.tf_checksum,
+        futures,
+        envelope_checksum=_normalized_dunder_envelope_checksum(active),
+    )
+
+    assert client.softcancel_by_checksum(active.tf_checksum, "last") is True
+    assert active.tf_checksum not in client._transformation_cache
+    assert _is_submission_cancelled(client._client, futures.submission_id)
+
+
 def test_dask_strict_different_dunder_rejects_only_while_active():
     client = _client()
     active = _submission("b" * 64, meta={"local": False})
@@ -146,6 +216,7 @@ def test_dask_cancel_by_checksum_marks_and_releases_active_submission():
     assert client.cancel_by_checksum(active.tf_checksum) is False
     assert active.tf_checksum not in client._transformation_cache
     assert active.tf_checksum not in client._active_transformation_envelopes
+    assert futures.members == set()
     assert not client._client.cancelled
     assert _is_submission_cancelled(client._client, futures.submission_id)
 

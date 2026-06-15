@@ -1363,6 +1363,7 @@ class SeamlessDaskClient:
         *,
         need_fat: bool = False,
         priority_boost: int = 0,
+        member_id: str | None = None,
     ) -> TransformationFutures:
         """Submit a transformation to Dask and return its futures."""
         self._prune_caches()
@@ -1376,11 +1377,15 @@ class SeamlessDaskClient:
         thin_priority = _BASE_DASK_PRIORITY + 10 + boost
 
         if tf_checksum_hex and not is_driver:
-            cached_futures = self._cached_transformation_for_submission(submission)
+            cached_futures = self._cached_transformation_for_submission(
+                submission, member_id=member_id
+            )
             if cached_futures is not None:
                 return cached_futures
 
         submission_id = uuid.uuid4().hex
+        if member_id is None:
+            member_id = uuid.uuid4().hex
         payload = {
             "transformation_dict": submission.transformation_dict,
             "inputs": [spec.__dict__ for spec in submission.inputs.values()],
@@ -1448,6 +1453,7 @@ class SeamlessDaskClient:
             tf_checksum=tf_checksum_hex,
             submission_id=submission_id,
         )
+        futures.members.add(member_id)
 
         envelope_checksum = _normalized_dunder_envelope_checksum(submission)
         def _register_done(
@@ -1655,7 +1661,7 @@ class SeamlessDaskClient:
             self._active_transformation_envelopes.pop(tf_checksum_hex, None)
 
     def _cached_transformation_for_submission(
-        self, submission: TransformationSubmission
+        self, submission: TransformationSubmission, *, member_id: str | None = None
     ) -> TransformationFutures | None:
         tf_checksum_hex = submission.tf_checksum
         if not tf_checksum_hex:
@@ -1678,6 +1684,8 @@ class SeamlessDaskClient:
                 "envelope; wait for it to finish or cancel it before strict "
                 "re-submission"
             )
+        if member_id is not None:
+            futures.members.add(str(member_id))
         self._touch_transformation_cache(tf_checksum_hex, futures)
         return futures
 
@@ -1737,11 +1745,18 @@ class SeamlessDaskClient:
         self._touch_transformation_cache(tf_checksum_hex, futures)
 
     def release_transformation_futures(
-        self, futures: TransformationFutures, *, cancel: bool = True
+        self,
+        futures: TransformationFutures,
+        *,
+        cancel: bool = True,
+        member_id: str | None = None,
     ) -> None:
         """Release and optionally cancel a transformation's futures and cache entries."""
 
         tf_checksum_hex = futures.tf_checksum
+        if not cancel and member_id is not None and tf_checksum_hex:
+            self.softcancel_by_checksum(tf_checksum_hex, member_id)
+            return
         with self._cache_lock:
             self._released_transformation_futures.add(id(futures))
             if tf_checksum_hex:
@@ -1770,6 +1785,47 @@ class SeamlessDaskClient:
                 future.release()
             except Exception:
                 pass
+
+    def softcancel_by_checksum(
+        self, tf_checksum: Checksum | str, member_id: str | None = None
+    ) -> bool:
+        """Detach one member from active transformation futures."""
+
+        if member_id is None:
+            return False
+        tf_checksum_hex = (
+            tf_checksum.hex() if isinstance(tf_checksum, Checksum) else str(tf_checksum)
+        )
+        with self._cache_lock:
+            cached = self._transformation_cache.get(tf_checksum_hex)
+            if cached is None:
+                return False
+            futures = cached[0]
+            if str(member_id) not in futures.members:
+                return False
+            futures.members.remove(str(member_id))
+            remaining = bool(futures.members)
+        if remaining:
+            return True
+        if self._transformation_done(futures) or futures.base.cancelled():
+            self.release_transformation_futures(futures, cancel=False)
+            return True
+        submission_id = getattr(futures, "submission_id", None)
+        try:
+            if submission_id:
+                self._client.run_on_scheduler(
+                    _mark_cancelled_submission,
+                    submission_id=str(submission_id),
+                )
+            else:
+                self._client.run_on_scheduler(
+                    _mark_cancelled_transformation,
+                    tf_checksum=tf_checksum_hex,
+                )
+        except Exception:
+            pass
+        self.release_transformation_futures(futures, cancel=False)
+        return True
 
     def cancel_by_checksum(self, tf_checksum: Checksum | str) -> bool:
         """Cancel the active transformation submission for a checksum."""
@@ -1800,6 +1856,7 @@ class SeamlessDaskClient:
         futures = cached[0]
         if self._transformation_done(futures) or futures.base.cancelled():
             return False
+        futures.members.clear()
         submission_id = getattr(futures, "submission_id", None)
         if submission_id:
             try:

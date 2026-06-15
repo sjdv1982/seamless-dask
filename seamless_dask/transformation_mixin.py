@@ -8,6 +8,7 @@ import random
 import string
 import time
 import traceback
+import uuid
 from copy import deepcopy
 from typing import Any, Dict, Optional, TYPE_CHECKING
 
@@ -436,7 +437,9 @@ class TransformationDaskMixin:
                 release_permission()
             if futures is not None:
                 try:
-                    client.cancel_by_checksum(futures.tf_checksum)
+                    client.softcancel_by_checksum(
+                        futures.tf_checksum, getattr(self, "_dask_member_id", None)
+                    )
                 except Exception:
                     pass
             raise
@@ -706,6 +709,10 @@ class TransformationDaskMixin:
         permission_granted: bool = False,
     ) -> TransformationFutures:
         permission_released = False
+        member_id = getattr(self, "_dask_member_id", None)
+        if member_id is None:
+            member_id = uuid.uuid4().hex
+            self._dask_member_id = member_id
         if self._dask_futures is not None:
             futures = self._dask_futures
         else:
@@ -713,9 +720,18 @@ class TransformationDaskMixin:
                 client, require_value=require_value, need_fat=need_fat
             )
             if submission.tf_checksum and not _submission_is_driver(submission):
-                cached_futures = client._cached_transformation_for_submission(  # type: ignore[attr-defined]
-                    submission
-                )
+                try:
+                    cached_futures = client._cached_transformation_for_submission(  # type: ignore[attr-defined]
+                        submission, member_id=member_id
+                    )
+                except TypeError:
+                    cached_futures = client._cached_transformation_for_submission(  # type: ignore[attr-defined]
+                        submission
+                    )
+                    if cached_futures is not None:
+                        members = getattr(cached_futures, "members", None)
+                        if isinstance(members, set):
+                            members.add(member_id)
                 if cached_futures is not None:
                     if permission_granted:
                         release_permission()
@@ -728,7 +744,17 @@ class TransformationDaskMixin:
                         )
                     return futures
             try:
-                futures = client.submit_transformation(submission, need_fat=need_fat)
+                try:
+                    futures = client.submit_transformation(
+                        submission, need_fat=need_fat, member_id=member_id
+                    )
+                except TypeError:
+                    futures = client.submit_transformation(
+                        submission, need_fat=need_fat
+                    )
+                    members = getattr(futures, "members", None)
+                    if isinstance(members, set):
+                        members.add(member_id)
                 self._dask_futures = futures
                 if permission_granted and futures.base is not None:
                     futures.base.add_done_callback(lambda _f: release_permission())
