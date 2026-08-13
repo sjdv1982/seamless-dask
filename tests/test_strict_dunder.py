@@ -149,7 +149,7 @@ def test_dask_softcancel_one_member_leaves_futures_alive():
     assert not _is_submission_cancelled(client._client, futures.submission_id)
 
 
-def test_dask_softcancel_last_member_marks_scheduler_cancel():
+def test_dask_softcancel_last_member_detaches_without_scheduler_cancel():
     client = _client()
     active = _submission("3" * 64, meta={"local": False})
     futures = TransformationFutures(
@@ -168,7 +168,9 @@ def test_dask_softcancel_last_member_marks_scheduler_cancel():
 
     assert client.softcancel_by_checksum(active.tf_checksum, "last") is True
     assert active.tf_checksum not in client._transformation_cache
-    assert _is_submission_cancelled(client._client, futures.submission_id)
+    # Soft cancellation only drops this process's interest.  Hard cancellation
+    # is the operation that marks a shared scheduler submission canceled.
+    assert not _is_submission_cancelled(client._client, futures.submission_id)
 
 
 def test_dask_strict_different_dunder_rejects_only_while_active():
