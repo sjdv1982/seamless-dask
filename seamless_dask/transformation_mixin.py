@@ -38,6 +38,24 @@ def _is_expression(value: Any) -> bool:
     return isinstance(value, Expression)
 
 
+def _publish_definition_for_dask(owner, checksum: Checksum) -> Checksum:
+    publish = getattr(owner, "_publish_definition", None)
+    if callable(publish):
+        return publish(checksum)
+    checksum.tempref()
+    owner._transformation_checksum = checksum
+    return checksum
+
+
+def _publish_result_for_dask(owner, checksum: Checksum) -> Checksum:
+    publish = getattr(owner, "_publish_result", None)
+    if callable(publish):
+        return publish(checksum)
+    checksum.tempref()
+    owner._result_checksum = checksum
+    return checksum
+
+
 def _expression_input_future(
     client: "SeamlessDaskClient",
     expression,
@@ -248,13 +266,15 @@ class TransformationDaskMixin:
             tf_checksum_hex = self._compute_tf_checksum_no_deps()
         if tf_checksum_hex is not None:
             if not self._constructed:
-                self._transformation_checksum = Checksum(tf_checksum_hex)
+                self._transformation_checksum = _publish_definition_for_dask(self, 
+                    Checksum(tf_checksum_hex)
+                )
                 self._constructed = True
             cached = self._try_database_cache_sync(
                 tf_checksum_hex, require_value=require_value
             )
             if cached is not None:
-                self._result_checksum = cached
+                _publish_result_for_dask(self, cached)
                 self._evaluated = True
                 self._exception = None
                 return self._result_checksum
@@ -286,9 +306,11 @@ class TransformationDaskMixin:
             if cached is not None:
                 if permission_granted:
                     release_permission()
-                self._transformation_checksum = Checksum(tf_checksum_hex)
+                self._transformation_checksum = _publish_definition_for_dask(self, 
+                    Checksum(tf_checksum_hex)
+                )
                 self._constructed = True
-                self._result_checksum = cached
+                _publish_result_for_dask(self, cached)
                 self._evaluated = True
                 self._exception = None
                 return self._result_checksum
@@ -329,10 +351,12 @@ class TransformationDaskMixin:
             self._evaluated = True
             return None
         if tf_checksum_hex:
-            self._transformation_checksum = Checksum(tf_checksum_hex)
+            self._transformation_checksum = _publish_definition_for_dask(self, 
+                Checksum(tf_checksum_hex)
+            )
             self._constructed = True
         if result_checksum_hex:
-            self._result_checksum = Checksum(result_checksum_hex)
+            _publish_result_for_dask(self, Checksum(result_checksum_hex))
             self._evaluated = True
             if self._transformation_checksum is not None:
                 try:
@@ -364,9 +388,11 @@ class TransformationDaskMixin:
                 tf_checksum_hex, require_value=require_value
             )
             if cached is not None:
-                self._transformation_checksum = Checksum(tf_checksum_hex)
+                self._transformation_checksum = _publish_definition_for_dask(self, 
+                    Checksum(tf_checksum_hex)
+                )
                 self._constructed = True
-                self._result_checksum = cached
+                _publish_result_for_dask(self, cached)
                 self._evaluated = True
                 self._exception = None
                 return self._result_checksum
@@ -404,9 +430,11 @@ class TransformationDaskMixin:
             if cached is not None:
                 if permission_granted:
                     release_permission()
-                self._transformation_checksum = Checksum(tf_checksum_hex)
+                self._transformation_checksum = _publish_definition_for_dask(self, 
+                    Checksum(tf_checksum_hex)
+                )
                 self._constructed = True
-                self._result_checksum = cached
+                _publish_result_for_dask(self, cached)
                 self._evaluated = True
                 self._exception = None
                 return self._result_checksum
@@ -465,10 +493,12 @@ class TransformationDaskMixin:
             self._evaluated = True
             return None
         if tf_checksum_hex:
-            self._transformation_checksum = Checksum(tf_checksum_hex)
+            self._transformation_checksum = _publish_definition_for_dask(self, 
+                Checksum(tf_checksum_hex)
+            )
             self._constructed = True
         if result_checksum_hex:
-            self._result_checksum = Checksum(result_checksum_hex)
+            _publish_result_for_dask(self, Checksum(result_checksum_hex))
             self._evaluated = True
             if self._transformation_checksum is not None:
                 try:
@@ -615,7 +645,7 @@ class TransformationDaskMixin:
             tf_buffer.tempref()
             tf_checksum = tf_buffer.get_checksum()
             tf_checksum_hex = tf_checksum.hex()
-            self._transformation_checksum = tf_checksum
+            self._transformation_checksum = _publish_definition_for_dask(self, tf_checksum)
             self._constructed = True
 
         inputs: dict[str, TransformationInputSpec] = {}
