@@ -339,6 +339,13 @@ class TransformationDaskMixin:
             self._evaluated = True
             return None
         if exc:
+            if "Transformation was canceled" in exc:
+                self._mark_cancelled("Transformation was canceled")
+                from seamless_transformer.transformation_cache import (
+                    TransformationCancelledError,
+                )
+
+                raise TransformationCancelledError("Transformation was canceled")
             self._exception = exc if exc.endswith("\n") else exc + "\n"
             self._constructed = True
             self._evaluated = True
@@ -484,6 +491,13 @@ class TransformationDaskMixin:
             self._evaluated = True
             return None
         if exc:
+            if "Transformation was canceled" in exc:
+                self._mark_cancelled("Transformation was canceled")
+                from seamless_transformer.transformation_cache import (
+                    TransformationCancelledError,
+                )
+
+                raise TransformationCancelledError("Transformation was canceled")
             self._exception = exc if exc.endswith("\n") else exc + "\n"
             self._constructed = True
             self._evaluated = True
