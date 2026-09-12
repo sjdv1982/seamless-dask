@@ -841,8 +841,8 @@ def _expression_task(
             lambda: evaluate_expression_remote(
                 checksum,
                 payload["path"],
+                payload["input_celltype"],
                 payload["celltype"],
-                payload["target_celltype"],
                 validator=payload.get("validator"),
                 validator_language=payload.get("validator_language"),
                 execution="auto",
@@ -1322,8 +1322,8 @@ class SeamlessDaskClient:
         """Return a fat-checksum-shaped future for an expression result."""
         payload = {
             "path": expression.path,
-            "celltype": expression.input_celltype,
-            "target_celltype": expression.target_celltype,
+            "input_celltype": expression.input_celltype,
+            "celltype": expression.celltype,
             "validator": (
                 expression.validator.hex()
                 if getattr(expression, "validator", None) is not None

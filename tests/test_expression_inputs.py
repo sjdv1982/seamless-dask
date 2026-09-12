@@ -10,8 +10,8 @@ def test_expression_task_returns_fat_input_tuple():
     result_checksum, result_buffer, error = dask_client._expression_task(
         {
             "path": "value",
-            "celltype": "plain",
-            "target_celltype": "int",
+            'input_celltype': "plain",
+            'celltype': "int",
             "validator": None,
             "validator_language": None,
         },
