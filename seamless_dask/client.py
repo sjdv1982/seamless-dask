@@ -1322,7 +1322,7 @@ class SeamlessDaskClient:
         """Return a fat-checksum-shaped future for an expression result."""
         payload = {
             "path": expression.path,
-            "celltype": expression.celltype,
+            "celltype": expression.input_celltype,
             "target_celltype": expression.target_celltype,
             "validator": (
                 expression.validator.hex()
