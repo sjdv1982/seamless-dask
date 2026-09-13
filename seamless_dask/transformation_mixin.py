@@ -63,7 +63,7 @@ def _expression_input_future(
     require_value: bool,
     allow_input_fingertip: bool,
 ):
-    input_ref = expression.input_ref
+    input_ref = expression._input_ref
     if _is_expression(input_ref):
         input_future = _expression_input_future(
             client,
