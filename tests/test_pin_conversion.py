@@ -29,7 +29,8 @@ def test_converted_pin_dependencies_and_null_boundaries():
         converted = consume(source('42'))
         assert converted.run() == 42
         payload = converted.construct().resolve('plain')
-        assert payload['value'][2] == Buffer(42, 'int').get_checksum().hex()
+        # str -> int keeps the checksum: the int pin holds the str's checksum.
+        assert payload['value'][2] == Buffer('42', 'str').get_checksum().hex()
 
         cell = Cell('str')
         cell.set('43')
