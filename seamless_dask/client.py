@@ -57,6 +57,11 @@ _QUEUE_EXCLUSIVE_ENV = "SEAMLESS_DASK_QUEUE_EXCLUSIVE"
 _STARTUP_RECORD_MODE_ENV = "SEAMLESS_DASK_RECORD_MODE"
 
 
+def _checksum_hex(checksum: Checksum | str) -> str:
+    """Normalize checksum keys without relying on their display spelling."""
+    return checksum.hex() if isinstance(checksum, Checksum) else str(checksum)
+
+
 def _parse_bool_env(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
     if raw is None:
@@ -142,13 +147,13 @@ def _mark_cancelled_transformation(dask_scheduler, tf_checksum: str) -> bool:
     if canceled is None:
         canceled = set()
         setattr(dask_scheduler, "seamless_cancelled_transformations", canceled)
-    canceled.add(str(tf_checksum))
+    canceled.add(_checksum_hex(tf_checksum))
     return True
 
 
 def _pop_cancelled_transformation(dask_scheduler, tf_checksum: str) -> bool:
     canceled = getattr(dask_scheduler, "seamless_cancelled_transformations", set())
-    tf_checksum = str(tf_checksum)
+    tf_checksum = _checksum_hex(tf_checksum)
     if tf_checksum not in canceled:
         return False
     try:
@@ -182,10 +187,10 @@ def _scheduler_consume_cancel(
     transformations = getattr(
         dask_scheduler, "seamless_cancelled_transformations", set()
     )
-    if str(tf_checksum) in transformations:
+    if _checksum_hex(tf_checksum) in transformations:
         hit = True
         try:
-            transformations.remove(str(tf_checksum))
+            transformations.remove(_checksum_hex(tf_checksum))
         except KeyError:
             pass
     return hit
@@ -211,7 +216,7 @@ def _consume_cancel_flags(
 def _scheduler_matching_transformation_keys(
     dask_scheduler, tf_checksum: str
 ) -> list[str]:
-    tf_checksum = str(tf_checksum)
+    tf_checksum = _checksum_hex(tf_checksum)
     matches = []
     for key in getattr(dask_scheduler, "tasks", {}):
         key_text = str(key)
@@ -241,7 +246,7 @@ def _is_transformation_cancelled(dask_client: Client, tf_checksum: str | None) -
         return bool(
             dask_client.run_on_scheduler(
                 _pop_cancelled_transformation,
-                tf_checksum=str(tf_checksum),
+                tf_checksum=_checksum_hex(tf_checksum),
             )
         )
     except Exception:
@@ -291,7 +296,7 @@ def _base_prefix_for_transformation(transformation_dict: Mapping[str, Any]) -> s
     base_prefix = "base"
     ccs = transformation_dict.get("__code_checksum__")
     if ccs is not None:
-        base_prefix += "_" + str(ccs)
+        base_prefix += "_" + _checksum_hex(ccs)
     return base_prefix
 
 
