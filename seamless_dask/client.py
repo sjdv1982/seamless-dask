@@ -18,6 +18,7 @@ from distributed import Client, Future, fire_and_forget
 from distributed.worker import get_worker
 
 from seamless import Buffer, Checksum, CacheMissError
+from seamless.error_envelope import encode_error, WorkflowExecutionError
 from seamless_transformer.record_runtime import get_record_mode
 from seamless_transformer.record_utils import _utcnow_iso
 from seamless_transformer import worker as transformer_worker
@@ -796,7 +797,9 @@ async def _promise_and_write_result_async(
         return
 
 
-def _fat_checksum_task(checksum_hex: str) -> Tuple[str, Buffer | None, str | None]:
+def _fat_checksum_task(
+    checksum_hex: str,
+) -> Tuple[str, Buffer | None, dict[str, Any] | None]:
     """Resolve a checksum into a buffer on a worker."""
     try:
         checksum = Checksum(checksum_hex)
@@ -806,13 +809,14 @@ def _fat_checksum_task(checksum_hex: str) -> Tuple[str, Buffer | None, str | Non
             buffer_obj if isinstance(buffer_obj, Buffer) else None,
             None,
         )
-    except Exception:
-        return checksum_hex, None, traceback.format_exc()
+    except Exception as exc:
+
+        return checksum_hex, None, encode_error(exc)
 
 
 def _fat_finger_checksum_task(
     checksum_hex: str,
-) -> Tuple[str, Buffer | None, str | None]:
+) -> Tuple[str, Buffer | None, dict[str, Any] | None]:
     """Resolve or fingertip a checksum into a buffer on a worker."""
     try:
         checksum = Checksum(checksum_hex)
@@ -822,20 +826,27 @@ def _fat_finger_checksum_task(
             buffer_obj if isinstance(buffer_obj, Buffer) else None,
             None,
         )
-    except Exception:
-        return checksum_hex, None, traceback.format_exc()
+    except Exception as exc:
+
+        return checksum_hex, None, encode_error(exc)
 
 
 def _expression_task(
     payload: Dict[str, Any],
     input_value: Tuple[Any, ...],
-) -> Tuple[str | None, Buffer | None, str | None]:
+) -> Tuple[str | None, Buffer | None, dict[str, Any] | None]:
     """Evaluate an expression input from a fat input tuple."""
     checksum_hex, buffer_obj, exc = input_value
     if exc:
         return checksum_hex, buffer_obj, exc
     if checksum_hex is None:
-        return None, None, "Expression input checksum unavailable"
+        return (
+            None,
+            None,
+            encode_error(
+                WorkflowExecutionError("Expression input checksum unavailable")
+            ),
+        )
     try:
         checksum = Checksum(checksum_hex)
         if isinstance(buffer_obj, Buffer):
@@ -854,20 +865,33 @@ def _expression_task(
             )
         )
         result_buffer = result_checksum.resolve()
+        from seamless_remote import buffer_remote
+
+        if isinstance(result_buffer, Buffer):
+            _run_on_worker_loop(
+                lambda: buffer_remote.write_buffer(result_checksum, result_buffer)
+            )
         return (
             result_checksum.hex(),
             result_buffer if isinstance(result_buffer, Buffer) else None,
             None,
         )
-    except Exception:
-        return checksum_hex, None, traceback.format_exc()
+    except Exception as exc:
+
+        return checksum_hex, None, encode_error(exc)
+
+
+def _expression_checksum_task(value):
+    """Keep the result buffer on workers at a standalone dispatch boundary."""
+    checksum, _, error = value
+    return checksum, error
 
 
 def _run_base(
     payload: Dict[str, Any],
     input_results: Mapping[str, Tuple[Any, ...]],
     priority: int | None = None,
-) -> Tuple[str | None, str | None, Buffer | None, str | None]:
+) -> Tuple[str | None, str | None, Buffer | None, dict[str, Any] | None]:
     """Worker task that performs the transformation itself."""
 
     from seamless_dask.client import SeamlessDaskClient
@@ -889,8 +913,8 @@ def _run_base(
     submission_id = payload.get("submission_id")
     request_record_mode = bool(payload.get("record", False))
     if request_record_mode != _startup_record_mode():
-        return tf_checksum_hex, None, None, _record_mode_mismatch_error(
-            request_record_mode
+        return tf_checksum_hex, None, None, encode_error(
+            WorkflowExecutionError(_record_mode_mismatch_error(request_record_mode))
         )
 
     owner_dask_key = payload.get("owner_dask_key")
@@ -1112,8 +1136,10 @@ def _run_base(
             )
         finally:
             gpu_memory_peak_bytes = stop_gpu_memory_sampler(gpu_sampler)
-        if isinstance(result_checksum, str):
+        if isinstance(result_checksum, dict) and "error" in result_checksum:
             return tf_checksum_hex, None, None, result_checksum
+        if isinstance(result_checksum, str):
+            return tf_checksum_hex, None, None, encode_error(WorkflowExecutionError(result_checksum))
         result_checksum = Checksum(result_checksum)
 
         result_checksum_hex = result_checksum.hex()
@@ -1132,7 +1158,7 @@ def _run_base(
                 tf_checksum_hex,
                 result_checksum_hex,
                 None,
-                "Result value unavailable",
+                encode_error(CacheMissError(result_checksum)),
             )
 
         tf_checksum_obj = Checksum(tf_checksum_hex)
@@ -1174,13 +1200,13 @@ def _run_base(
         )
 
         return tf_checksum_hex, result_checksum_hex, result_buffer, None
-    except Exception:
-        return tf_checksum_hex, None, None, traceback.format_exc()
+    except Exception as exc:
+        return tf_checksum_hex, None, None, encode_error(exc)
 
 
 def _run_fat(
-    base_result: Tuple[str | None, str | None, Buffer | None, str | None],
-) -> Tuple[str | None, Buffer | None, str | None]:
+    base_result: Tuple[str | None, str | None, Buffer | None, dict[str, Any] | None],
+) -> Tuple[str | None, Buffer | None, dict[str, Any] | None]:
     """Worker task that ensures a buffer is available for dependents."""
     tf_checksum_hex, result_checksum_hex, result_buffer, exc = base_result
     if exc:
@@ -1188,13 +1214,13 @@ def _run_fat(
     if result_buffer is not None:
         return result_checksum_hex, result_buffer, None
     if result_checksum_hex is None:
-        return None, None, "Result checksum unavailable"
+        return None, None, encode_error(WorkflowExecutionError("Result checksum unavailable"))
     return _fat_checksum_task(result_checksum_hex)
 
 
 def _run_fat_finger(
-    base_result: Tuple[str | None, str | None, Buffer | None, str | None],
-) -> Tuple[str | None, Buffer | None, str | None]:
+    base_result: Tuple[str | None, str | None, Buffer | None, dict[str, Any] | None],
+) -> Tuple[str | None, Buffer | None, dict[str, Any] | None]:
     """Worker task that allows fingering inputs when buffers are missing."""
     tf_checksum_hex, result_checksum_hex, result_buffer, exc = base_result
     if exc:
@@ -1202,7 +1228,7 @@ def _run_fat_finger(
     if result_buffer is not None:
         return result_checksum_hex, result_buffer, None
     if result_checksum_hex is None:
-        return None, None, "Result checksum unavailable"
+        return None, None, encode_error(WorkflowExecutionError("Result checksum unavailable"))
     checksum_hex, buffer_obj, err = _fat_checksum_task(result_checksum_hex)
     if buffer_obj is not None and err is None:
         return checksum_hex, buffer_obj, None
@@ -1210,8 +1236,8 @@ def _run_fat_finger(
 
 
 def _run_thin(
-    base_result: Tuple[str | None, str | None, Buffer | None, str | None],
-) -> Tuple[str | None, str | None, str | None]:
+    base_result: Tuple[str | None, str | None, Buffer | None, dict[str, Any] | None],
+) -> Tuple[str | None, str | None, dict[str, Any] | None]:
     """Worker task that only needs the checksums."""
     tf_checksum_hex, result_checksum_hex, _result_buffer, exc = base_result
     return tf_checksum_hex, result_checksum_hex, exc
@@ -1281,8 +1307,19 @@ class SeamlessDaskClient:
         with self._cache_lock:
             cached = self._fat_checksum_cache.get(checksum_hex)
         if cached is not None and not cached[0].cancelled():
-            self._touch_fat_checksum_cache(checksum_hex, cached[0])
-            return cached[0]
+            failed = False
+            if cached[0].done():
+                try:
+                    failed = bool(cached[0].result()[2])
+                except Exception:
+                    failed = True
+            if not failed:
+                self._touch_fat_checksum_cache(checksum_hex, cached[0])
+                return cached[0]
+            with self._cache_lock:
+                if self._fat_checksum_cache.get(checksum_hex) == cached:
+                    self._fat_checksum_cache.pop(checksum_hex)
+            cached[0].release()
 
         future = self._client.submit(
             _fat_checksum_task,
@@ -1336,7 +1373,9 @@ class SeamlessDaskClient:
             ),
             "validator_language": expression.validator_language,
         }
-        key = "expression-" + uuid.uuid4().hex
+        from dask.base import tokenize
+
+        key = "expression-" + tokenize(payload, input_future.key)
         return self._client.submit(
             _expression_task,
             payload,
@@ -1591,9 +1630,9 @@ class SeamlessDaskClient:
 
             cache = get_buffer_cache()
             cs_obj = Checksum(checksum_hex)
-            with cache.lock:
-                if cs_obj in cache.strong_cache or cs_obj in cache.weak_cache:
-                    has_local_buffer = True
+            # A refholder-only cache entry is not an uploadable buffer. Existing
+            # promises on the hashserver retain their normal wait semantics.
+            has_local_buffer = isinstance(cache.get(cs_obj), Buffer)
         except Exception:
             pass
         if not has_local_buffer:

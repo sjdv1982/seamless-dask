@@ -235,7 +235,8 @@ def test_run_base_rejects_record_mode_mismatch(monkeypatch):
 
     assert result[0] == tf_checksum.hex()
     assert result[1] is None
-    assert "Dask server record mode mismatch" in result[3]
+    assert result[3]["error"]["kind"] == "execution"
+    assert "Dask server record mode mismatch" in result[3]["error"]["message"]
 
 
 def test_wrapper_configuration_exports_startup_record_mode():
@@ -739,7 +740,8 @@ def test_run_base_surfaces_record_persistence_failure(monkeypatch):
 
     assert result[0] == tf_checksum.hex()
     assert result[1] is None
-    assert "missing bucket probe" in result[3]
+    assert result[3]["error"]["kind"] == "execution"
+    assert "missing bucket probe" in result[3]["error"]["message"]
 
 
 def test_minimal_record_write_storage_failure_logs_and_continues(

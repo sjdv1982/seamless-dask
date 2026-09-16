@@ -267,8 +267,7 @@ class TransformationDaskMixin:
         if tf_checksum_hex is not None:
             if not self._constructed:
                 self._transformation_checksum = _publish_definition_for_dask(
-                    self,
-                    Checksum(tf_checksum_hex)
+                    self, Checksum(tf_checksum_hex)
                 )
                 self._constructed = True
             cached = self._try_database_cache_sync(
@@ -308,8 +307,7 @@ class TransformationDaskMixin:
                 if permission_granted:
                     release_permission()
                 self._transformation_checksum = _publish_definition_for_dask(
-                    self,
-                    Checksum(tf_checksum_hex)
+                    self, Checksum(tf_checksum_hex)
                 )
                 self._constructed = True
                 _publish_result_for_dask(self, cached)
@@ -331,28 +329,38 @@ class TransformationDaskMixin:
                 permission_granted=permission_granted,
             )
             tf_checksum_hex, result_checksum_hex, exc = futures.thin.result()
-        except Exception:
+        except Exception as exc:
             if permission_granted:
                 release_permission()
-            self._exception = traceback.format_exc().strip("\n") + "\n"
+            from seamless.error_envelope import execution_error
+
+            self._exception = execution_error(exc)
             self._constructed = True
             self._evaluated = True
             return None
         if exc:
-            if "Transformation was canceled" in exc:
+            if (
+                isinstance(exc, dict) and exc.get("error", {}).get("kind") == "canceled"
+            ) or (isinstance(exc, str) and "Transformation was canceled" in exc):
                 self._mark_cancelled("Transformation was canceled")
                 from seamless_transformer.transformation_cache import (
                     TransformationCancelledError,
                 )
 
                 raise TransformationCancelledError("Transformation was canceled")
-            self._exception = exc if exc.endswith("\n") else exc + "\n"
+            from seamless.error_envelope import execution_error
+
+            self._exception = (
+                execution_error(exc)
+                if isinstance(exc, dict)
+                else exc
+                if exc.endswith("\n")
+                else exc + "\n"
+            )
             self._constructed = True
             self._evaluated = True
             return None
-        if result_checksum_hex is not None and not _is_valid_checksum(
-            result_checksum_hex
-        ):
+        if result_checksum_hex is not None and not _is_valid_checksum(result_checksum_hex):
             self._exception = (
                 "Invalid Dask result checksum: " + repr(result_checksum_hex) + "\n"
             )
@@ -361,8 +369,7 @@ class TransformationDaskMixin:
             return None
         if tf_checksum_hex:
             self._transformation_checksum = _publish_definition_for_dask(
-                self,
-                Checksum(tf_checksum_hex)
+                self, Checksum(tf_checksum_hex)
             )
             self._constructed = True
         if result_checksum_hex:
@@ -399,8 +406,7 @@ class TransformationDaskMixin:
             )
             if cached is not None:
                 self._transformation_checksum = _publish_definition_for_dask(
-                    self,
-                    Checksum(tf_checksum_hex)
+                    self, Checksum(tf_checksum_hex)
                 )
                 self._constructed = True
                 _publish_result_for_dask(self, cached)
@@ -442,8 +448,7 @@ class TransformationDaskMixin:
                 if permission_granted:
                     release_permission()
                 self._transformation_checksum = _publish_definition_for_dask(
-                    self,
-                    Checksum(tf_checksum_hex)
+                    self, Checksum(tf_checksum_hex)
                 )
                 self._constructed = True
                 _publish_result_for_dask(self, cached)
@@ -483,28 +488,38 @@ class TransformationDaskMixin:
                 except Exception:
                     pass
             raise
-        except Exception:
+        except Exception as exc:
             if permission_granted:
                 release_permission()
-            self._exception = traceback.format_exc().strip("\n") + "\n"
+            from seamless.error_envelope import execution_error
+
+            self._exception = execution_error(exc)
             self._constructed = True
             self._evaluated = True
             return None
         if exc:
-            if "Transformation was canceled" in exc:
+            if (
+                isinstance(exc, dict) and exc.get("error", {}).get("kind") == "canceled"
+            ) or (isinstance(exc, str) and "Transformation was canceled" in exc):
                 self._mark_cancelled("Transformation was canceled")
                 from seamless_transformer.transformation_cache import (
                     TransformationCancelledError,
                 )
 
                 raise TransformationCancelledError("Transformation was canceled")
-            self._exception = exc if exc.endswith("\n") else exc + "\n"
+            from seamless.error_envelope import execution_error
+
+            self._exception = (
+                execution_error(exc)
+                if isinstance(exc, dict)
+                else exc
+                if exc.endswith("\n")
+                else exc + "\n"
+            )
             self._constructed = True
             self._evaluated = True
             return None
-        if result_checksum_hex is not None and not _is_valid_checksum(
-            result_checksum_hex
-        ):
+        if result_checksum_hex is not None and not _is_valid_checksum(result_checksum_hex):
             self._exception = (
                 "Invalid Dask result checksum: " + repr(result_checksum_hex) + "\n"
             )
@@ -513,8 +528,7 @@ class TransformationDaskMixin:
             return None
         if tf_checksum_hex:
             self._transformation_checksum = _publish_definition_for_dask(
-                self,
-                Checksum(tf_checksum_hex)
+                self, Checksum(tf_checksum_hex)
             )
             self._constructed = True
         if result_checksum_hex:

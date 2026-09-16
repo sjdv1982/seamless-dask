@@ -35,4 +35,5 @@ def test_run_base_rejects_incompatible_input_hash_type_before_dispatch(monkeypat
     )
 
     assert result[1] is None
-    assert "Cannot deserialize" in result[3]
+    assert result[3]["error"]["kind"] == "hash_type_validation"
+    assert "Cannot deserialize" in result[3]["error"]["message"]
