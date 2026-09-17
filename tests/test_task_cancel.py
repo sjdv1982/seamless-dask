@@ -2,16 +2,15 @@
 
 A bare ``CancelledError`` on the async computation path (e.g. ``task().cancel()``)
 used to only mark the local promise canceled while orphaning the running Dask
-submission. It must instead converge on the authoritative scheduler-flag
-mechanism (``SeamlessDaskClient.cancel_by_checksum``), matching the other
-cancel-signal producers.
+submission. It now detaches the local member with
+``SeamlessDaskClient.softcancel_by_checksum``; if that was the last member, the
+authoritative scheduler flag is set.
 """
 
 import asyncio
 
 import pytest
 
-import seamless
 from seamless.transformer import Transformation, delayed
 from seamless_dask.dummy_scheduler import create_dummy_client
 from seamless_dask.transformer_client import set_seamless_dask_client
@@ -21,16 +20,15 @@ def test_task_cancel_propagates_to_dask_scheduler():
     sd_client = create_dummy_client(workers=1, worker_threads=2, spawn_workers=2)
     set_seamless_dask_client(sd_client)
 
-    cancel_calls: list[str] = []
-    orig_cancel = sd_client.cancel_by_checksum
+    softcancel_calls: list[tuple[str, str | None]] = []
+    orig_softcancel = sd_client.softcancel_by_checksum
 
-    def _spy(tf_checksum):
-        cancel_calls.append(str(tf_checksum))
-        return orig_cancel(tf_checksum)
+    def _spy(tf_checksum, member_id=None):
+        softcancel_calls.append((str(tf_checksum), member_id))
+        return orig_softcancel(tf_checksum, member_id)
 
-    # Shadow the bound method so the patched handler's
-    # ``client.cancel_by_checksum(...)`` call is observed.
-    sd_client.cancel_by_checksum = _spy
+    # Shadow the bound method so the patched handler's softcancel call is observed.
+    sd_client.softcancel_by_checksum = _spy
 
     try:
 
@@ -61,10 +59,11 @@ def test_task_cancel_propagates_to_dask_scheduler():
 
         asyncio.run(_drive())
 
-        assert (
-            cancel_calls
-        ), "cancel_by_checksum was not invoked when the Dask-backed task was canceled"
+        assert softcancel_calls, (
+            "softcancel_by_checksum was not invoked when the Dask-backed task "
+            "was canceled"
+        )
+        assert softcancel_calls[0][1] is not None
     finally:
-        sd_client.cancel_by_checksum = orig_cancel
+        sd_client.softcancel_by_checksum = orig_softcancel
         set_seamless_dask_client(None)
-        seamless.close()

@@ -8,11 +8,15 @@ import random
 import string
 import time
 import traceback
+import uuid
 from copy import deepcopy
 from typing import Any, Dict, Optional, TYPE_CHECKING
 
 from seamless import Checksum, CacheMissError
-from seamless_transformer.transformation_utils import tf_get_buffer
+from seamless_transformer.transformation_utils import (
+    normalize_optional_pins_for_construction,
+    tf_get_buffer,
+)
 from seamless_transformer import probe_index, record_runtime
 
 from .permissions import release_permission, request_permission
@@ -24,6 +28,66 @@ from .types import (
 
 if TYPE_CHECKING:  # pragma: no cover - type checking only
     from .client import SeamlessDaskClient
+
+
+def _is_expression(value: Any) -> bool:
+    try:
+        from seamless import Expression
+    except Exception:
+        return False
+    return isinstance(value, Expression)
+
+
+def _publish_definition_for_dask(owner, checksum: Checksum) -> Checksum:
+    publish = getattr(owner, "_publish_definition", None)
+    if callable(publish):
+        return publish(checksum)
+    checksum.tempref()
+    owner._transformation_checksum = checksum
+    return checksum
+
+
+def _publish_result_for_dask(owner, checksum: Checksum) -> Checksum:
+    publish = getattr(owner, "_publish_result", None)
+    if callable(publish):
+        return publish(checksum)
+    checksum.tempref()
+    owner._result_checksum = checksum
+    return checksum
+
+
+def _expression_input_future(
+    client: "SeamlessDaskClient",
+    expression,
+    *,
+    require_value: bool,
+    allow_input_fingertip: bool,
+):
+    input_ref = expression._input_ref
+    if _is_expression(input_ref):
+        input_future = _expression_input_future(
+            client,
+            input_ref,
+            require_value=require_value,
+            allow_input_fingertip=allow_input_fingertip,
+        )
+        return client.get_expression_future(expression, input_future)
+    if hasattr(input_ref, "_ensure_dask_futures"):
+        dep_futures = input_ref._ensure_dask_futures(
+            client, require_value=require_value, need_fat=False
+        )
+        if allow_input_fingertip:
+            input_future = client.ensure_fat_finger_future(dep_futures)
+        else:
+            input_future = client.ensure_fat_future(dep_futures)
+        return client.get_expression_future(expression, input_future)
+
+    checksum = Checksum(input_ref)
+    if allow_input_fingertip:
+        input_future = client.get_fat_finger_checksum_future(checksum)
+    else:
+        input_future = client.get_fat_checksum_future(checksum)
+    return client.get_expression_future(expression, input_future)
 
 
 def _ensure_remote_clients_from_env() -> None:
@@ -78,7 +142,15 @@ class TransformationDaskMixin:
             return None
         template = getattr(self, "_definition_payload_template", None)
         if template is None:
-            return None
+            pre_transformation = getattr(self, "_pretransformation", None)
+            if pre_transformation is None:
+                return None
+            upstream_dependencies = getattr(self, "_upstream_dependencies", {}) or {}
+            template, dependencies = pre_transformation.build_partial_transformation(
+                upstream_dependencies
+            )
+            self._definition_payload_template = deepcopy(template)
+            self._upstream_dependencies = dict(dependencies)
         transformation_dict = deepcopy(template)
         meta = getattr(self, "_meta", {}) or {}
         if meta:
@@ -194,13 +266,15 @@ class TransformationDaskMixin:
             tf_checksum_hex = self._compute_tf_checksum_no_deps()
         if tf_checksum_hex is not None:
             if not self._constructed:
-                self._transformation_checksum = Checksum(tf_checksum_hex)
+                self._transformation_checksum = _publish_definition_for_dask(
+                    self, Checksum(tf_checksum_hex)
+                )
                 self._constructed = True
             cached = self._try_database_cache_sync(
                 tf_checksum_hex, require_value=require_value
             )
             if cached is not None:
-                self._result_checksum = cached
+                _publish_result_for_dask(self, cached)
                 self._evaluated = True
                 self._exception = None
                 return self._result_checksum
@@ -232,9 +306,11 @@ class TransformationDaskMixin:
             if cached is not None:
                 if permission_granted:
                     release_permission()
-                self._transformation_checksum = Checksum(tf_checksum_hex)
+                self._transformation_checksum = _publish_definition_for_dask(
+                    self, Checksum(tf_checksum_hex)
+                )
                 self._constructed = True
-                self._result_checksum = cached
+                _publish_result_for_dask(self, cached)
                 self._evaluated = True
                 self._exception = None
                 return self._result_checksum
@@ -253,21 +329,38 @@ class TransformationDaskMixin:
                 permission_granted=permission_granted,
             )
             tf_checksum_hex, result_checksum_hex, exc = futures.thin.result()
-        except Exception:
+        except Exception as exc:
             if permission_granted:
                 release_permission()
-            self._exception = traceback.format_exc().strip("\n") + "\n"
+            from seamless.error_envelope import execution_error
+
+            self._exception = execution_error(exc)
             self._constructed = True
             self._evaluated = True
             return None
         if exc:
-            self._exception = exc if exc.endswith("\n") else exc + "\n"
+            if (
+                isinstance(exc, dict) and exc.get("error", {}).get("kind") == "canceled"
+            ) or (isinstance(exc, str) and "Transformation was canceled" in exc):
+                self._mark_cancelled("Transformation was canceled")
+                from seamless_transformer.transformation_cache import (
+                    TransformationCancelledError,
+                )
+
+                raise TransformationCancelledError("Transformation was canceled")
+            from seamless.error_envelope import execution_error
+
+            self._exception = (
+                execution_error(exc)
+                if isinstance(exc, dict)
+                else exc
+                if exc.endswith("\n")
+                else exc + "\n"
+            )
             self._constructed = True
             self._evaluated = True
             return None
-        if result_checksum_hex is not None and not _is_valid_checksum(
-            result_checksum_hex
-        ):
+        if result_checksum_hex is not None and not _is_valid_checksum(result_checksum_hex):
             self._exception = (
                 "Invalid Dask result checksum: " + repr(result_checksum_hex) + "\n"
             )
@@ -275,10 +368,12 @@ class TransformationDaskMixin:
             self._evaluated = True
             return None
         if tf_checksum_hex:
-            self._transformation_checksum = Checksum(tf_checksum_hex)
+            self._transformation_checksum = _publish_definition_for_dask(
+                self, Checksum(tf_checksum_hex)
+            )
             self._constructed = True
         if result_checksum_hex:
-            self._result_checksum = Checksum(result_checksum_hex)
+            _publish_result_for_dask(self, Checksum(result_checksum_hex))
             self._evaluated = True
             if self._transformation_checksum is not None:
                 try:
@@ -310,9 +405,11 @@ class TransformationDaskMixin:
                 tf_checksum_hex, require_value=require_value
             )
             if cached is not None:
-                self._transformation_checksum = Checksum(tf_checksum_hex)
+                self._transformation_checksum = _publish_definition_for_dask(
+                    self, Checksum(tf_checksum_hex)
+                )
                 self._constructed = True
-                self._result_checksum = cached
+                _publish_result_for_dask(self, cached)
                 self._evaluated = True
                 self._exception = None
                 return self._result_checksum
@@ -350,9 +447,11 @@ class TransformationDaskMixin:
             if cached is not None:
                 if permission_granted:
                     release_permission()
-                self._transformation_checksum = Checksum(tf_checksum_hex)
+                self._transformation_checksum = _publish_definition_for_dask(
+                    self, Checksum(tf_checksum_hex)
+                )
                 self._constructed = True
-                self._result_checksum = cached
+                _publish_result_for_dask(self, cached)
                 self._evaluated = True
                 self._exception = None
                 return self._result_checksum
@@ -383,25 +482,44 @@ class TransformationDaskMixin:
                 release_permission()
             if futures is not None:
                 try:
-                    client.cancel_by_checksum(futures.tf_checksum)
+                    client.softcancel_by_checksum(
+                        futures.tf_checksum, getattr(self, "_dask_member_id", None)
+                    )
                 except Exception:
                     pass
             raise
-        except Exception:
+        except Exception as exc:
             if permission_granted:
                 release_permission()
-            self._exception = traceback.format_exc().strip("\n") + "\n"
+            from seamless.error_envelope import execution_error
+
+            self._exception = execution_error(exc)
             self._constructed = True
             self._evaluated = True
             return None
         if exc:
-            self._exception = exc if exc.endswith("\n") else exc + "\n"
+            if (
+                isinstance(exc, dict) and exc.get("error", {}).get("kind") == "canceled"
+            ) or (isinstance(exc, str) and "Transformation was canceled" in exc):
+                self._mark_cancelled("Transformation was canceled")
+                from seamless_transformer.transformation_cache import (
+                    TransformationCancelledError,
+                )
+
+                raise TransformationCancelledError("Transformation was canceled")
+            from seamless.error_envelope import execution_error
+
+            self._exception = (
+                execution_error(exc)
+                if isinstance(exc, dict)
+                else exc
+                if exc.endswith("\n")
+                else exc + "\n"
+            )
             self._constructed = True
             self._evaluated = True
             return None
-        if result_checksum_hex is not None and not _is_valid_checksum(
-            result_checksum_hex
-        ):
+        if result_checksum_hex is not None and not _is_valid_checksum(result_checksum_hex):
             self._exception = (
                 "Invalid Dask result checksum: " + repr(result_checksum_hex) + "\n"
             )
@@ -409,10 +527,12 @@ class TransformationDaskMixin:
             self._evaluated = True
             return None
         if tf_checksum_hex:
-            self._transformation_checksum = Checksum(tf_checksum_hex)
+            self._transformation_checksum = _publish_definition_for_dask(
+                self, Checksum(tf_checksum_hex)
+            )
             self._constructed = True
         if result_checksum_hex:
-            self._result_checksum = Checksum(result_checksum_hex)
+            _publish_result_for_dask(self, Checksum(result_checksum_hex))
             self._evaluated = True
             if self._transformation_checksum is not None:
                 try:
@@ -527,10 +647,21 @@ class TransformationDaskMixin:
     ) -> TransformationSubmission:
         template = getattr(self, "_definition_payload_template", None)
         if template is None:
-            raise RuntimeError("No frozen transformation definition available for Dask")
+            pre_transformation = getattr(self, "_pretransformation", None)
+            if pre_transformation is None:
+                raise RuntimeError(
+                    "No frozen transformation definition available for Dask"
+                )
+            upstream_dependencies = getattr(self, "_upstream_dependencies", {}) or {}
+            template, dependencies = pre_transformation.build_partial_transformation(
+                upstream_dependencies
+            )
+            self._definition_payload_template = deepcopy(template)
+            self._upstream_dependencies = dict(dependencies)
 
         transformation_dict = deepcopy(template)
         dependencies = getattr(self, "_upstream_dependencies", {}) or {}
+        optional_pins = frozenset(getattr(self, "_optional_pins", ()) or ())
         meta = getattr(self, "_meta", {}) or {}
         allow_input_fingertip = bool(meta.get("allow_input_fingertip", False))
         if meta:
@@ -543,11 +674,12 @@ class TransformationDaskMixin:
             transformation_dict["__meta__"] = merged_meta
         tf_checksum_hex: str | None = None
         if not dependencies:
+            normalize_optional_pins_for_construction(transformation_dict, optional_pins)
             tf_buffer = tf_get_buffer(transformation_dict)
             tf_buffer.tempref()
             tf_checksum = tf_buffer.get_checksum()
             tf_checksum_hex = tf_checksum.hex()
-            self._transformation_checksum = tf_checksum
+            self._transformation_checksum = _publish_definition_for_dask(self, tf_checksum)
             self._constructed = True
 
         inputs: dict[str, TransformationInputSpec] = {}
@@ -560,6 +692,21 @@ class TransformationDaskMixin:
             celltype, subcelltype, checksum_hex = value
             dependency = dependencies.get(pinname)
             if dependency is not None:
+                if _is_expression(dependency):
+                    inputs[pinname] = TransformationInputSpec(
+                        name=pinname,
+                        celltype=celltype,
+                        subcelltype=subcelltype,
+                        checksum=None,
+                        kind="expression",
+                    )
+                    input_futures[pinname] = _expression_input_future(
+                        client,
+                        dependency,
+                        require_value=require_value,
+                        allow_input_fingertip=allow_input_fingertip,
+                    )
+                    continue
                 if dependency.exception is not None:
                     msg = f"Dependency '{pinname}' has an exception."
                     raise RuntimeError(msg)
@@ -586,6 +733,9 @@ class TransformationDaskMixin:
                 raise RuntimeError(f"Input '{pinname}' has no checksum")
             if isinstance(checksum_hex, Checksum):
                 checksum_hex = checksum_hex.hex()
+            from seamless.checksum.hash_type_validation import validate_deserializable_as
+
+            validate_deserializable_as(checksum_hex, celltype)
             inputs[pinname] = TransformationInputSpec(
                 name=pinname,
                 celltype=celltype,
@@ -611,6 +761,7 @@ class TransformationDaskMixin:
             require_value=require_value,
             allow_input_fingertip=allow_input_fingertip,
             strict_dunder=bool(getattr(self, "_strict_dunder", False)),
+            optional_pins=optional_pins,
         )
 
     def _ensure_dask_futures(
@@ -622,6 +773,10 @@ class TransformationDaskMixin:
         permission_granted: bool = False,
     ) -> TransformationFutures:
         permission_released = False
+        member_id = getattr(self, "_dask_member_id", None)
+        if member_id is None:
+            member_id = uuid.uuid4().hex
+            self._dask_member_id = member_id
         if self._dask_futures is not None:
             futures = self._dask_futures
         else:
@@ -629,9 +784,18 @@ class TransformationDaskMixin:
                 client, require_value=require_value, need_fat=need_fat
             )
             if submission.tf_checksum and not _submission_is_driver(submission):
-                cached_futures = client._cached_transformation_for_submission(  # type: ignore[attr-defined]
-                    submission
-                )
+                try:
+                    cached_futures = client._cached_transformation_for_submission(  # type: ignore[attr-defined]
+                        submission, member_id=member_id
+                    )
+                except TypeError:
+                    cached_futures = client._cached_transformation_for_submission(  # type: ignore[attr-defined]
+                        submission
+                    )
+                    if cached_futures is not None:
+                        members = getattr(cached_futures, "members", None)
+                        if isinstance(members, set):
+                            members.add(member_id)
                 if cached_futures is not None:
                     if permission_granted:
                         release_permission()
@@ -644,7 +808,17 @@ class TransformationDaskMixin:
                         )
                     return futures
             try:
-                futures = client.submit_transformation(submission, need_fat=need_fat)
+                try:
+                    futures = client.submit_transformation(
+                        submission, need_fat=need_fat, member_id=member_id
+                    )
+                except TypeError:
+                    futures = client.submit_transformation(
+                        submission, need_fat=need_fat
+                    )
+                    members = getattr(futures, "members", None)
+                    if isinstance(members, set):
+                        members.add(member_id)
                 self._dask_futures = futures
                 if permission_granted and futures.base is not None:
                     futures.base.add_done_callback(lambda _f: release_permission())
@@ -666,6 +840,8 @@ class TransformationDaskMixin:
             dependencies = getattr(self, "_upstream_dependencies", {}) or {}
             if dependencies:
                 return None
+            optional_pins = frozenset(getattr(self, "_optional_pins", ()) or ())
+            normalize_optional_pins_for_construction(tf_dict, optional_pins)
             tf_buffer = tf_get_buffer(tf_dict)
             tf_buffer.tempref()
             tf_checksum = tf_buffer.get_checksum()

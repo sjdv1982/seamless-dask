@@ -215,7 +215,7 @@ class DummySchedulerHandle:
                 pending = asyncio.all_tasks(loop)
                 for task in pending:
                     task.cancel()
-                with contextlib.suppress(Exception):
+                with contextlib.suppress(asyncio.CancelledError, Exception):
                     loop.run_until_complete(asyncio.gather(*pending))
                 with contextlib.suppress(Exception):
                     loop.run_until_complete(loop.shutdown_asyncgens())

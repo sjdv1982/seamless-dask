@@ -14,14 +14,19 @@ from typing import Any, Dict, Iterable, Mapping, Optional, Tuple, Callable, Coro
 
 import dask.config
 from aiohttp import ClientConnectionError
-from distributed import Client, Future
+from distributed import Client, Future, fire_and_forget
 from distributed.worker import get_worker
 
 from seamless import Buffer, Checksum, CacheMissError
+from seamless.error_envelope import encode_error, WorkflowExecutionError
 from seamless_transformer.record_runtime import get_record_mode
 from seamless_transformer.record_utils import _utcnow_iso
 from seamless_transformer import worker as transformer_worker
-from seamless_transformer.transformation_utils import tf_get_buffer
+from seamless_transformer.transformation_utils import (
+    json_null_checksum,
+    normalize_optional_pins_for_construction,
+    tf_get_buffer,
+)
 
 from .permissions import ensure_configured
 from .types import (
@@ -51,6 +56,11 @@ except (TypeError, ValueError):
 _ENSURE_RESULT_UPLOAD_ENV = "SEAMLESS_DASK_ENSURE_RESULT_UPLOAD"
 _QUEUE_EXCLUSIVE_ENV = "SEAMLESS_DASK_QUEUE_EXCLUSIVE"
 _STARTUP_RECORD_MODE_ENV = "SEAMLESS_DASK_RECORD_MODE"
+
+
+def _checksum_hex(checksum: Checksum | str) -> str:
+    """Normalize checksum keys without relying on their display spelling."""
+    return checksum.hex() if isinstance(checksum, Checksum) else str(checksum)
 
 
 def _parse_bool_env(name: str, default: bool = False) -> bool:
@@ -138,13 +148,13 @@ def _mark_cancelled_transformation(dask_scheduler, tf_checksum: str) -> bool:
     if canceled is None:
         canceled = set()
         setattr(dask_scheduler, "seamless_cancelled_transformations", canceled)
-    canceled.add(str(tf_checksum))
+    canceled.add(_checksum_hex(tf_checksum))
     return True
 
 
 def _pop_cancelled_transformation(dask_scheduler, tf_checksum: str) -> bool:
     canceled = getattr(dask_scheduler, "seamless_cancelled_transformations", set())
-    tf_checksum = str(tf_checksum)
+    tf_checksum = _checksum_hex(tf_checksum)
     if tf_checksum not in canceled:
         return False
     try:
@@ -178,10 +188,10 @@ def _scheduler_consume_cancel(
     transformations = getattr(
         dask_scheduler, "seamless_cancelled_transformations", set()
     )
-    if str(tf_checksum) in transformations:
+    if _checksum_hex(tf_checksum) in transformations:
         hit = True
         try:
-            transformations.remove(str(tf_checksum))
+            transformations.remove(_checksum_hex(tf_checksum))
         except KeyError:
             pass
     return hit
@@ -207,7 +217,7 @@ def _consume_cancel_flags(
 def _scheduler_matching_transformation_keys(
     dask_scheduler, tf_checksum: str
 ) -> list[str]:
-    tf_checksum = str(tf_checksum)
+    tf_checksum = _checksum_hex(tf_checksum)
     matches = []
     for key in getattr(dask_scheduler, "tasks", {}):
         key_text = str(key)
@@ -237,7 +247,7 @@ def _is_transformation_cancelled(dask_client: Client, tf_checksum: str | None) -
         return bool(
             dask_client.run_on_scheduler(
                 _pop_cancelled_transformation,
-                tf_checksum=str(tf_checksum),
+                tf_checksum=_checksum_hex(tf_checksum),
             )
         )
     except Exception:
@@ -287,7 +297,7 @@ def _base_prefix_for_transformation(transformation_dict: Mapping[str, Any]) -> s
     base_prefix = "base"
     ccs = transformation_dict.get("__code_checksum__")
     if ccs is not None:
-        base_prefix += "_" + str(ccs)
+        base_prefix += "_" + _checksum_hex(ccs)
     return base_prefix
 
 
@@ -787,7 +797,9 @@ async def _promise_and_write_result_async(
         return
 
 
-def _fat_checksum_task(checksum_hex: str) -> Tuple[str, Buffer | None, str | None]:
+def _fat_checksum_task(
+    checksum_hex: str,
+) -> Tuple[str, Buffer | None, dict[str, Any] | None]:
     """Resolve a checksum into a buffer on a worker."""
     try:
         checksum = Checksum(checksum_hex)
@@ -797,13 +809,14 @@ def _fat_checksum_task(checksum_hex: str) -> Tuple[str, Buffer | None, str | Non
             buffer_obj if isinstance(buffer_obj, Buffer) else None,
             None,
         )
-    except Exception:
-        return checksum_hex, None, traceback.format_exc()
+    except Exception as exc:
+
+        return checksum_hex, None, encode_error(exc)
 
 
 def _fat_finger_checksum_task(
     checksum_hex: str,
-) -> Tuple[str, Buffer | None, str | None]:
+) -> Tuple[str, Buffer | None, dict[str, Any] | None]:
     """Resolve or fingertip a checksum into a buffer on a worker."""
     try:
         checksum = Checksum(checksum_hex)
@@ -813,15 +826,72 @@ def _fat_finger_checksum_task(
             buffer_obj if isinstance(buffer_obj, Buffer) else None,
             None,
         )
-    except Exception:
-        return checksum_hex, None, traceback.format_exc()
+    except Exception as exc:
+
+        return checksum_hex, None, encode_error(exc)
+
+
+def _expression_task(
+    payload: Dict[str, Any],
+    input_value: Tuple[Any, ...],
+) -> Tuple[str | None, Buffer | None, dict[str, Any] | None]:
+    """Evaluate an expression input from a fat input tuple."""
+    checksum_hex, buffer_obj, exc = input_value
+    if exc:
+        return checksum_hex, buffer_obj, exc
+    if checksum_hex is None:
+        return (
+            None,
+            None,
+            encode_error(
+                WorkflowExecutionError("Expression input checksum unavailable")
+            ),
+        )
+    try:
+        checksum = Checksum(checksum_hex)
+        if isinstance(buffer_obj, Buffer):
+            Buffer(buffer_obj.content, checksum=checksum)
+        from seamless.checksum.expression import evaluate_expression_remote
+
+        result_checksum = _run_on_worker_loop(
+            lambda: evaluate_expression_remote(
+                checksum,
+                payload["path"],
+                payload["input_celltype"],
+                payload["celltype"],
+                validator=payload.get("validator"),
+                validator_language=payload.get("validator_language"),
+                execution="auto",
+            )
+        )
+        result_buffer = result_checksum.resolve()
+        from seamless_remote import buffer_remote
+
+        if isinstance(result_buffer, Buffer):
+            _run_on_worker_loop(
+                lambda: buffer_remote.write_buffer(result_checksum, result_buffer)
+            )
+        return (
+            result_checksum.hex(),
+            result_buffer if isinstance(result_buffer, Buffer) else None,
+            None,
+        )
+    except Exception as exc:
+
+        return checksum_hex, None, encode_error(exc)
+
+
+def _expression_checksum_task(value):
+    """Keep the result buffer on workers at a standalone dispatch boundary."""
+    checksum, _, error = value
+    return checksum, error
 
 
 def _run_base(
     payload: Dict[str, Any],
     input_results: Mapping[str, Tuple[Any, ...]],
     priority: int | None = None,
-) -> Tuple[str | None, str | None, Buffer | None, str | None]:
+) -> Tuple[str | None, str | None, Buffer | None, dict[str, Any] | None]:
     """Worker task that performs the transformation itself."""
 
     from seamless_dask.client import SeamlessDaskClient
@@ -843,8 +913,8 @@ def _run_base(
     submission_id = payload.get("submission_id")
     request_record_mode = bool(payload.get("record", False))
     if request_record_mode != _startup_record_mode():
-        return tf_checksum_hex, None, None, _record_mode_mismatch_error(
-            request_record_mode
+        return tf_checksum_hex, None, None, encode_error(
+            WorkflowExecutionError(_record_mode_mismatch_error(request_record_mode))
         )
 
     owner_dask_key = payload.get("owner_dask_key")
@@ -896,6 +966,7 @@ def _run_base(
     except Exception:
         owner_dask_priority = None
     tf_dunder = payload.get("tf_dunder", {}) or {}
+    optional_pins = frozenset(payload.get("optional_pins", ()) or ())
     require_value = bool(payload.get("require_value", False))
     started_at = _utcnow_iso()
     wall_start = time.perf_counter()
@@ -909,19 +980,49 @@ def _run_base(
             if input_value is None:
                 raise RuntimeError(f"Missing input for pin '{spec.name}'")
 
+            from seamless.checksum.hash_type_validation import validate_deserializable_as
+
             if spec.kind == "checksum":
-                checksum_hex, _buf, exc = input_value
+                checksum_hex, buf, exc = input_value
                 if exc:
                     return tf_checksum_hex, None, None, exc
+                if not (
+                    spec.name in optional_pins
+                    and checksum_hex == json_null_checksum().hex()
+                ):
+                    validate_deserializable_as(checksum_hex, spec.celltype, buffer=buf)
                 transformation_dict[spec.name] = (
                     spec.celltype,
                     spec.subcelltype,
                     checksum_hex,
                 )
             elif spec.kind == "transformation":
-                result_checksum_hex, _buf, exc = input_value
+                result_checksum_hex, buf, exc = input_value
                 if exc:
                     return tf_checksum_hex, None, None, exc
+                if not (
+                    spec.name in optional_pins
+                    and result_checksum_hex == json_null_checksum().hex()
+                ):
+                    validate_deserializable_as(
+                        result_checksum_hex, spec.celltype, buffer=buf
+                    )
+                transformation_dict[spec.name] = (
+                    spec.celltype,
+                    spec.subcelltype,
+                    result_checksum_hex,
+                )
+            elif spec.kind == "expression":
+                result_checksum_hex, buf, exc = input_value
+                if exc:
+                    return tf_checksum_hex, None, None, exc
+                if not (
+                    spec.name in optional_pins
+                    and result_checksum_hex == json_null_checksum().hex()
+                ):
+                    validate_deserializable_as(
+                        result_checksum_hex, spec.celltype, buffer=buf
+                    )
                 transformation_dict[spec.name] = (
                     spec.celltype,
                     spec.subcelltype,
@@ -931,10 +1032,16 @@ def _run_base(
                 raise ValueError(f"Unknown input kind '{spec.kind}'")
 
         if tf_checksum_hex is None:
+            normalize_optional_pins_for_construction(
+                transformation_dict, optional_pins
+            )
             tf_buffer = tf_get_buffer(transformation_dict)
             tf_buffer.tempref()
             tf_checksum_hex = tf_buffer.get_checksum().hex()
-        if _is_transformation_cancelled(client.client, tf_checksum_hex):
+        dask_client = getattr(client, "client", None)
+        if dask_client is not None and _is_transformation_cancelled(
+            dask_client, tf_checksum_hex
+        ):
             return (
                 tf_checksum_hex,
                 None,
@@ -1029,8 +1136,10 @@ def _run_base(
             )
         finally:
             gpu_memory_peak_bytes = stop_gpu_memory_sampler(gpu_sampler)
-        if isinstance(result_checksum, str):
+        if isinstance(result_checksum, dict) and "error" in result_checksum:
             return tf_checksum_hex, None, None, result_checksum
+        if isinstance(result_checksum, str):
+            return tf_checksum_hex, None, None, encode_error(WorkflowExecutionError(result_checksum))
         result_checksum = Checksum(result_checksum)
 
         result_checksum_hex = result_checksum.hex()
@@ -1049,7 +1158,7 @@ def _run_base(
                 tf_checksum_hex,
                 result_checksum_hex,
                 None,
-                "Result value unavailable",
+                encode_error(CacheMissError(result_checksum)),
             )
 
         tf_checksum_obj = Checksum(tf_checksum_hex)
@@ -1059,9 +1168,11 @@ def _run_base(
         cpu_end = os.times()
         cpu_user_seconds = round(cpu_end.user - cpu_start.user, 6)
         cpu_system_seconds = round(cpu_end.system - cpu_start.system, 6)
-        if _is_submission_cancelled(
-            client.client, submission_id
-        ) or _is_transformation_cancelled(client.client, tf_checksum_hex):
+        dask_client = getattr(client, "client", None)
+        if dask_client is not None and (
+            _is_submission_cancelled(dask_client, submission_id)
+            or _is_transformation_cancelled(dask_client, tf_checksum_hex)
+        ):
             return (
                 tf_checksum_hex,
                 None,
@@ -1089,13 +1200,13 @@ def _run_base(
         )
 
         return tf_checksum_hex, result_checksum_hex, result_buffer, None
-    except Exception:
-        return tf_checksum_hex, None, None, traceback.format_exc()
+    except Exception as exc:
+        return tf_checksum_hex, None, None, encode_error(exc)
 
 
 def _run_fat(
-    base_result: Tuple[str | None, str | None, Buffer | None, str | None],
-) -> Tuple[str | None, Buffer | None, str | None]:
+    base_result: Tuple[str | None, str | None, Buffer | None, dict[str, Any] | None],
+) -> Tuple[str | None, Buffer | None, dict[str, Any] | None]:
     """Worker task that ensures a buffer is available for dependents."""
     tf_checksum_hex, result_checksum_hex, result_buffer, exc = base_result
     if exc:
@@ -1103,13 +1214,13 @@ def _run_fat(
     if result_buffer is not None:
         return result_checksum_hex, result_buffer, None
     if result_checksum_hex is None:
-        return None, None, "Result checksum unavailable"
+        return None, None, encode_error(WorkflowExecutionError("Result checksum unavailable"))
     return _fat_checksum_task(result_checksum_hex)
 
 
 def _run_fat_finger(
-    base_result: Tuple[str | None, str | None, Buffer | None, str | None],
-) -> Tuple[str | None, Buffer | None, str | None]:
+    base_result: Tuple[str | None, str | None, Buffer | None, dict[str, Any] | None],
+) -> Tuple[str | None, Buffer | None, dict[str, Any] | None]:
     """Worker task that allows fingering inputs when buffers are missing."""
     tf_checksum_hex, result_checksum_hex, result_buffer, exc = base_result
     if exc:
@@ -1117,7 +1228,7 @@ def _run_fat_finger(
     if result_buffer is not None:
         return result_checksum_hex, result_buffer, None
     if result_checksum_hex is None:
-        return None, None, "Result checksum unavailable"
+        return None, None, encode_error(WorkflowExecutionError("Result checksum unavailable"))
     checksum_hex, buffer_obj, err = _fat_checksum_task(result_checksum_hex)
     if buffer_obj is not None and err is None:
         return checksum_hex, buffer_obj, None
@@ -1125,8 +1236,8 @@ def _run_fat_finger(
 
 
 def _run_thin(
-    base_result: Tuple[str | None, str | None, Buffer | None, str | None],
-) -> Tuple[str | None, str | None, str | None]:
+    base_result: Tuple[str | None, str | None, Buffer | None, dict[str, Any] | None],
+) -> Tuple[str | None, str | None, dict[str, Any] | None]:
     """Worker task that only needs the checksums."""
     tf_checksum_hex, result_checksum_hex, _result_buffer, exc = base_result
     return tf_checksum_hex, result_checksum_hex, exc
@@ -1196,8 +1307,19 @@ class SeamlessDaskClient:
         with self._cache_lock:
             cached = self._fat_checksum_cache.get(checksum_hex)
         if cached is not None and not cached[0].cancelled():
-            self._touch_fat_checksum_cache(checksum_hex, cached[0])
-            return cached[0]
+            failed = False
+            if cached[0].done():
+                try:
+                    failed = bool(cached[0].result()[2])
+                except Exception:
+                    failed = True
+            if not failed:
+                self._touch_fat_checksum_cache(checksum_hex, cached[0])
+                return cached[0]
+            with self._cache_lock:
+                if self._fat_checksum_cache.get(checksum_hex) == cached:
+                    self._fat_checksum_cache.pop(checksum_hex)
+            cached[0].release()
 
         future = self._client.submit(
             _fat_checksum_task,
@@ -1232,6 +1354,37 @@ class SeamlessDaskClient:
         self._cache_fat_finger_checksum_future(checksum_hex, future)
         return future
 
+    def get_expression_future(
+        self,
+        expression,
+        input_future: Future,
+        *,
+        priority: int = -1,
+    ) -> Future:
+        """Return a fat-checksum-shaped future for an expression result."""
+        payload = {
+            "path": expression.path,
+            "input_celltype": expression.input_celltype,
+            "celltype": expression.celltype,
+            "validator": (
+                expression.validator.hex()
+                if getattr(expression, "validator", None) is not None
+                else None
+            ),
+            "validator_language": expression.validator_language,
+        }
+        from dask.base import tokenize
+
+        key = "expression-" + tokenize(payload, input_future.key)
+        return self._client.submit(
+            _expression_task,
+            payload,
+            input_future,
+            pure=False,
+            key=key,
+            priority=priority,
+        )
+
     def get_transformation_futures(
         self, tf_checksum: Checksum | str
     ) -> TransformationFutures | None:
@@ -1254,6 +1407,7 @@ class SeamlessDaskClient:
         *,
         need_fat: bool = False,
         priority_boost: int = 0,
+        member_id: str | None = None,
     ) -> TransformationFutures:
         """Submit a transformation to Dask and return its futures."""
         self._prune_caches()
@@ -1267,11 +1421,15 @@ class SeamlessDaskClient:
         thin_priority = _BASE_DASK_PRIORITY + 10 + boost
 
         if tf_checksum_hex and not is_driver:
-            cached_futures = self._cached_transformation_for_submission(submission)
+            cached_futures = self._cached_transformation_for_submission(
+                submission, member_id=member_id
+            )
             if cached_futures is not None:
                 return cached_futures
 
         submission_id = uuid.uuid4().hex
+        if member_id is None:
+            member_id = uuid.uuid4().hex
         payload = {
             "transformation_dict": submission.transformation_dict,
             "inputs": [spec.__dict__ for spec in submission.inputs.values()],
@@ -1282,6 +1440,7 @@ class SeamlessDaskClient:
             "owner_dask_priority": base_priority,
             "record": get_record_mode(),
             "submission_id": submission_id,
+            "optional_pins": sorted(submission.optional_pins),
         }
         input_futures = dict(submission.input_futures)
         resource_string = None  # TODO: get from tf_dunder
@@ -1338,6 +1497,14 @@ class SeamlessDaskClient:
             tf_checksum=tf_checksum_hex,
             submission_id=submission_id,
         )
+        futures.members.add(member_id)
+        for future in (base_future, thin_future, fat_future):
+            if future is None:
+                continue
+            try:
+                fire_and_forget(future)
+            except Exception:
+                pass
 
         envelope_checksum = _normalized_dunder_envelope_checksum(submission)
         def _register_done(
@@ -1463,9 +1630,9 @@ class SeamlessDaskClient:
 
             cache = get_buffer_cache()
             cs_obj = Checksum(checksum_hex)
-            with cache.lock:
-                if cs_obj in cache.strong_cache or cs_obj in cache.weak_cache:
-                    has_local_buffer = True
+            # A refholder-only cache entry is not an uploadable buffer. Existing
+            # promises on the hashserver retain their normal wait semantics.
+            has_local_buffer = isinstance(cache.get(cs_obj), Buffer)
         except Exception:
             pass
         if not has_local_buffer:
@@ -1545,7 +1712,7 @@ class SeamlessDaskClient:
             self._active_transformation_envelopes.pop(tf_checksum_hex, None)
 
     def _cached_transformation_for_submission(
-        self, submission: TransformationSubmission
+        self, submission: TransformationSubmission, *, member_id: str | None = None
     ) -> TransformationFutures | None:
         tf_checksum_hex = submission.tf_checksum
         if not tf_checksum_hex:
@@ -1553,7 +1720,8 @@ class SeamlessDaskClient:
         requested_envelope = _normalized_dunder_envelope_checksum(submission)
         with self._cache_lock:
             cached = self._transformation_cache.get(tf_checksum_hex)
-            active_envelope = self._active_transformation_envelopes.get(tf_checksum_hex)
+            active_envelopes = getattr(self, "_active_transformation_envelopes", {})
+            active_envelope = active_envelopes.get(tf_checksum_hex)
         if cached is None:
             return None
         futures = cached[0]
@@ -1567,6 +1735,8 @@ class SeamlessDaskClient:
                 "envelope; wait for it to finish or cancel it before strict "
                 "re-submission"
             )
+        if member_id is not None:
+            futures.members.add(str(member_id))
         self._touch_transformation_cache(tf_checksum_hex, futures)
         return futures
 
@@ -1608,9 +1778,13 @@ class SeamlessDaskClient:
             if cached is None or cached[0] is not futures:
                 self._transformation_cache[tf_checksum_hex] = (futures, None)
             if envelope_checksum is not None:
-                self._active_transformation_envelopes[tf_checksum_hex] = (
-                    envelope_checksum
+                active_envelopes = getattr(
+                    self, "_active_transformation_envelopes", None
                 )
+                if active_envelopes is None:
+                    active_envelopes = {}
+                    self._active_transformation_envelopes = active_envelopes
+                active_envelopes[tf_checksum_hex] = envelope_checksum
 
         def _on_done(_fut: Future) -> None:
             self._touch_transformation_cache(tf_checksum_hex, futures)
@@ -1622,11 +1796,18 @@ class SeamlessDaskClient:
         self._touch_transformation_cache(tf_checksum_hex, futures)
 
     def release_transformation_futures(
-        self, futures: TransformationFutures, *, cancel: bool = True
+        self,
+        futures: TransformationFutures,
+        *,
+        cancel: bool = True,
+        member_id: str | None = None,
     ) -> None:
         """Release and optionally cancel a transformation's futures and cache entries."""
 
         tf_checksum_hex = futures.tf_checksum
+        if not cancel and member_id is not None and tf_checksum_hex:
+            self.softcancel_by_checksum(tf_checksum_hex, member_id)
+            return
         with self._cache_lock:
             self._released_transformation_futures.add(id(futures))
             if tf_checksum_hex:
@@ -1655,6 +1836,37 @@ class SeamlessDaskClient:
                 future.release()
             except Exception:
                 pass
+
+    def softcancel_by_checksum(
+        self, tf_checksum: Checksum | str, member_id: str | None = None
+    ) -> bool:
+        """Detach one member from active transformation futures."""
+
+        if member_id is None:
+            return False
+        tf_checksum_hex = (
+            tf_checksum.hex() if isinstance(tf_checksum, Checksum) else str(tf_checksum)
+        )
+        with self._cache_lock:
+            cached = self._transformation_cache.get(tf_checksum_hex)
+            if cached is None:
+                return False
+            futures = cached[0]
+            if str(member_id) not in futures.members:
+                return False
+            futures.members.remove(str(member_id))
+            remaining = bool(futures.members)
+        if remaining:
+            return True
+        if self._transformation_done(futures) or futures.base.cancelled():
+            self.release_transformation_futures(futures, cancel=False)
+            return True
+        # A SeamlessDaskClient only knows about members in this Python process.
+        # Other processes may be latched onto the same scheduler keys, so soft
+        # detach must not mark the shared scheduler submission as canceled here.
+        # Hard cancel_by_checksum() remains the kill-all path.
+        self.release_transformation_futures(futures, cancel=False)
+        return True
 
     def cancel_by_checksum(self, tf_checksum: Checksum | str) -> bool:
         """Cancel the active transformation submission for a checksum."""
@@ -1685,6 +1897,7 @@ class SeamlessDaskClient:
         futures = cached[0]
         if self._transformation_done(futures) or futures.base.cancelled():
             return False
+        futures.members.clear()
         submission_id = getattr(futures, "submission_id", None)
         if submission_id:
             try:

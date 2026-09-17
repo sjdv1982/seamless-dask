@@ -16,7 +16,7 @@ class TransformationInputSpec:
     celltype: str
     subcelltype: Optional[str]
     checksum: Optional[str]
-    kind: str = "checksum"  # "checksum" | "transformation"
+    kind: str = "checksum"  # "checksum" | "transformation" | "expression"
 
 
 @dataclass
@@ -33,6 +33,7 @@ class TransformationSubmission:
     require_value: bool = False
     allow_input_fingertip: bool = False
     strict_dunder: bool = False
+    optional_pins: frozenset[str] = field(default_factory=frozenset)
 
 
 @dataclass
@@ -45,3 +46,4 @@ class TransformationFutures:
     tf_checksum: Optional[str] = None
     result_checksum: Optional[str] = None
     submission_id: Optional[str] = None
+    members: set[str] = field(default_factory=set)
