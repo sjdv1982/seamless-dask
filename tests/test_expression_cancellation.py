@@ -136,10 +136,6 @@ def test_cancelled_expression_dispatch_keeps_materialization_alive_during_linger
     assert remote_running
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason="contract ahead of code: an abandoned Dask waiter still retains its executor thread",
-)
 def test_cancelled_expression_dispatch_releases_default_executor_thread(monkeypatch):
     _, executor_blocked, waiter_blocked = _observe_cancel(monkeypatch)
     assert not waiter_blocked
