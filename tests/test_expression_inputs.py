@@ -28,10 +28,6 @@ def test_expression_task_returns_fat_input_tuple():
     assert result_buffer.get_value("int") == 42
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason="contract ahead of code: Dask Expression payload omits scratch",
-)
 def test_expression_future_payload_includes_scratch():
     from types import SimpleNamespace
 
@@ -99,19 +95,15 @@ def test_expression_task_requests_auto_location(monkeypatch):
     assert executions == ["auto"]
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason="contract ahead of code: scratch Expression results are still uploaded",
-)
 def test_scratch_expression_task_does_not_publish_its_result(monkeypatch):
     from seamless_remote import buffer_remote
 
     source = Buffer({"value": 42}, "plain")
     source_checksum = source.get_checksum()
-    source.tempref()
+    source.tempref(scratch=True)
     expected = Buffer(42, "int")
     expected_checksum = expected.get_checksum()
-    expected.tempref()
+    expected.tempref(scratch=True)
     writes = []
 
     async def evaluate_expression(*args, **kwargs):
