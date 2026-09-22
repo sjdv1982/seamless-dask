@@ -862,12 +862,13 @@ def _expression_task(
                 validator=payload.get("validator"),
                 validator_language=payload.get("validator_language"),
                 execution="auto",
+                scratch=payload.get("scratch", True),
             )
         )
         result_buffer = result_checksum.resolve()
         from seamless_remote import buffer_remote
 
-        if isinstance(result_buffer, Buffer):
+        if isinstance(result_buffer, Buffer) and not payload.get("scratch", True):
             _run_on_worker_loop(
                 lambda: buffer_remote.write_buffer(result_checksum, result_buffer)
             )
@@ -877,7 +878,6 @@ def _expression_task(
             None,
         )
     except Exception as exc:
-
         return checksum_hex, None, encode_error(exc)
 
 
@@ -1372,10 +1372,15 @@ class SeamlessDaskClient:
                 else None
             ),
             "validator_language": expression.validator_language,
+            "scratch": vars(expression).get("scratch", True)
+            if hasattr(expression, "__dict__")
+            else True,
         }
         from dask.base import tokenize
 
-        key = "expression-" + tokenize(payload, input_future.key)
+        key = "expression-" + tokenize(
+            {k: v for k, v in payload.items() if k != "scratch"}, input_future.key
+        )
         return self._client.submit(
             _expression_task,
             payload,
