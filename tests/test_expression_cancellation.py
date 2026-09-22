@@ -1,7 +1,7 @@
-"""Live-Dask evidence for known-issues section 3.4, item 3.
+"""Live-Dask evidence for Expression materialization cancellation.
 
-These characterize the documented limitation: abandoning dispatch_expression
-does not interrupt remote materialization or reclaim its default-executor slot.
+Abandoning a waiter leaves shared work alive through the linger, but must release
+the waiter's default-executor slot.
 The dummy-scheduler helper starts real Dask workers; no external cluster is needed.
 Run this file on its own, in the seamless1 conda environment.
 """
@@ -131,12 +131,16 @@ def _observe_cancel(monkeypatch):
         set_seamless_dask_client(None)
 
 
-def test_cancelled_expression_dispatch_leaves_remote_materialization_running(monkeypatch):
+def test_cancelled_expression_dispatch_keeps_materialization_alive_during_linger(monkeypatch):
     remote_running, _, _ = _observe_cancel(monkeypatch)
-    assert remote_running, "Update this characterization if Dask cancellation is fixed"
+    assert remote_running
 
 
-def test_cancelled_expression_dispatch_retains_default_executor_thread(monkeypatch):
+@pytest.mark.xfail(
+    strict=False,
+    reason="contract ahead of code: an abandoned Dask waiter still retains its executor thread",
+)
+def test_cancelled_expression_dispatch_releases_default_executor_thread(monkeypatch):
     _, executor_blocked, waiter_blocked = _observe_cancel(monkeypatch)
-    assert waiter_blocked, "Future.result should still be waiting on the remote result"
-    assert executor_blocked, "Known limitation: cancellation does not reclaim the thread"
+    assert not waiter_blocked
+    assert not executor_blocked
