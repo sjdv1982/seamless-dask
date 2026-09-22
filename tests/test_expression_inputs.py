@@ -1,3 +1,5 @@
+import pytest
+
 from seamless import Buffer, CacheMissError, Checksum
 from seamless.checksum import expression as expression_mod
 from seamless_dask import client as dask_client
@@ -24,6 +26,40 @@ def test_expression_task_returns_fat_input_tuple():
     assert result_checksum is not None
     assert isinstance(result_buffer, Buffer)
     assert result_buffer.get_value("int") == 42
+
+
+@pytest.mark.xfail(
+    strict=False,
+    reason="contract ahead of code: Dask Expression payload omits scratch",
+)
+def test_expression_future_payload_includes_scratch():
+    from types import SimpleNamespace
+
+    submissions = []
+    sentinel = object()
+
+    class Scheduler:
+        def submit(self, function, payload, input_future, **kwargs):
+            submissions.append((function, payload, input_future, kwargs))
+            return sentinel
+
+    subject = SimpleNamespace(_client=Scheduler())
+    expression = SimpleNamespace(
+        path="value",
+        input_celltype="plain",
+        celltype="int",
+        validator=None,
+        validator_language=None,
+        scratch=True,
+    )
+    input_future = SimpleNamespace(key="fat-input")
+
+    actual = dask_client.SeamlessDaskClient.get_expression_future(
+        subject, expression, input_future
+    )
+
+    assert actual is sentinel
+    assert submissions[0][1]["scratch"] is True
 
 
 def test_expression_task_requests_auto_location(monkeypatch):
@@ -61,6 +97,51 @@ def test_expression_task_requests_auto_location(monkeypatch):
     assert isinstance(result_buffer, Buffer)
     assert result_buffer.get_value("int") == 42
     assert executions == ["auto"]
+
+
+@pytest.mark.xfail(
+    strict=False,
+    reason="contract ahead of code: scratch Expression results are still uploaded",
+)
+def test_scratch_expression_task_does_not_publish_its_result(monkeypatch):
+    from seamless_remote import buffer_remote
+
+    source = Buffer({"value": 42}, "plain")
+    source_checksum = source.get_checksum()
+    source.tempref()
+    expected = Buffer(42, "int")
+    expected_checksum = expected.get_checksum()
+    expected.tempref()
+    writes = []
+
+    async def evaluate_expression(*args, **kwargs):
+        return expected_checksum
+
+    async def write_buffer(checksum, buffer):
+        writes.append((checksum, buffer))
+        return True
+
+    monkeypatch.setattr(
+        expression_mod, "evaluate_expression_remote", evaluate_expression
+    )
+    monkeypatch.setattr(buffer_remote, "write_buffer", write_buffer)
+
+    result_checksum, result_buffer, error = dask_client._expression_task(
+        {
+            "path": "value",
+            "input_celltype": "plain",
+            "celltype": "int",
+            "validator": None,
+            "validator_language": None,
+            "scratch": True,
+        },
+        (source_checksum.hex(), source, None),
+    )
+
+    assert error is None
+    assert result_checksum == expected_checksum.hex()
+    assert isinstance(result_buffer, Buffer)
+    assert writes == []
 
 
 def test_expression_task_reports_structured_cache_miss(monkeypatch):
