@@ -986,7 +986,7 @@ def _run_base(
                 checksum_hex, buf, exc = input_value
                 if exc:
                     return tf_checksum_hex, None, None, exc
-                if not (
+                if not transformation_dict.get("__schema__") and not (
                     spec.name in optional_pins
                     and checksum_hex == json_null_checksum().hex()
                 ):
@@ -1000,7 +1000,7 @@ def _run_base(
                 result_checksum_hex, buf, exc = input_value
                 if exc:
                     return tf_checksum_hex, None, None, exc
-                if not (
+                if not transformation_dict.get("__schema__") and not (
                     spec.name in optional_pins
                     and result_checksum_hex == json_null_checksum().hex()
                 ):
@@ -1016,7 +1016,7 @@ def _run_base(
                 result_checksum_hex, buf, exc = input_value
                 if exc:
                     return tf_checksum_hex, None, None, exc
-                if not (
+                if not transformation_dict.get("__schema__") and not (
                     spec.name in optional_pins
                     and result_checksum_hex == json_null_checksum().hex()
                 ):
