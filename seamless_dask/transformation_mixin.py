@@ -735,7 +735,8 @@ class TransformationDaskMixin:
                 checksum_hex = checksum_hex.hex()
             from seamless.checksum.hash_type_validation import validate_deserializable_as
 
-            validate_deserializable_as(checksum_hex, celltype)
+            if not transformation_dict.get("__schema__") or pinname in ("code", "objects"):
+                validate_deserializable_as(checksum_hex, celltype)
             inputs[pinname] = TransformationInputSpec(
                 name=pinname,
                 celltype=celltype,
