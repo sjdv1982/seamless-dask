@@ -43,6 +43,12 @@ def _publish_definition_for_dask(owner, checksum: Checksum) -> Checksum:
     if callable(publish):
         return publish(checksum)
     checksum.tempref()
+    # UNCLEAR: this fallback fires only when `owner` has no _publish_definition
+    # of its own (see call-site classification (c) in the tempref/transfer_write
+    # refactor); it is not known whether such an owner exposes a `.scratch`
+    # flag, so transfer_write preserves today's unconditional non-scratch
+    # registration pending a design decision.
+    checksum.transfer_write()
     owner._transformation_checksum = checksum
     return checksum
 
@@ -52,6 +58,8 @@ def _publish_result_for_dask(owner, checksum: Checksum) -> Checksum:
     if callable(publish):
         return publish(checksum)
     checksum.tempref()
+    # UNCLEAR: see _publish_definition_for_dask above.
+    checksum.transfer_write()
     owner._result_checksum = checksum
     return checksum
 

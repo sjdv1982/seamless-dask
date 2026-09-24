@@ -214,7 +214,8 @@ def test_actual_fat_acquisition_and_scratch_publication_paths(monkeypatch):
     definition = transformation._transformation_checksum_internal()
     assert definition is not None
     cache = get_buffer_cache()
-    assert cache.is_scratch_ref(definition) is True
+    # Scratch applies to the result only; the definition is provenance.
+    assert cache.is_scratch_ref(definition) is False
     assert cache.is_scratch_ref(result) is True
     assert cache.reference_snapshot().get(result, (0, 0, False))[0] == 0
     assert cache.purge_scratch(result) == 1
