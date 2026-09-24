@@ -100,10 +100,10 @@ def test_scratch_expression_task_does_not_publish_its_result(monkeypatch):
 
     source = Buffer({"value": 42}, "plain")
     source_checksum = source.get_checksum()
-    source.tempref(scratch=True)
+    source.tempref()
     expected = Buffer(42, "int")
     expected_checksum = expected.get_checksum()
-    expected.tempref(scratch=True)
+    expected.tempref()
     writes = []
 
     async def evaluate_expression(*args, **kwargs):

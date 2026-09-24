@@ -501,7 +501,8 @@ async def _resolve_buffer_async(checksum: Checksum) -> Buffer | None:
 async def _fingertip_buffer_async(checksum: Checksum) -> Buffer | None:
     buffer_obj = await checksum.fingertip()
     if isinstance(buffer_obj, Buffer):
-        buffer_obj.tempref(scratch=True)
+        buffer_obj.tempref()
+        buffer_obj.mark_scratch()
         return buffer_obj
     return None
 
@@ -1037,6 +1038,8 @@ def _run_base(
             )
             tf_buffer = tf_get_buffer(transformation_dict)
             tf_buffer.tempref()
+            if not scratch:
+                tf_buffer.transfer_write()
             tf_checksum_hex = tf_buffer.get_checksum().hex()
         dask_client = getattr(client, "client", None)
         if dask_client is not None and _is_transformation_cancelled(
@@ -1378,9 +1381,10 @@ class SeamlessDaskClient:
         }
         from dask.base import tokenize
 
-        key = "expression-" + tokenize(
-            {k: v for k, v in payload.items() if k != "scratch"}, input_future.key
-        )
+        # scratch is part of the key: a non-scratch request must materialize
+        # and write, so it may not be answered by a scratch task of the same
+        # Expression.
+        key = "expression-" + tokenize(payload, input_future.key)
         return self._client.submit(
             _expression_task,
             payload,
