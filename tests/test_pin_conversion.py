@@ -46,7 +46,7 @@ def test_converted_pin_dependencies_and_null_boundaries():
 
         null_source.celltypes.result = 'plain'
         optional.celltypes.value = 'binary'
-        optional.optional_pins.add('value')
+        optional.optional_pins.value.enable()
         absent = optional()
         connected = optional(null_source())
         assert connected.run() is True
