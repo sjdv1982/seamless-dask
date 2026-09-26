@@ -150,11 +150,25 @@ def test_dask_softcancel_one_member_leaves_futures_alive():
 
 
 def test_dask_softcancel_last_member_detaches_without_scheduler_cancel():
+    """cancellation.md, "The two operations" (Dask exception): when the last
+    member softcancels, the client releases its futures and drops the entry,
+    and does NOT cancel the run -- neither by marking the shared scheduler
+    submission canceled nor by cancelling any future. This is contract, not a
+    gap: on Dask only a hard cancel kills the run."""
+
+    class RecordingFuture(FakeFuture):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.released = False
+
+        def release(self):
+            self.released = True
+
     client = _client()
     active = _submission("3" * 64, meta={"local": False})
     futures = TransformationFutures(
-        base=FakeFuture(done=False),
-        thin=FakeFuture(done=False),
+        base=RecordingFuture(done=False),
+        thin=RecordingFuture(done=False),
         fat=None,
         tf_checksum=active.tf_checksum,
         submission_id="last-token",
@@ -168,8 +182,45 @@ def test_dask_softcancel_last_member_detaches_without_scheduler_cancel():
 
     assert client.softcancel_by_checksum(active.tf_checksum, "last") is True
     assert active.tf_checksum not in client._transformation_cache
-    # Soft cancellation only drops this process's interest.  Hard cancellation
-    # is the operation that marks a shared scheduler submission canceled.
+    assert active.tf_checksum not in client._active_transformation_envelopes
+    # The futures are released (this process's interest is dropped) ...
+    assert futures.base.released and futures.thin.released
+    # ... but the run is not killed: no future is cancelled ...
+    assert client._client.cancelled == []
+    assert not futures.base.cancelled() and not futures.thin.cancelled()
+    # ... and the shared scheduler submission is not marked canceled. Hard
+    # cancellation is the only operation that does that.
+    assert not _is_submission_cancelled(client._client, futures.submission_id)
+    # Having left, the member cannot leave again.
+    assert client.softcancel_by_checksum(active.tf_checksum, "last") is False
+
+
+def test_dask_softcancel_without_member_or_by_stranger_is_noop():
+    """A caller only softcancels its own participation: no member id, an
+    unknown member id, or an unknown checksum removes nobody and kills
+    nothing."""
+    client = _client()
+    active = _submission("4" * 64, meta={"local": False})
+    futures = TransformationFutures(
+        base=FakeFuture(done=False),
+        thin=FakeFuture(done=False),
+        fat=None,
+        tf_checksum=active.tf_checksum,
+        submission_id="noop-token",
+    )
+    futures.members.add("only")
+    client._store_transformation(
+        active.tf_checksum,
+        futures,
+        envelope_checksum=_normalized_dunder_envelope_checksum(active),
+    )
+
+    assert client.softcancel_by_checksum(active.tf_checksum) is False
+    assert client.softcancel_by_checksum(active.tf_checksum, "stranger") is False
+    assert client.softcancel_by_checksum("5" * 64, "only") is False
+    assert futures.members == {"only"}
+    assert active.tf_checksum in client._transformation_cache
+    assert client._client.cancelled == []
     assert not _is_submission_cancelled(client._client, futures.submission_id)
 
 
