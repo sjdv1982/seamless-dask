@@ -852,10 +852,10 @@ def _expression_task(
         checksum = Checksum(checksum_hex)
         if isinstance(buffer_obj, Buffer):
             Buffer(buffer_obj.content, checksum=checksum)
-        from seamless.checksum.expression import evaluate_expression_remote
+        from seamless.checksum.expression import evaluate_expression_placed
 
         result_checksum = _run_on_worker_loop(
-            lambda: evaluate_expression_remote(
+            lambda: evaluate_expression_placed(
                 checksum,
                 payload["path"],
                 payload["input_celltype"],

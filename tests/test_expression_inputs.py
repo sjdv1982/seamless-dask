@@ -67,14 +67,14 @@ def test_expression_task_requests_auto_location(monkeypatch):
     expected.tempref()
     executions = []
 
-    async def evaluate_expression(*args, **kwargs):
+    async def evaluate_expression_local(*args, **kwargs):
         executions.append(kwargs["execution"])
         return expected_checksum
 
     monkeypatch.setattr(
         expression_mod,
-        "evaluate_expression_remote",
-        evaluate_expression,
+        "evaluate_expression_placed",
+        evaluate_expression_local,
     )
 
     result_checksum, result_buffer, error = dask_client._expression_task(
@@ -106,7 +106,7 @@ def test_scratch_expression_task_does_not_publish_its_result(monkeypatch):
     expected.tempref()
     writes = []
 
-    async def evaluate_expression(*args, **kwargs):
+    async def evaluate_expression_local(*args, **kwargs):
         return expected_checksum
 
     async def write_buffer(checksum, buffer):
@@ -114,7 +114,7 @@ def test_scratch_expression_task_does_not_publish_its_result(monkeypatch):
         return True
 
     monkeypatch.setattr(
-        expression_mod, "evaluate_expression_remote", evaluate_expression
+        expression_mod, "evaluate_expression_placed", evaluate_expression_local
     )
     monkeypatch.setattr(buffer_remote, "write_buffer", write_buffer)
 
@@ -139,13 +139,13 @@ def test_scratch_expression_task_does_not_publish_its_result(monkeypatch):
 def test_expression_task_reports_structured_cache_miss(monkeypatch):
     missing = Checksum("f" * 64)
 
-    async def evaluate_expression(*args, **kwargs):
+    async def evaluate_expression_local(*args, **kwargs):
         raise CacheMissError(missing)
 
     monkeypatch.setattr(
         expression_mod,
-        "evaluate_expression_remote",
-        evaluate_expression,
+        "evaluate_expression_placed",
+        evaluate_expression_local,
     )
 
     result_checksum, result_buffer, error = dask_client._expression_task(
