@@ -765,7 +765,7 @@ class TransformationDaskMixin:
             input_futures=input_futures,
             tf_checksum=tf_checksum_hex,
             tf_dunder=getattr(self, "_tf_dunder", {}),
-            scratch=getattr(self, "_scratch", False),
+            scratch=self._requested_scratch(),
             meta=getattr(self, "_meta", {}) or {},
             require_value=require_value,
             allow_input_fingertip=allow_input_fingertip,
