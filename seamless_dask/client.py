@@ -520,6 +520,8 @@ async def _fetch_cached_result_async(
         result_checksum = await database_remote.get_transformation_result(tf_checksum)
         if result_checksum is None:
             return None
+        from seamless_transformer.transformation_cache import register_transformation_result
+        register_transformation_result(tf_checksum, result_checksum)
         if require_value:
             try:
                 await result_checksum.resolution()
@@ -672,7 +674,13 @@ async def _promise_and_write_result_async(
                                 member_checksum.hex(),
                             )
                             return
-    await database_remote.set_transformation_result(tf_checksum, result_checksum)
+    from seamless_transformer.transformation_cache import get_transformation_cache
+    outcome = await get_transformation_cache()._record_transformation_result(
+        tf_checksum, result_checksum, tf_dunder=tf_dunder,
+        remote_database=database_remote,
+    )
+    if outcome != "NEW":
+        return
 
     from seamless_transformer.transformation_cache import (
         _memory_peak_bytes,

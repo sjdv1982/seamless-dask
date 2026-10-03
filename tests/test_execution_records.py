@@ -788,3 +788,40 @@ def test_minimal_record_write_storage_failure_logs_and_continues(
         (tf_checksum.hex(), result_checksum.hex())
     ]
     assert "best-effort minimal execution-record write failed" in caplog.text
+
+
+def test_dask_result_mismatch_keeps_mapping_and_skips_execution_record(monkeypatch):
+    fake_database = _FakeDatabaseRemote()
+    reports = []
+    async def report(tf, result):
+        reports.append((tf, result))
+        return True
+    fake_database.report_irreproducible_result = report
+    monkeypatch.setattr(seamless_remote, "database_remote", fake_database)
+    monkeypatch.setattr(seamless_remote, "buffer_remote", _FakeBufferRemote())
+    cache = transformation_cache.TransformationCache()
+    monkeypatch.setattr(transformation_cache, "get_transformation_cache", lambda: cache)
+    tf, recorded, observed = (Checksum(char * 64) for char in "abc")
+    cache._register_transformation_result(tf, recorded)
+    asyncio.run(dask_client._promise_and_write_result_async(tf, observed, write_buffer=False))
+    assert cache._transformation_cache[tf] == recorded
+    assert reports == [(tf, observed)]
+    assert fake_database.transformation_results == []
+    assert fake_database.execution_records == []
+
+
+def test_dask_unreachable_database_hit_is_learned(monkeypatch):
+    from seamless import CacheMissError
+    fake_database = _FakeDatabaseRemote()
+    tf, recorded = Checksum("d" * 64), Checksum("e" * 64)
+    async def get(tf):
+        return recorded
+    async def unavailable(*args, **kwargs):
+        raise CacheMissError(recorded)
+    fake_database.get_transformation_result = get
+    monkeypatch.setattr(seamless_remote, "database_remote", fake_database)
+    monkeypatch.setattr(Checksum, "resolution", unavailable)
+    cache = transformation_cache.TransformationCache()
+    monkeypatch.setattr(transformation_cache, "get_transformation_cache", lambda: cache)
+    assert asyncio.run(dask_client._fetch_cached_result_async(tf, True)) is None
+    assert cache._transformation_cache[tf] == recorded
