@@ -251,6 +251,14 @@ def test_real_dask_progress_mixes_text_and_reaches_ten(stream_client, monkeypatc
     _, events, subscribed, unsubscribed = stream_client
     _FakeBar.instances = []
     monkeypatch.setattr(tqdm, "tqdm", _FakeBar)
+    rendered = []
+    refresh = _FakeBar.refresh
+
+    def record_refresh(bar):
+        refresh(bar)
+        rendered.append((bar.n, time.monotonic()))
+
+    monkeypatch.setattr(_FakeBar, "refresh", record_refresh)
 
     @delayed
     def progress(token):
@@ -269,10 +277,15 @@ def test_real_dask_progress_mixes_text_and_reaches_ten(stream_client, monkeypatc
     tf = progress(token)
     tf.streaming = True
     assert tf.run() == token
+    completed_at = time.monotonic()
     _wait_for(lambda: any(_kind(c) == "tqdm_close" for _, c, _ in events))
     chunks = [c for _, c, _ in events]
     updates = [c for c in chunks if _kind(c) == "tqdm_update"]
     assert len(updates) >= 2
+    assert any(
+        0 < n < 10 and timestamp < completed_at - 0.5
+        for n, timestamp in rendered
+    ), "positive progress must render while the synchronous transformation call is running"
     assert any(_kind(c) == "tqdm_close" and c["n"] == 10 for c in chunks)
     assert any("before-" + token in c.get("text", "") for c in chunks)
     assert any("after-" + token in c.get("text", "") for c in chunks)
