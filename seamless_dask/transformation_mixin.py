@@ -771,6 +771,7 @@ class TransformationDaskMixin:
             allow_input_fingertip=allow_input_fingertip,
             strict_dunder=bool(getattr(self, "_strict_dunder", False)),
             optional_pins=optional_pins,
+            streaming=bool(getattr(self, "_streaming", False)),
         )
 
     def _ensure_dask_futures(

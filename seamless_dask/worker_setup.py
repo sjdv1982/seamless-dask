@@ -11,6 +11,8 @@ from typing import Any
 
 from distributed.diagnostics.plugin import WorkerPlugin
 
+from .stream_throttle import default_stream_throttle
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -80,6 +82,7 @@ class SeamlessWorkerPlugin(WorkerPlugin):
         worker_logger = _get_worker_logger(worker)
         worker_logger.info("Seamless worker setup started")
         from seamless.transformer import has_spawned, spawn
+        from seamless_transformer import worker as transformer_worker
         from seamless.config import set_remote_clients
         from .permissions import configure as configure_permissions
         import os
@@ -96,6 +99,7 @@ class SeamlessWorkerPlugin(WorkerPlugin):
         if scheduler_address:
             os.environ.setdefault("SEAMLESS_DASK_SCHEDULER", scheduler_address)
         os.environ.setdefault("SEAMLESS_DASK_WORKERS", str(self.num_workers))
+        transformer_worker.set_stream_throttle(**default_stream_throttle())
 
         if self.remote_clients is not None:
             set_remote_clients(self.remote_clients, in_remote=True)
