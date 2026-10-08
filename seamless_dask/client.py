@@ -412,6 +412,7 @@ async def _dispatch_with_cancel_watch(
     streaming,
     stream_worker_address,
     stream_event_logger,
+    nparallel=None,
 ):
     """Run the worker-side dispatch while watching for a cancel flag.
 
@@ -433,6 +434,7 @@ async def _dispatch_with_cancel_watch(
             streaming=streaming,
             stream_worker_address=stream_worker_address,
             stream_event_logger=stream_event_logger,
+            nparallel=nparallel,
         )
     )
     loop = asyncio.get_running_loop()
@@ -1168,6 +1170,7 @@ def _run_base(
                     streaming=streaming,
                     stream_worker_address=stream_worker_address,
                     stream_event_logger=stream_event_logger,
+                    nparallel=payload.get("nparallel"),
                 )
             )
         finally:
@@ -1492,6 +1495,11 @@ class SeamlessDaskClient(StreamingMixin):
             "submission_id": submission_id,
             "optional_pins": sorted(submission.optional_pins),
             "streaming": bool(submission.streaming),
+            "nparallel": (
+                submission.nparallel
+                if submission.nparallel is not None
+                else transformer_worker.current_nparallel()
+            ),
         }
         input_futures = dict(submission.input_futures)
         resource_string = None  # TODO: get from tf_dunder
