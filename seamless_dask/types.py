@@ -34,6 +34,7 @@ class TransformationSubmission:
     allow_input_fingertip: bool = False
     strict_dunder: bool = False
     optional_pins: frozenset[str] = field(default_factory=frozenset)
+    streaming: bool = False
 
 
 @dataclass
@@ -47,3 +48,6 @@ class TransformationFutures:
     result_checksum: Optional[str] = None
     submission_id: Optional[str] = None
     members: set[str] = field(default_factory=set)
+    stream_topic: Optional[str] = None
+    stream_topic_released: bool = False
+    _stream_release_token: dict[str, bool] = field(default_factory=dict, repr=False)

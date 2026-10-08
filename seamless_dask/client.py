@@ -35,6 +35,9 @@ from .types import (
     TransformationSubmission,
 )
 from .worker_setup import SeamlessWorkerPlugin
+from .streaming import StreamingMixin, TqdmStreamRenderer
+
+_TqdmStreamRenderer = TqdmStreamRenderer
 
 # Apply the requested global Dask defaults up front.
 dask.config.set({"distributed.worker.daemon": False})
@@ -406,6 +409,9 @@ async def _dispatch_with_cancel_watch(
     scratch,
     owner_dask_key,
     owner_dask_priority,
+    streaming,
+    stream_worker_address,
+    stream_event_logger,
 ):
     """Run the worker-side dispatch while watching for a cancel flag.
 
@@ -424,6 +430,9 @@ async def _dispatch_with_cancel_watch(
             scratch=scratch,
             owner_dask_key=owner_dask_key,
             owner_dask_priority=owner_dask_priority,
+            streaming=streaming,
+            stream_worker_address=stream_worker_address,
+            stream_event_logger=stream_event_logger,
         )
     )
     loop = asyncio.get_running_loop()
@@ -1132,6 +1141,19 @@ def _run_base(
 
         gpu_sampler = start_gpu_memory_sampler()
         try:
+            streaming = bool(payload.get("streaming", False))
+            stream_worker_address = None
+            stream_event_logger = None
+            if streaming:
+                try:
+                    stream_worker = get_worker()
+                    stream_worker_address = getattr(stream_worker, "address", None)
+                    stream_event_logger = stream_worker.log_event
+                except Exception:
+                    _LOGGER.debug(
+                        "Could not resolve the Dask worker for stream events",
+                        exc_info=True,
+                    )
             result_checksum = _run_on_worker_loop(
                 lambda: _dispatch_with_cancel_watch(
                     client.client,
@@ -1143,6 +1165,9 @@ def _run_base(
                     scratch=scratch,
                     owner_dask_key=owner_dask_key,
                     owner_dask_priority=owner_dask_priority,
+                    streaming=streaming,
+                    stream_worker_address=stream_worker_address,
+                    stream_event_logger=stream_event_logger,
                 )
             )
         finally:
@@ -1254,7 +1279,7 @@ def _run_thin(
     return tf_checksum_hex, result_checksum_hex, exc
 
 
-class SeamlessDaskClient:
+class SeamlessDaskClient(StreamingMixin):
     """Coordinate Seamless transformations running on a Dask cluster."""
 
     def __init__(
@@ -1277,6 +1302,8 @@ class SeamlessDaskClient:
         self._active_transformation_envelopes: dict[str, str] = {}
         self._released_transformation_futures: set[int] = set()
         self._cache_lock = threading.RLock()
+        self._stream_topic_lock = threading.RLock()
+        self._stream_topics: dict[str, dict[str, Any]] = {}
         self._prune_stop = threading.Event()
         self._prune_interval = _parse_cache_prune_interval()
         self._prune_thread: threading.Thread | None = None
@@ -1285,6 +1312,13 @@ class SeamlessDaskClient:
         self._promised_targets: dict[str, set[str]] = {}
         ensure_configured(workers=worker_plugin_workers)
         self._register_worker_plugin(worker_plugin_workers, remote_clients)
+        try:
+            get_worker()
+            inside_dask_worker = True
+        except Exception:
+            inside_dask_worker = False
+        if not inside_dask_worker:
+            self._register_stream_throttle_plugin()
         _LOGGER.info(
             "[seamless-dask] SeamlessDaskClient created pid=%s thread=%s %s",
             os.getpid(),
@@ -1303,7 +1337,6 @@ class SeamlessDaskClient:
         self._warn_if_no_workers()
         self._start_prune_thread()
 
-    # --- public API -----------------------------------------------------
     @property
     def client(self) -> Client:
         return self._client
@@ -1458,6 +1491,7 @@ class SeamlessDaskClient:
             "record": get_record_mode(),
             "submission_id": submission_id,
             "optional_pins": sorted(submission.optional_pins),
+            "streaming": bool(submission.streaming),
         }
         input_futures = dict(submission.input_futures)
         resource_string = None  # TODO: get from tf_dunder
@@ -1475,17 +1509,35 @@ class SeamlessDaskClient:
 
         payload["owner_dask_key"] = base_key
 
-        base_future = self._client.submit(
-            _run_base,
-            payload,
-            input_futures,
-            base_priority,
-            pure=False,
-            key=base_key,
-            resources={"S": 1},
-            priority=base_priority,
-            retries=3,
-        )
+        stream_topic = None
+        stream_release_token = None
+        if submission.streaming:
+            stream_topic = f"seamless-stream-{base_key}"
+            stream_release_token = {"released": False}
+            self._subscribe_stream_topic(stream_topic, base_key)
+
+        try:
+            base_future = self._client.submit(
+                _run_base,
+                payload,
+                input_futures,
+                base_priority,
+                pure=False,
+                key=base_key,
+                resources={"S": 1},
+                priority=base_priority,
+                retries=3,
+            )
+        except BaseException:
+            if stream_topic is not None:
+                self._release_stream_topic(stream_topic, stream_release_token)
+            raise
+        if stream_topic is not None:
+            base_future.add_done_callback(
+                lambda _future, topic=stream_topic, token=stream_release_token: self._release_stream_topic(
+                    topic, token
+                )
+            )
         thin_future = self._client.submit(
             _run_thin,
             base_future,
@@ -1513,6 +1565,11 @@ class SeamlessDaskClient:
             thin=thin_future,
             tf_checksum=tf_checksum_hex,
             submission_id=submission_id,
+            stream_topic=stream_topic,
+            stream_topic_released=bool(
+                stream_release_token and stream_release_token.get("released")
+            ),
+            _stream_release_token=stream_release_token or {},
         )
         futures.members.add(member_id)
         for future in (base_future, thin_future, fat_future):
@@ -1839,6 +1896,12 @@ class SeamlessDaskClient:
                 cached = self._fat_finger_checksum_cache.get(futures.result_checksum)
                 if cached is not None and cached[0] is futures.fat:
                     self._fat_finger_checksum_cache.pop(futures.result_checksum, None)
+
+        try:
+            if cancel or futures.base.done():
+                self._release_stream_for_futures(futures)
+        except Exception:
+            _LOGGER.debug("Could not release a transformation stream topic", exc_info=True)
 
         for future in (futures.base, futures.thin, futures.fat):
             if future is None:

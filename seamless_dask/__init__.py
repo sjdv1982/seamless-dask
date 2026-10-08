@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, Any
 
 __all__ = [
     "SeamlessDaskClient",
+    "TqdmStreamRenderer",
+    "StreamingMixin",
     "get_seamless_dask_client",
     "set_seamless_dask_client",
     "TransformationDaskMixin",
@@ -21,6 +23,8 @@ __all__ = [
 # package is merely used as a namespace (e.g. ``import seamless_dask.wrapper``).
 _LAZY_EXPORTS = {
     "SeamlessDaskClient": (".client", "SeamlessDaskClient"),
+    "TqdmStreamRenderer": (".streaming", "TqdmStreamRenderer"),
+    "StreamingMixin": (".streaming", "StreamingMixin"),
     "get_seamless_dask_client": (
         ".transformer_client",
         "get_seamless_dask_client",
@@ -43,6 +47,7 @@ _LAZY_EXPORTS = {
 
 if TYPE_CHECKING:
     from .client import SeamlessDaskClient
+    from .streaming import StreamingMixin, TqdmStreamRenderer
     from .dummy_scheduler import (
         DummySchedulerHandle,
         create_dummy_client,
