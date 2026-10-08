@@ -35,6 +35,7 @@ class TransformationSubmission:
     strict_dunder: bool = False
     optional_pins: frozenset[str] = field(default_factory=frozenset)
     streaming: bool = False
+    nparallel: Optional[int] = None  # None: use the submitting process's nparallel
 
 
 @dataclass
