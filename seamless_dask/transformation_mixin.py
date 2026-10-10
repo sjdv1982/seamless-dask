@@ -336,7 +336,7 @@ class TransformationDaskMixin:
                 need_fat=False,
                 permission_granted=permission_granted,
             )
-            tf_checksum_hex, result_checksum_hex, exc = futures.thin.result()
+            tf_checksum_hex, result_checksum_hex, exc, logs = futures.thin.result()
         except Exception as exc:
             if permission_granted:
                 release_permission()
@@ -394,6 +394,23 @@ class TransformationDaskMixin:
                     )
                 except Exception:
                     pass
+                if logs is not None:
+                    try:
+                        store_log = getattr(
+                            client, "_store_transformation_log_for_futures", None
+                        )
+                        if callable(store_log):
+                            store_log(
+                                futures, self._transformation_checksum, logs
+                            )
+                        else:
+                            from seamless_transformer.transformation_cache import (
+                                set_transformation_log,
+                            )
+
+                            set_transformation_log(self._transformation_checksum, logs)
+                    except Exception:
+                        pass
         return self._result_checksum
 
     async def _compute_with_dask_async(self, require_value: bool) -> Checksum | None:
@@ -478,7 +495,7 @@ class TransformationDaskMixin:
                 need_fat=False,
                 permission_granted=permission_granted,
             )
-            tf_checksum_hex, result_checksum_hex, exc = await asyncio.wrap_future(
+            tf_checksum_hex, result_checksum_hex, exc, logs = await asyncio.wrap_future(
                 asyncio.get_running_loop().run_in_executor(None, futures.thin.result)
             )
         except asyncio.CancelledError:
@@ -553,6 +570,23 @@ class TransformationDaskMixin:
                     )
                 except Exception:
                     pass
+                if logs is not None:
+                    try:
+                        store_log = getattr(
+                            client, "_store_transformation_log_for_futures", None
+                        )
+                        if callable(store_log):
+                            store_log(
+                                futures, self._transformation_checksum, logs
+                            )
+                        else:
+                            from seamless_transformer.transformation_cache import (
+                                set_transformation_log,
+                            )
+
+                            set_transformation_log(self._transformation_checksum, logs)
+                    except Exception:
+                        pass
         return self._result_checksum
 
     # ---- internals --------------------------------------------------------
