@@ -900,9 +900,71 @@ def _expression_task(
     except Exception as exc:
         return checksum_hex, None, encode_error(exc)
 
+def _celljoin_task(
+    payload: Dict[str, Any],
+    definition_value: Tuple[Any, ...],
+) -> Tuple[str | None, Buffer | None, dict[str, Any] | None]:
+    """Evaluate a celljoin from its hashserver definition buffer."""
+    checksum_hex, definition_buffer, exc = definition_value
+    if exc:
+        return checksum_hex, definition_buffer, exc
+    if checksum_hex is None:
+        return (
+            None,
+            None,
+            encode_error(
+                WorkflowExecutionError("Celljoin definition checksum unavailable")
+            ),
+        )
+    try:
+        checksum = Checksum(payload["celljoin_checksum"])
+        from seamless.checksum.expression import ExpressionEvaluationError
+
+        celltype = payload["celltype"]
+        if celltype not in ("mixed", "plain"):
+            raise ExpressionEvaluationError(
+                f"Remote celljoin evaluation does not support celltype {celltype!r}"
+            )
+        if not isinstance(definition_buffer, Buffer):
+            raise CacheMissError(checksum)
+        Buffer(definition_buffer.content, checksum=checksum)
+        from seamless.checksum.celljoin import (
+            evaluate_celljoin_local_async,
+            parse_celljoin,
+        )
+
+        spec = parse_celljoin(definition_buffer, celltype)
+        if spec.checksum != checksum:
+            raise CacheMissError(checksum)
+        scratch = bool(payload.get("scratch", True))
+        result_checksum = _run_on_worker_loop(
+            lambda: evaluate_celljoin_local_async(
+                spec, materialize=not scratch
+            )
+        )
+        result_buffer = result_checksum.resolve()
+        from seamless_remote import buffer_remote
+
+        if isinstance(result_buffer, Buffer) and not scratch:
+            _run_on_worker_loop(
+                lambda: buffer_remote.write_buffer(result_checksum, result_buffer)
+            )
+        return (
+            result_checksum.hex(),
+            result_buffer if isinstance(result_buffer, Buffer) else None,
+            None,
+        )
+    except Exception as exc:
+        return checksum_hex, None, encode_error(exc)
+
 
 def _expression_checksum_task(value):
     """Keep the result buffer on workers at a standalone dispatch boundary."""
+    checksum, _, error = value
+    return checksum, error
+
+def _celljoin_checksum_task(value):
+    """Keep a dispatched celljoin result buffer on its worker."""
     checksum, _, error = value
     return checksum, error
 
@@ -1433,6 +1495,28 @@ class SeamlessDaskClient(StreamingMixin):
             _expression_task,
             payload,
             input_future,
+            pure=False,
+            key=key,
+            priority=priority,
+        )
+
+    def get_celljoin_future(
+        self,
+        payload: Dict[str, Any],
+        definition_future: Future,
+        *,
+        priority: int = -1,
+    ) -> Future:
+        """Return a fat-checksum-shaped future for a celljoin result."""
+        payload = dict(payload)
+        payload["scratch"] = bool(payload.get("scratch", True))
+        from dask.base import tokenize
+
+        key = "celljoin-" + tokenize(payload, definition_future.key)
+        return self._client.submit(
+            _celljoin_task,
+            payload,
+            definition_future,
             pure=False,
             key=key,
             priority=priority,
