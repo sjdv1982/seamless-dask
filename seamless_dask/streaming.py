@@ -17,6 +17,7 @@ from .stream_throttle import (
     update_worker_state,
 )
 from .types import TransformationFutures
+from seamless_transformer.stream_output import get_stream_output_override
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -34,6 +35,7 @@ def _parse_bool_env(name: str, default: bool = False) -> bool:
 
 
 _TQDM_AUTO = object()
+_STREAM_OUTPUT_UNSET = object()
 
 class TqdmStreamRenderer:
     """Render streamed tqdm lifecycle chunks in the local client process."""
@@ -402,10 +404,16 @@ class StreamingMixin:
                 current["refs"] += 1
                 return
 
-            renderer = TqdmStreamRenderer(base_key)
+            output_override = get_stream_output_override()
+            renderer = TqdmStreamRenderer(base_key, output=output_override)
 
             def _handler(event) -> None:
-                self._render_stream_event(base_key, event, renderer=renderer)
+                self._render_stream_event(
+                    base_key,
+                    event,
+                    renderer=renderer,
+                    output_override=output_override,
+                )
 
             self._client.subscribe_topic(topic, _handler)
             self._stream_topics[topic] = {
@@ -421,6 +429,7 @@ class StreamingMixin:
         event,
         *,
         renderer: TqdmStreamRenderer | None = None,
+        output_override=_STREAM_OUTPUT_UNSET,
     ) -> None:
         try:
             _timestamp, message = event
@@ -428,6 +437,9 @@ class StreamingMixin:
             return
         if not isinstance(message, dict):
             return
+
+        if output_override is _STREAM_OUTPUT_UNSET:
+            output_override = get_stream_output_override()
 
         if renderer is None:
             topic = f"seamless-stream-{base_key}"
@@ -460,7 +472,9 @@ class StreamingMixin:
         except (TypeError, ValueError, OverflowError):
             truncated = 0
         marker = f"[... {truncated} bytes truncated from head ...]\n" if truncated else ""
-        output = sys.stderr if stream_name == "stderr" else sys.stdout
+        output = output_override
+        if output is None:
+            output = sys.stderr if stream_name == "stderr" else sys.stdout
         rendered_text = prefix + marker + text
         if renderer is not None:
             renderer.write_text(output, rendered_text)
