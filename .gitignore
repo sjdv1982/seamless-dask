@@ -1,5 +1,6 @@
 *.code-workspace
 .vscode/
+.serena
 *.pyc
 *.egg-info/
 build/
