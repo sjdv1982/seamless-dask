@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 
 import pytest
 import tqdm
@@ -21,14 +22,22 @@ def _kind(chunk):
     return chunk.get("kind", chunk.get("type"))
 
 
-def test_patch_covers_main_std_auto_and_restores_on_exception():
+@contextmanager
+def _streaming_tqdm_patch(notifier, **kwargs):
+    from seamless_transformer.output_routing import output_route
     from seamless_transformer.stream_tqdm import install_tqdm_patch
 
+    with install_tqdm_patch(notifier, **kwargs) as patch:
+        with output_route(sys.stdout, sys.stderr, tqdm_patch=patch):
+            yield patch
+
+
+def test_patch_covers_main_std_auto_and_restores_on_exception():
     original = (tqdm.tqdm, tqdm.std.tqdm, tqdm.auto.tqdm)
     finders = list(sys.meta_path)
     chunks = []
     with pytest.raises(RuntimeError, match="intentional"):
-        with install_tqdm_patch(chunks.append):
+        with _streaming_tqdm_patch(chunks.append):
             assert tqdm.tqdm is not original[0]
             assert tqdm.std.tqdm is not original[1]
             assert tqdm.auto.tqdm is not original[2]
@@ -47,13 +56,11 @@ def test_patch_covers_main_std_auto_and_restores_on_exception():
 
 
 def test_patch_handles_auto_imported_after_context_entry(monkeypatch):
-    from seamless_transformer.stream_tqdm import install_tqdm_patch
-
     monkeypatch.delitem(sys.modules, "tqdm.auto")
     monkeypatch.delattr(tqdm, "auto")
     chunks = []
     finders = list(sys.meta_path)
-    with install_tqdm_patch(chunks.append):
+    with _streaming_tqdm_patch(chunks.append):
         import tqdm.auto as late_auto
 
         with late_auto.tqdm(total=1, file=io.StringIO()) as bar:
@@ -65,11 +72,9 @@ def test_patch_handles_auto_imported_after_context_entry(monkeypatch):
 
 
 def test_nested_and_indeterminate_bars_close_without_terminal_duplicates():
-    from seamless_transformer.stream_tqdm import install_tqdm_patch
-
     chunks = []
     terminal = io.StringIO()
-    with install_tqdm_patch(chunks.append):
+    with _streaming_tqdm_patch(chunks.append):
         with tqdm.tqdm(total=2, desc="outer", unit="item", unit_scale=True, file=terminal) as outer:
             with tqdm.tqdm(total=None, desc="inner", file=terminal) as inner:
                 inner.update(3)
@@ -92,10 +97,8 @@ def test_nested_and_indeterminate_bars_close_without_terminal_duplicates():
 
 
 def test_fast_progress_coalesces_but_close_carries_latest_state():
-    from seamless_transformer.stream_tqdm import install_tqdm_patch
-
     chunks = []
-    with install_tqdm_patch(chunks.append):
+    with _streaming_tqdm_patch(chunks.append):
         with tqdm.tqdm(total=100, mininterval=0, file=io.StringIO()) as bar:
             for _ in range(100):
                 bar.update(1)
@@ -108,11 +111,9 @@ def test_fast_progress_coalesces_but_close_carries_latest_state():
 
 
 def test_context_exit_closes_unfinished_bars_and_restores_patch():
-    from seamless_transformer.stream_tqdm import install_tqdm_patch
-
     original = tqdm.tqdm
     chunks = []
-    with install_tqdm_patch(chunks.append):
+    with _streaming_tqdm_patch(chunks.append):
         bar = tqdm.tqdm(total=10, file=io.StringIO())
         bar.update(4)
     assert tqdm.tqdm is original
@@ -123,10 +124,8 @@ def test_context_exit_closes_unfinished_bars_and_restores_patch():
 
 
 def test_progress_throttle_can_tighten_active_bars():
-    from seamless_transformer.stream_tqdm import install_tqdm_patch
-
     chunks = []
-    with install_tqdm_patch(chunks.append, min_interval=0.01) as controller:
+    with _streaming_tqdm_patch(chunks.append, min_interval=0.01) as controller:
         with tqdm.tqdm(total=5, file=io.StringIO()) as bar:
             bar.update(1)
             bar.refresh()

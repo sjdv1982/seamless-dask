@@ -46,6 +46,8 @@ dask.config.set({"distributed.scheduler.target-duration": "10m"})
 
 _SEAMLESS_DASK_CLIENT_LOCK = threading.Lock()
 _LOGGER = logging.getLogger(__name__)
+_TRANSFORMATION_LOG_DISPATCH_TOPIC = "seamless-transformation-log-dispatch"
+_DISPATCH_STARTED_LOGS_MARKER = "_seamless_dispatch_started"
 _BASE_DASK_PRIORITY = 10
 # How often a running worker task polls the scheduler for a cancel flag so it can
 # terminate the inner spawn subprocess and reclaim the slot. Polling (rather than a
@@ -413,6 +415,7 @@ async def _dispatch_with_cancel_watch(
     stream_worker_address,
     stream_event_logger,
     nparallel=None,
+    with_logs=False,
 ):
     """Run the worker-side dispatch while watching for a cancel flag.
 
@@ -435,6 +438,7 @@ async def _dispatch_with_cancel_watch(
             stream_worker_address=stream_worker_address,
             stream_event_logger=stream_event_logger,
             nparallel=nparallel,
+            with_logs=with_logs,
         )
     )
     loop = asyncio.get_running_loop()
@@ -973,7 +977,13 @@ def _run_base(
     payload: Dict[str, Any],
     input_results: Mapping[str, Tuple[Any, ...]],
     priority: int | None = None,
-) -> Tuple[str | None, str | None, Buffer | None, dict[str, Any] | None]:
+) -> Tuple[
+    str | None,
+    str | None,
+    Buffer | None,
+    dict[str, Any] | None,
+    dict[str, Any] | None,
+]:
     """Worker task that performs the transformation itself."""
 
     from seamless_dask.client import SeamlessDaskClient
@@ -997,7 +1007,7 @@ def _run_base(
     if request_record_mode != _startup_record_mode():
         return tf_checksum_hex, None, None, encode_error(
             WorkflowExecutionError(_record_mode_mismatch_error(request_record_mode))
-        )
+        ), None
 
     owner_dask_key = payload.get("owner_dask_key")
     if not isinstance(owner_dask_key, str) or not owner_dask_key:
@@ -1054,6 +1064,7 @@ def _run_base(
     wall_start = time.perf_counter()
     cpu_start = os.times()
     gpu_memory_peak_bytes = None
+    dispatch_started = False
 
     try:
         for raw_spec in inputs:
@@ -1067,7 +1078,7 @@ def _run_base(
             if spec.kind == "checksum":
                 checksum_hex, buf, exc = input_value
                 if exc:
-                    return tf_checksum_hex, None, None, exc
+                    return tf_checksum_hex, None, None, exc, None
                 if not transformation_dict.get("__schema__") and not (
                     spec.name in optional_pins
                     and checksum_hex == json_null_checksum().hex()
@@ -1081,7 +1092,7 @@ def _run_base(
             elif spec.kind == "transformation":
                 result_checksum_hex, buf, exc = input_value
                 if exc:
-                    return tf_checksum_hex, None, None, exc
+                    return tf_checksum_hex, None, None, exc, None
                 if not transformation_dict.get("__schema__") and not (
                     spec.name in optional_pins
                     and result_checksum_hex == json_null_checksum().hex()
@@ -1097,7 +1108,7 @@ def _run_base(
             elif spec.kind == "expression":
                 result_checksum_hex, buf, exc = input_value
                 if exc:
-                    return tf_checksum_hex, None, None, exc
+                    return tf_checksum_hex, None, None, exc, None
                 if not transformation_dict.get("__schema__") and not (
                     spec.name in optional_pins
                     and result_checksum_hex == json_null_checksum().hex()
@@ -1131,6 +1142,7 @@ def _run_base(
                 None,
                 None,
                 "Transformation was canceled",
+                None,
             )
         if tf_checksum_missing:
             # Redirect tasks submitted without a checksum to the deterministic key.
@@ -1194,9 +1206,24 @@ def _run_base(
                     # fall back to full execution if value unavailable
                     pass
                 else:
-                    return tf_checksum_hex, result_checksum_hex, result_buffer, None
+                    return tf_checksum_hex, result_checksum_hex, result_buffer, None, None
             else:
-                return tf_checksum_hex, result_checksum_hex, None, None
+                return tf_checksum_hex, result_checksum_hex, None, None, None
+
+        dispatch_started = True
+        try:
+            get_worker().log_event(
+                _TRANSFORMATION_LOG_DISPATCH_TOPIC,
+                {
+                    "tf_checksum": tf_checksum_hex,
+                    "submission_id": submission_id,
+                },
+            )
+        except Exception:
+            _LOGGER.debug(
+                "Could not publish transformation log dispatch event",
+                exc_info=True,
+            )
 
         from seamless_transformer.transformation_cache import (
             start_gpu_memory_sampler,
@@ -1218,7 +1245,7 @@ def _run_base(
                         "Could not resolve the Dask worker for stream events",
                         exc_info=True,
                     )
-            result_checksum = _run_on_worker_loop(
+            dispatch_result = _run_on_worker_loop(
                 lambda: _dispatch_with_cancel_watch(
                     client.client,
                     submission_id,
@@ -1233,14 +1260,32 @@ def _run_base(
                     stream_worker_address=stream_worker_address,
                     stream_event_logger=stream_event_logger,
                     nparallel=payload.get("nparallel"),
+                    with_logs=True,
                 )
             )
+            dispatched_logs = None
+            if isinstance(dispatch_result, tuple) and len(dispatch_result) == 2:
+                result_checksum, dispatched_logs = dispatch_result
+            else:
+                result_checksum = dispatch_result
         finally:
             gpu_memory_peak_bytes = stop_gpu_memory_sampler(gpu_sampler)
         if isinstance(result_checksum, dict) and "error" in result_checksum:
-            return tf_checksum_hex, None, None, result_checksum
+            return (
+                tf_checksum_hex,
+                None,
+                None,
+                result_checksum,
+                {_DISPATCH_STARTED_LOGS_MARKER: True},
+            )
         if isinstance(result_checksum, str):
-            return tf_checksum_hex, None, None, encode_error(WorkflowExecutionError(result_checksum))
+            return (
+                tf_checksum_hex,
+                None,
+                None,
+                encode_error(WorkflowExecutionError(result_checksum)),
+                {_DISPATCH_STARTED_LOGS_MARKER: True},
+            )
         result_checksum = Checksum(result_checksum)
 
         result_checksum_hex = result_checksum.hex()
@@ -1260,12 +1305,23 @@ def _run_base(
                 result_checksum_hex,
                 None,
                 encode_error(CacheMissError(result_checksum)),
+                {_DISPATCH_STARTED_LOGS_MARKER: True},
             )
 
         tf_checksum_obj = Checksum(tf_checksum_hex)
         output_celltype = _output_celltype_from_transformation(transformation_dict)
         finished_at = _utcnow_iso()
         wall_time_seconds = round(time.perf_counter() - wall_start, 6)
+        dispatched_logs = dispatched_logs or {}
+        transformation_logs = {
+            "stdout": dispatched_logs.get("stdout", ""),
+            "stderr": dispatched_logs.get("stderr", ""),
+            "wall_time_seconds": wall_time_seconds,
+            # This stays inside the thin-future transport so a parent poller
+            # can distinguish a fresh successful dispatch from a Dask cache
+            # hit even if the topic event arrives late or is unavailable.
+            _DISPATCH_STARTED_LOGS_MARKER: True,
+        }
         cpu_end = os.times()
         cpu_user_seconds = round(cpu_end.user - cpu_start.user, 6)
         cpu_system_seconds = round(cpu_end.system - cpu_start.system, 6)
@@ -1279,6 +1335,7 @@ def _run_base(
                 None,
                 None,
                 "Transformation was canceled",
+                {_DISPATCH_STARTED_LOGS_MARKER: True},
             )
         _run_on_worker_loop(
             lambda: _promise_and_write_result_async(
@@ -1300,16 +1357,23 @@ def _run_base(
             )
         )
 
-        return tf_checksum_hex, result_checksum_hex, result_buffer, None
+        return tf_checksum_hex, result_checksum_hex, result_buffer, None, transformation_logs
     except Exception as exc:
-        return tf_checksum_hex, None, None, encode_error(exc)
+        logs = {_DISPATCH_STARTED_LOGS_MARKER: True} if dispatch_started else None
+        return tf_checksum_hex, None, None, encode_error(exc), logs
 
 
 def _run_fat(
-    base_result: Tuple[str | None, str | None, Buffer | None, dict[str, Any] | None],
+    base_result: Tuple[
+        str | None,
+        str | None,
+        Buffer | None,
+        dict[str, Any] | None,
+        dict[str, Any] | None,
+    ],
 ) -> Tuple[str | None, Buffer | None, dict[str, Any] | None]:
     """Worker task that ensures a buffer is available for dependents."""
-    tf_checksum_hex, result_checksum_hex, result_buffer, exc = base_result
+    tf_checksum_hex, result_checksum_hex, result_buffer, exc, _logs = base_result
     if exc:
         return result_checksum_hex, result_buffer, exc
     if result_buffer is not None:
@@ -1320,10 +1384,16 @@ def _run_fat(
 
 
 def _run_fat_finger(
-    base_result: Tuple[str | None, str | None, Buffer | None, dict[str, Any] | None],
+    base_result: Tuple[
+        str | None,
+        str | None,
+        Buffer | None,
+        dict[str, Any] | None,
+        dict[str, Any] | None,
+    ],
 ) -> Tuple[str | None, Buffer | None, dict[str, Any] | None]:
     """Worker task that allows fingering inputs when buffers are missing."""
-    tf_checksum_hex, result_checksum_hex, result_buffer, exc = base_result
+    tf_checksum_hex, result_checksum_hex, result_buffer, exc, _logs = base_result
     if exc:
         return result_checksum_hex, result_buffer, exc
     if result_buffer is not None:
@@ -1337,11 +1407,17 @@ def _run_fat_finger(
 
 
 def _run_thin(
-    base_result: Tuple[str | None, str | None, Buffer | None, dict[str, Any] | None],
-) -> Tuple[str | None, str | None, dict[str, Any] | None]:
+    base_result: Tuple[
+        str | None,
+        str | None,
+        Buffer | None,
+        dict[str, Any] | None,
+        dict[str, Any] | None,
+    ],
+) -> Tuple[str | None, str | None, dict[str, Any] | None, dict[str, Any] | None]:
     """Worker task that only needs the checksums."""
-    tf_checksum_hex, result_checksum_hex, _result_buffer, exc = base_result
-    return tf_checksum_hex, result_checksum_hex, exc
+    tf_checksum_hex, result_checksum_hex, _result_buffer, exc, logs = base_result
+    return tf_checksum_hex, result_checksum_hex, exc, logs
 
 
 class SeamlessDaskClient(StreamingMixin):
@@ -1365,6 +1441,9 @@ class SeamlessDaskClient(StreamingMixin):
             str, tuple[TransformationFutures, float | None]
         ] = {}
         self._active_transformation_envelopes: dict[str, str] = {}
+        self._transformation_log_submissions: dict[str, str | None] = {}
+        self._transformation_log_started_submissions: set[str] = set()
+        self._transformation_log_futures: dict[str, TransformationFutures] = {}
         self._released_transformation_futures: set[int] = set()
         self._cache_lock = threading.RLock()
         self._stream_topic_lock = threading.RLock()
@@ -1383,6 +1462,7 @@ class SeamlessDaskClient(StreamingMixin):
         except Exception:
             inside_dask_worker = False
         if not inside_dask_worker:
+            self._subscribe_transformation_log_dispatch()
             self._register_stream_throttle_plugin()
         _LOGGER.info(
             "[seamless-dask] SeamlessDaskClient created pid=%s thread=%s %s",
@@ -1608,6 +1688,8 @@ class SeamlessDaskClient(StreamingMixin):
             stream_release_token = {"released": False}
             self._subscribe_stream_topic(stream_topic, base_key)
 
+        with self._cache_lock:
+            self._transformation_log_submissions[submission_id] = tf_checksum_hex
         try:
             base_future = self._client.submit(
                 _run_base,
@@ -1621,6 +1703,9 @@ class SeamlessDaskClient(StreamingMixin):
                 retries=3,
             )
         except BaseException:
+            with self._cache_lock:
+                self._transformation_log_submissions.pop(submission_id, None)
+                self._transformation_log_started_submissions.discard(submission_id)
             if stream_topic is not None:
                 self._release_stream_topic(stream_topic, stream_release_token)
             raise
@@ -1630,26 +1715,59 @@ class SeamlessDaskClient(StreamingMixin):
                     topic, token
                 )
             )
-        thin_future = self._client.submit(
-            _run_thin,
-            base_future,
-            pure=False,
-            key=thin_key,
-            priority=thin_priority,
-        )
+        try:
+            thin_future = self._client.submit(
+                _run_thin,
+                base_future,
+                pure=False,
+                key=thin_key,
+                priority=thin_priority,
+            )
+        except BaseException:
+            with self._cache_lock:
+                self._transformation_log_submissions.pop(submission_id, None)
+                self._transformation_log_started_submissions.discard(submission_id)
+            try:
+                self._client.cancel(base_future, force=True)
+            except Exception:
+                pass
+            try:
+                base_future.release()
+            except Exception:
+                pass
+            if stream_topic is not None:
+                self._release_stream_topic(stream_topic, stream_release_token)
+            raise
 
         fat_future = None
         if need_fat:
             fat_key = self._build_key("fat", resource_string, tf_checksum_hex)
             if key_suffix:
                 fat_key += key_suffix
-            fat_future = self._client.submit(
-                _run_fat,
-                base_future,
-                pure=False,
-                key=fat_key,
-                priority=-1,
-            )
+            try:
+                fat_future = self._client.submit(
+                    _run_fat,
+                    base_future,
+                    pure=False,
+                    key=fat_key,
+                    priority=-1,
+                )
+            except BaseException:
+                with self._cache_lock:
+                    self._transformation_log_submissions.pop(submission_id, None)
+                    self._transformation_log_started_submissions.discard(submission_id)
+                for future in (base_future, thin_future):
+                    try:
+                        self._client.cancel(future, force=True)
+                    except Exception:
+                        pass
+                    try:
+                        future.release()
+                    except Exception:
+                        pass
+                if stream_topic is not None:
+                    self._release_stream_topic(stream_topic, stream_release_token)
+                raise
 
         futures = TransformationFutures(
             base=base_future,
@@ -1663,6 +1781,10 @@ class SeamlessDaskClient(StreamingMixin):
             ),
             _stream_release_token=stream_release_token or {},
         )
+        with self._cache_lock:
+            self._transformation_log_futures[submission_id] = futures
+            if submission_id in self._transformation_log_started_submissions:
+                futures._seamless_dispatch_started = True
         futures.members.add(member_id)
         for future in (base_future, thin_future, fat_future):
             if future is None:
@@ -1679,13 +1801,19 @@ class SeamlessDaskClient(StreamingMixin):
             store_cache: bool = not is_driver,
             envelope_checksum: str = envelope_checksum,
         ) -> None:
-            self._register_transformation(
-                tf_checksum_hex,
-                futures,
-                fut,
-                store_cache=store_cache,
-                envelope_checksum=envelope_checksum,
-            )
+            try:
+                self._register_transformation(
+                    tf_checksum_hex,
+                    futures,
+                    fut,
+                    store_cache=store_cache,
+                    envelope_checksum=envelope_checksum,
+                )
+            finally:
+                with self._cache_lock:
+                    self._transformation_log_submissions.pop(submission_id, None)
+                    self._transformation_log_started_submissions.discard(submission_id)
+                    self._transformation_log_futures.pop(submission_id, None)
 
         thin_future.add_done_callback(_register_done)
         if tf_checksum_hex and not is_driver:
@@ -1694,6 +1822,70 @@ class SeamlessDaskClient(StreamingMixin):
             )
 
         return futures
+
+    def _subscribe_transformation_log_dispatch(self) -> None:
+        subscribe = getattr(self._client, "subscribe_topic", None)
+        if not callable(subscribe):
+            return
+        try:
+            subscribe(
+                _TRANSFORMATION_LOG_DISPATCH_TOPIC,
+                self._handle_transformation_log_dispatch,
+            )
+        except Exception:
+            _LOGGER.debug(
+                "Could not subscribe to transformation log dispatch events",
+                exc_info=True,
+            )
+
+    def _handle_transformation_log_dispatch(self, event) -> None:
+        if isinstance(event, tuple) and len(event) == 2:
+            _timestamp, event = event
+        if not isinstance(event, dict):
+            return
+        tf_checksum = event.get("tf_checksum")
+        submission_id = event.get("submission_id")
+        if not isinstance(tf_checksum, str) or not isinstance(submission_id, str):
+            return
+        with self._cache_lock:
+            if submission_id not in self._transformation_log_submissions:
+                return
+            expected_checksum = self._transformation_log_submissions[submission_id]
+            if expected_checksum is not None and expected_checksum != tf_checksum:
+                return
+            if expected_checksum is None:
+                self._transformation_log_submissions[submission_id] = tf_checksum
+            self._transformation_log_started_submissions.add(submission_id)
+            futures = self._transformation_log_futures.get(submission_id)
+            if futures is not None:
+                futures._seamless_dispatch_started = True
+            try:
+                from seamless_transformer.transformation_cache import (
+                    clear_transformation_log,
+                )
+
+                clear_transformation_log(tf_checksum)
+            except Exception:
+                _LOGGER.debug(
+                    "Could not clear transformation log after dispatch",
+                    exc_info=True,
+                )
+
+    def _store_transformation_log_for_futures(
+        self,
+        futures: TransformationFutures,
+        tf_checksum,
+        logs: dict[str, Any],
+    ) -> None:
+        with self._cache_lock:
+            submission_id = futures.submission_id
+            if submission_id is not None:
+                self._transformation_log_submissions.pop(submission_id, None)
+                self._transformation_log_started_submissions.discard(submission_id)
+                self._transformation_log_futures.pop(submission_id, None)
+            from seamless_transformer.transformation_cache import set_transformation_log
+
+            set_transformation_log(tf_checksum, logs)
 
     def ensure_fat_future(self, futures: TransformationFutures) -> Future:
         """Create or return the fat future for a transformation."""
@@ -1976,6 +2168,14 @@ class SeamlessDaskClient(StreamingMixin):
             return
         with self._cache_lock:
             self._released_transformation_futures.add(id(futures))
+            if futures.submission_id is not None:
+                self._transformation_log_submissions.pop(
+                    futures.submission_id, None
+                )
+                self._transformation_log_started_submissions.discard(
+                    futures.submission_id
+                )
+                self._transformation_log_futures.pop(futures.submission_id, None)
             if tf_checksum_hex:
                 cached = self._transformation_cache.get(tf_checksum_hex)
                 if cached is not None and cached[0] is futures:
@@ -2152,13 +2352,45 @@ class SeamlessDaskClient(StreamingMixin):
         store_cache: bool = True,
         envelope_checksum: str | None = None,
     ) -> None:
-        with self._cache_lock:
-            if id(futures) in self._released_transformation_futures:
-                return
         try:
-            tf_checksum_hex, result_checksum_hex, exc = thin_future.result()
+            tf_checksum_hex, result_checksum_hex, exc, logs = thin_future.result()
         except Exception:
             return
+
+        with self._cache_lock:
+            released = id(futures) in self._released_transformation_futures
+            submission_id = futures.submission_id
+            active_submission = (
+                submission_id is not None
+                and submission_id in self._transformation_log_submissions
+            )
+            if active_submission:
+                expected_checksum = self._transformation_log_submissions[submission_id]
+                log_checksum = tf_checksum_hex or tf_checksum_hint
+                active_submission = (
+                    expected_checksum is None
+                    or expected_checksum == log_checksum
+                )
+            if (
+                not released
+                and active_submission
+                and exc
+                and isinstance(logs, dict)
+                and logs.get(_DISPATCH_STARTED_LOGS_MARKER) is True
+            ):
+                try:
+                    from seamless_transformer.transformation_cache import (
+                        clear_transformation_log,
+                    )
+
+                    clear_transformation_log(log_checksum)
+                except Exception:
+                    _LOGGER.debug(
+                        "Could not clear failed transformation log",
+                        exc_info=True,
+                    )
+            if released:
+                return
 
         if tf_checksum_hex:
             futures.tf_checksum = tf_checksum_hex
