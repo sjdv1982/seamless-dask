@@ -1317,6 +1317,10 @@ def _run_base(
             "stdout": dispatched_logs.get("stdout", ""),
             "stderr": dispatched_logs.get("stderr", ""),
             "wall_time_seconds": wall_time_seconds,
+            # This stays inside the thin-future transport so a parent poller
+            # can distinguish a fresh successful dispatch from a Dask cache
+            # hit even if the topic event arrives late or is unavailable.
+            _DISPATCH_STARTED_LOGS_MARKER: True,
         }
         cpu_end = os.times()
         cpu_user_seconds = round(cpu_end.user - cpu_start.user, 6)
@@ -1438,6 +1442,8 @@ class SeamlessDaskClient(StreamingMixin):
         ] = {}
         self._active_transformation_envelopes: dict[str, str] = {}
         self._transformation_log_submissions: dict[str, str | None] = {}
+        self._transformation_log_started_submissions: set[str] = set()
+        self._transformation_log_futures: dict[str, TransformationFutures] = {}
         self._released_transformation_futures: set[int] = set()
         self._cache_lock = threading.RLock()
         self._stream_topic_lock = threading.RLock()
@@ -1699,6 +1705,7 @@ class SeamlessDaskClient(StreamingMixin):
         except BaseException:
             with self._cache_lock:
                 self._transformation_log_submissions.pop(submission_id, None)
+                self._transformation_log_started_submissions.discard(submission_id)
             if stream_topic is not None:
                 self._release_stream_topic(stream_topic, stream_release_token)
             raise
@@ -1719,6 +1726,7 @@ class SeamlessDaskClient(StreamingMixin):
         except BaseException:
             with self._cache_lock:
                 self._transformation_log_submissions.pop(submission_id, None)
+                self._transformation_log_started_submissions.discard(submission_id)
             try:
                 self._client.cancel(base_future, force=True)
             except Exception:
@@ -1747,6 +1755,7 @@ class SeamlessDaskClient(StreamingMixin):
             except BaseException:
                 with self._cache_lock:
                     self._transformation_log_submissions.pop(submission_id, None)
+                    self._transformation_log_started_submissions.discard(submission_id)
                 for future in (base_future, thin_future):
                     try:
                         self._client.cancel(future, force=True)
@@ -1772,6 +1781,10 @@ class SeamlessDaskClient(StreamingMixin):
             ),
             _stream_release_token=stream_release_token or {},
         )
+        with self._cache_lock:
+            self._transformation_log_futures[submission_id] = futures
+            if submission_id in self._transformation_log_started_submissions:
+                futures._seamless_dispatch_started = True
         futures.members.add(member_id)
         for future in (base_future, thin_future, fat_future):
             if future is None:
@@ -1799,6 +1812,8 @@ class SeamlessDaskClient(StreamingMixin):
             finally:
                 with self._cache_lock:
                     self._transformation_log_submissions.pop(submission_id, None)
+                    self._transformation_log_started_submissions.discard(submission_id)
+                    self._transformation_log_futures.pop(submission_id, None)
 
         thin_future.add_done_callback(_register_done)
         if tf_checksum_hex and not is_driver:
@@ -1840,6 +1855,10 @@ class SeamlessDaskClient(StreamingMixin):
                 return
             if expected_checksum is None:
                 self._transformation_log_submissions[submission_id] = tf_checksum
+            self._transformation_log_started_submissions.add(submission_id)
+            futures = self._transformation_log_futures.get(submission_id)
+            if futures is not None:
+                futures._seamless_dispatch_started = True
             try:
                 from seamless_transformer.transformation_cache import (
                     clear_transformation_log,
@@ -1862,6 +1881,8 @@ class SeamlessDaskClient(StreamingMixin):
             submission_id = futures.submission_id
             if submission_id is not None:
                 self._transformation_log_submissions.pop(submission_id, None)
+                self._transformation_log_started_submissions.discard(submission_id)
+                self._transformation_log_futures.pop(submission_id, None)
             from seamless_transformer.transformation_cache import set_transformation_log
 
             set_transformation_log(tf_checksum, logs)
@@ -2151,6 +2172,10 @@ class SeamlessDaskClient(StreamingMixin):
                 self._transformation_log_submissions.pop(
                     futures.submission_id, None
                 )
+                self._transformation_log_started_submissions.discard(
+                    futures.submission_id
+                )
+                self._transformation_log_futures.pop(futures.submission_id, None)
             if tf_checksum_hex:
                 cached = self._transformation_cache.get(tf_checksum_hex)
                 if cached is not None and cached[0] is futures:

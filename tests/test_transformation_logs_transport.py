@@ -11,8 +11,9 @@ import seamless_dask.transformation_mixin as tm
 import seamless_transformer.transformation_cache as tc
 
 
+@pytest.mark.parametrize('topic_available', [False, True])
 @pytest.mark.parametrize('cached', [False, True])
-def test_base_success_fifth_slot_uses_worker_clock_cache_has_none(monkeypatch, cached):
+def test_base_success_fifth_slot_uses_worker_clock_cache_has_none(monkeypatch, cached, topic_available):
     checksum = Checksum('e' * 64)
     logs = {'stdout': 'worker stdout', 'stderr': 'worker stderr'}
     monkeypatch.setattr(dc, '_startup_record_mode', lambda: False)
@@ -22,9 +23,9 @@ def test_base_success_fifth_slot_uses_worker_clock_cache_has_none(monkeypatch, c
     monkeypatch.setattr(dc, '_resolve_buffer_async', lambda *a: asyncio.sleep(0, result=None))
     dispatched = []
     events = []
-    monkeypatch.setattr(dc, 'get_worker', lambda: SimpleNamespace(log_event=lambda topic, message: events.append((topic, message))))
+    monkeypatch.setattr(dc, 'get_worker', lambda: SimpleNamespace(log_event=lambda topic, message: events.append((topic, message))) if topic_available else SimpleNamespace())
     async def dispatch(*a, **k):
-        assert events == [('seamless-transformation-log-dispatch', {'tf_checksum': 'f' * 64, 'submission_id': 'test-submission'})]
+        assert events == ([('seamless-transformation-log-dispatch', {'tf_checksum': 'f' * 64, 'submission_id': 'test-submission'})] if topic_available else [])
         dispatched.append(k)
         return checksum, logs
     monkeypatch.setattr(dc, '_dispatch_with_cancel_watch', dispatch)
@@ -44,7 +45,7 @@ def test_base_success_fifth_slot_uses_worker_clock_cache_has_none(monkeypatch, c
         assert not dispatched and not persisted and not events
     else:
         assert dispatched[0]['with_logs'] is True
-        assert result[4] == {**logs, 'wall_time_seconds': 3.125}
+        assert result[4] == {**logs, 'wall_time_seconds': 3.125, '_seamless_dispatch_started': True}
         assert result[4]['wall_time_seconds'] == persisted[0]['wall_time_seconds']
 
 
