@@ -42,21 +42,31 @@ def test_nested_transformations_multi():
                 def leaf(label: str):
                     import time
                     import os
-                    from seamless.transformer import global_lock
 
                     time.sleep(0.5)
                     return label, os.getpid()
 
                 leaf = delayed(leaf)
+                leaf.process_lock = False
 
-                left = leaf(f"{label}-a").start()
+                left_handle = leaf(f"{label}-a")
+                assert left_handle.meta["process_lock"] is False
+                left = left_handle.start()
 
                 right = leaf(f"{label}-b").start()
                 return left.run(), right.run()
 
+            # The legacy lock enclosed only leaf bodies; keep outer and
+            # direct nesting work concurrent for the nested Dask submissions.
+            middle.process_lock = False
+            assert middle.meta["process_lock"] is False
+
             first = middle(f"{label}-1")
             second = middle(f"{label}-2")
             return first, second
+
+        outer.process_lock = False
+        assert outer.meta["process_lock"] is False
 
         start = time.perf_counter()
         tasks = [outer(f"job-{idx}").start() for idx in range(job_count)]

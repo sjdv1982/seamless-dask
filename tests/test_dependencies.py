@@ -28,11 +28,11 @@ def test_dependencies():
         @delayed
         def slow_add(a, b, c=None, d=None, e=None):
             import time
-            from seamless.transformer import global_lock
-
-            with global_lock:
-                time.sleep(0.2)
+            time.sleep(0.2)
             return sum(v for v in (a, b, c, d, e) if v is not None)
+
+        slow_add.meta = {"process_lock": True}
+        assert slow_add.meta["process_lock"] is True
 
         @delayed
         def fast_add(a, b, c=None, d=None, e=None):
