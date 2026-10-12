@@ -596,7 +596,7 @@ class TransformationDaskMixin:
         return True
 
     def _skip_permission_gate(self) -> bool:
-        """Skip Dask throttling for driver transforms or top-level submissions."""
+        """Skip Dask throttling for drivers, driver children, or top-level submissions."""
 
         meta = None
         tf_dunder = getattr(self, "_tf_dunder", None)
@@ -606,7 +606,9 @@ class TransformationDaskMixin:
                 meta = tf_meta
         if meta is None:
             meta = getattr(self, "_meta", None)
-        if isinstance(meta, dict) and meta.get("driver"):
+        if (isinstance(meta, dict) and meta.get("driver")) or bool(
+            getattr(self, "_driver_context", False)
+        ):
             return True
         try:
             from seamless import is_worker
