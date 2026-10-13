@@ -20,6 +20,7 @@ from seamless_transformer.transformation_utils import (
 from seamless_transformer import probe_index, record_runtime
 
 from .permissions import release_permission, request_permission
+from .hash_type_utils import hash_validation_celltype
 from .types import (
     TransformationFutures,
     TransformationInputSpec,
@@ -780,7 +781,9 @@ class TransformationDaskMixin:
             from seamless.checksum.hash_type_validation import validate_deserializable_as
 
             if not transformation_dict.get("__schema__") or pinname in ("code", "objects"):
-                validate_deserializable_as(checksum_hex, celltype)
+                validate_deserializable_as(
+                    checksum_hex, hash_validation_celltype(celltype)
+                )
             inputs[pinname] = TransformationInputSpec(
                 name=pinname,
                 celltype=celltype,
