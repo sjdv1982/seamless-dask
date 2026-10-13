@@ -853,6 +853,13 @@ class TransformationDaskMixin:
                             futures,
                         )
                     return futures
+            from seamless_transformer.transformation_cache import (
+                _validate_environment_before_dispatch,
+            )
+
+            _validate_environment_before_dispatch(
+                submission.transformation_dict, submission.tf_dunder
+            )
             try:
                 try:
                     futures = client.submit_transformation(
