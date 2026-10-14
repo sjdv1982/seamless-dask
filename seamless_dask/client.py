@@ -29,6 +29,7 @@ from seamless_transformer.transformation_utils import (
 )
 
 from .permissions import ensure_configured
+from .hash_type_utils import hash_validation_celltype
 from .types import (
     TransformationFutures,
     TransformationInputSpec,
@@ -1083,7 +1084,11 @@ def _run_base(
                     spec.name in optional_pins
                     and checksum_hex == json_null_checksum().hex()
                 ):
-                    validate_deserializable_as(checksum_hex, spec.celltype, buffer=buf)
+                    validate_deserializable_as(
+                        checksum_hex,
+                        hash_validation_celltype(spec.celltype),
+                        buffer=buf,
+                    )
                 transformation_dict[spec.name] = (
                     spec.celltype,
                     spec.subcelltype,
@@ -1098,7 +1103,9 @@ def _run_base(
                     and result_checksum_hex == json_null_checksum().hex()
                 ):
                     validate_deserializable_as(
-                        result_checksum_hex, spec.celltype, buffer=buf
+                        result_checksum_hex,
+                        hash_validation_celltype(spec.celltype),
+                        buffer=buf,
                     )
                 transformation_dict[spec.name] = (
                     spec.celltype,
@@ -1114,7 +1121,9 @@ def _run_base(
                     and result_checksum_hex == json_null_checksum().hex()
                 ):
                     validate_deserializable_as(
-                        result_checksum_hex, spec.celltype, buffer=buf
+                        result_checksum_hex,
+                        hash_validation_celltype(spec.celltype),
+                        buffer=buf,
                     )
                 transformation_dict[spec.name] = (
                     spec.celltype,
