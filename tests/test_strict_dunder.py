@@ -64,6 +64,9 @@ def _client():
     client._transformation_cache = {}
     client._active_transformation_envelopes = {}
     client._released_transformation_futures = set()
+    client._transformation_log_submissions = {}
+    client._transformation_log_started_submissions = set()
+    client._transformation_log_futures = {}
     client._fat_future_ttl = 10.0
     return client
 
@@ -365,7 +368,7 @@ def test_dask_base_skips_database_write_after_submission_cancel(monkeypatch):
         lambda: _FakeSeamlessDaskClient(),
     )
 
-    tf_hex, result_hex, _buffer, exc = dask_client_module._run_base(
+    tf_hex, result_hex, _buffer, exc, _logs = dask_client_module._run_base(
         {
             "transformation_dict": {
                 "__language__": "bash",

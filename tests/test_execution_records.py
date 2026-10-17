@@ -190,6 +190,9 @@ def test_submit_transformation_sends_record_mode(monkeypatch):
     client._client = _FakeDistributedClient()
     client._cache_lock = threading.RLock()
     client._transformation_cache = {}
+    client._transformation_log_submissions = {}
+    client._transformation_log_started_submissions = set()
+    client._transformation_log_futures = {}
     client._prune_caches = lambda: None
     client._touch_transformation_cache = lambda *args, **kwargs: None
 
