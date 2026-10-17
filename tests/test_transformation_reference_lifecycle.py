@@ -117,7 +117,7 @@ class _FakeDaskClient:
         self.submissions.append(submission)
         base = _ImmediateFuture(None)
         thin = _ImmediateFuture(
-            (submission.tf_checksum, self.result_checksum, self.error)
+            (submission.tf_checksum, self.result_checksum, self.error, None)
         )
         # Let the mixin exercise its real ensure_fat_future branch even when
         # the submission itself requested a fat value.

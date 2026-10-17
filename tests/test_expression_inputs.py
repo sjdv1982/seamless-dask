@@ -196,7 +196,7 @@ def test_transformation_input_cache_miss_keeps_its_type(monkeypatch):
         {"projected": (missing.hex(), None, envelope)},
     )
 
-    assert result == ("d" * 64, None, None, envelope)
+    assert result == ("d" * 64, None, None, envelope, None)
 
 
 def test_dask_api_records_typed_expression_input_error():
@@ -208,7 +208,7 @@ def test_dask_api_records_typed_expression_input_error():
 
     missing = Checksum("c" * 64)
     future = concurrent.futures.Future()
-    future.set_result(("d" * 64, None, encode_error(CacheMissError(missing))))
+    future.set_result(("d" * 64, None, encode_error(CacheMissError(missing)), None))
 
     class Subject(TransformationDaskMixin):
         _constructed = False
